@@ -51,7 +51,7 @@ impl Workspace {
     fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let editor = cx.new(|cx| {
             InputState::new(window, cx)
-                .multi_line(true)
+                .code_editor("sql")
                 .placeholder("Write SQL…")
         });
 

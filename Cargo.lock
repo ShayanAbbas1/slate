@@ -5449,6 +5449,7 @@ dependencies = [
  "gpui",
  "gpui-component",
  "postgres",
+ "serde_json",
  "tree-sitter",
  "tree-sitter-sequel",
 ]

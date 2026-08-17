@@ -17,6 +17,12 @@
 pub mod color;
 
 use color::{Oklch, Rgba, Srgb};
+use gpui_component::{
+    ThemeMode,
+    highlighter::{HighlightTheme, HighlightThemeStyle, SyntaxColors},
+};
+use serde_json::json;
+use std::sync::Arc;
 
 /// Layout scale. Deliberately tiny — four spacing values and three radii.
 /// An arbitrary one-off pixel value in a component is a code review failure.
@@ -132,6 +138,15 @@ pub struct Theme {
     pub danger: Srgb,
     pub warning: Srgb,
     pub success: Srgb,
+
+    pub syntax_comment: Srgb,
+    pub syntax_keyword: Srgb,
+    pub syntax_string: Srgb,
+    pub syntax_number: Srgb,
+    pub syntax_function: Srgb,
+    pub syntax_type: Srgb,
+    pub syntax_variable: Srgb,
+    pub syntax_operator: Srgb,
 }
 
 impl Theme {
@@ -160,6 +175,71 @@ impl Theme {
         component.colors.scrollbar = self.bg.into();
         component.colors.scrollbar_thumb = self.border_strong.into();
         component.colors.scrollbar_thumb_hover = self.element_active.into();
+        component.highlight_theme = self.highlight_theme();
+    }
+
+    fn highlight_theme(self) -> Arc<HighlightTheme> {
+        let style = |color: Srgb| json!({ "color": color.hex() });
+        let syntax: SyntaxColors = serde_json::from_value(json!({
+            "attribute": style(self.syntax_variable),
+            "boolean": style(self.syntax_number),
+            "comment": style(self.syntax_comment),
+            "comment_doc": style(self.syntax_comment),
+            "constant": style(self.syntax_number),
+            "constructor": style(self.syntax_type),
+            "embedded": style(self.text),
+            "emphasis": style(self.text),
+            "emphasis.strong": style(self.text),
+            "enum": style(self.syntax_type),
+            "function": style(self.syntax_function),
+            "hint": style(self.text_muted),
+            "keyword": style(self.syntax_keyword),
+            "label": style(self.syntax_variable),
+            "link_text": style(self.syntax_function),
+            "link_uri": style(self.syntax_string),
+            "number": style(self.syntax_number),
+            "operator": style(self.syntax_operator),
+            "predictive": style(self.text_faint),
+            "preproc": style(self.syntax_keyword),
+            "primary": style(self.text),
+            "property": style(self.syntax_variable),
+            "punctuation": style(self.syntax_operator),
+            "punctuation.bracket": style(self.syntax_operator),
+            "punctuation.delimiter": style(self.syntax_operator),
+            "punctuation.list_marker": style(self.syntax_operator),
+            "punctuation.special": style(self.syntax_keyword),
+            "string": style(self.syntax_string),
+            "string.escape": style(self.syntax_number),
+            "string.regex": style(self.syntax_string),
+            "string.special": style(self.syntax_string),
+            "string.special.symbol": style(self.syntax_string),
+            "tag": style(self.syntax_keyword),
+            "tag.doctype": style(self.syntax_keyword),
+            "text.literal": style(self.syntax_string),
+            "title": style(self.syntax_function),
+            "type": style(self.syntax_type),
+            "variable": style(self.syntax_variable),
+            "variable.special": style(self.syntax_keyword),
+            "variant": style(self.syntax_type)
+        }))
+        .expect("Slate's syntax theme must be valid");
+
+        Arc::new(HighlightTheme {
+            name: "Slate".into(),
+            appearance: match self.appearance {
+                Appearance::Dark => ThemeMode::Dark,
+                Appearance::Light => ThemeMode::Light,
+            },
+            style: HighlightThemeStyle {
+                editor_background: Some(self.bg.into()),
+                editor_foreground: Some(self.text.into()),
+                editor_active_line: Some(self.element_hover.into()),
+                editor_line_number: Some(self.text_faint.into()),
+                editor_active_line_number: Some(self.text_muted.into()),
+                status: Default::default(),
+                syntax,
+            },
+        })
     }
 
     pub fn dark() -> Self {
@@ -188,6 +268,15 @@ impl Theme {
             danger: Oklch::new(0.68, 0.19, 25.0).to_srgb(),
             warning: Oklch::new(0.80, 0.13, 85.0).to_srgb(),
             success: Oklch::new(0.72, 0.15, 150.0).to_srgb(),
+
+            syntax_comment: neutral(0.64),
+            syntax_keyword: Oklch::new(0.76, 0.13, 300.0).to_srgb(),
+            syntax_string: Oklch::new(0.76, 0.13, 150.0).to_srgb(),
+            syntax_number: Oklch::new(0.80, 0.12, 75.0).to_srgb(),
+            syntax_function: Oklch::new(0.76, 0.12, 250.0).to_srgb(),
+            syntax_type: Oklch::new(0.78, 0.10, 205.0).to_srgb(),
+            syntax_variable: neutral(0.90),
+            syntax_operator: neutral(0.72),
         }
     }
 
@@ -217,6 +306,15 @@ impl Theme {
             danger: Oklch::new(0.52, 0.20, 25.0).to_srgb(),
             warning: Oklch::new(0.58, 0.14, 75.0).to_srgb(),
             success: Oklch::new(0.52, 0.15, 150.0).to_srgb(),
+
+            syntax_comment: neutral(0.46),
+            syntax_keyword: Oklch::new(0.48, 0.16, 300.0).to_srgb(),
+            syntax_string: Oklch::new(0.44, 0.14, 150.0).to_srgb(),
+            syntax_number: Oklch::new(0.48, 0.15, 65.0).to_srgb(),
+            syntax_function: Oklch::new(0.46, 0.16, 250.0).to_srgb(),
+            syntax_type: Oklch::new(0.44, 0.12, 205.0).to_srgb(),
+            syntax_variable: neutral(0.28),
+            syntax_operator: neutral(0.40),
         }
     }
 }
@@ -238,6 +336,41 @@ mod tests {
             ratio >= minimum,
             "{name}: contrast {ratio:.2} is below the {minimum:.1} floor"
         );
+    }
+
+    #[test]
+    fn syntax_tokens_clear_wcag_in_both_appearances() {
+        for theme in [Theme::dark(), Theme::light()] {
+            for (name, token) in [
+                ("comment", theme.syntax_comment),
+                ("keyword", theme.syntax_keyword),
+                ("string", theme.syntax_string),
+                ("number", theme.syntax_number),
+                ("function", theme.syntax_function),
+                ("type", theme.syntax_type),
+                ("variable", theme.syntax_variable),
+                ("operator", theme.syntax_operator),
+            ] {
+                check(name, token, theme.bg, AA_TEXT);
+            }
+        }
+    }
+
+    #[test]
+    fn every_highlighter_category_has_a_slate_style() {
+        for theme in [Theme::dark(), Theme::light()] {
+            let syntax = serde_json::to_value(&theme.highlight_theme().style.syntax).unwrap();
+            let styles = syntax.as_object().unwrap();
+            let missing = styles
+                .iter()
+                .filter_map(|(name, style)| style.is_null().then_some(name.as_str()))
+                .collect::<Vec<_>>();
+            assert_eq!(styles.len(), 40);
+            assert!(
+                missing.is_empty(),
+                "highlighter categories fell back to the component theme: {missing:?}"
+            );
+        }
     }
 
     #[test]

@@ -88,6 +88,16 @@ impl Srgb {
         }
     }
 
+    pub fn hex(self) -> String {
+        let channel = |value: f32| (value.clamp(0.0, 1.0) * 255.0).round() as u8;
+        format!(
+            "#{:02x}{:02x}{:02x}",
+            channel(self.r),
+            channel(self.g),
+            channel(self.b)
+        )
+    }
+
     /// WCAG 2.1 relative luminance.
     pub fn relative_luminance(self) -> f32 {
         0.2126 * gamma_decode(self.r) + 0.7152 * gamma_decode(self.g) + 0.0722 * gamma_decode(self.b)
@@ -181,6 +191,11 @@ mod tests {
             contrast_ratio(black, white),
             0.001
         ));
+    }
+
+    #[test]
+    fn srgb_formats_as_hex() {
+        assert_eq!(Srgb::new(1.0, 0.5, 0.0).hex(), "#ff8000");
     }
 
     #[test]
