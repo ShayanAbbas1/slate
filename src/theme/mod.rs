@@ -142,6 +142,26 @@ impl Theme {
         }
     }
 
+    pub fn apply_to_components(self, cx: &mut gpui::App) {
+        let component = gpui_component::Theme::global_mut(cx);
+        component.shadow = false;
+        component.radius = gpui::px(layout::RADIUS_CONTROL);
+        component.radius_lg = gpui::px(layout::RADIUS_LARGE);
+
+        component.colors.background = self.bg.into();
+        component.colors.foreground = self.text.into();
+        component.colors.input = self.border.into();
+        component.colors.border = self.border.into();
+        component.colors.caret = self.cursor.into();
+        component.colors.selection = self.selection.into();
+        component.colors.ring = self.accent.into();
+        component.colors.muted = self.surface.into();
+        component.colors.muted_foreground = self.text_muted.into();
+        component.colors.scrollbar = self.bg.into();
+        component.colors.scrollbar_thumb = self.border_strong.into();
+        component.colors.scrollbar_thumb_hover = self.element_active.into();
+    }
+
     pub fn dark() -> Self {
         Self {
             appearance: Appearance::Dark,
