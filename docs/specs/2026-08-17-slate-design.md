@@ -344,28 +344,47 @@ There is no "test connection" button. Connecting is the test.
 
 ## 9. Build order
 
-v1 ships in two phases. The first produces something usable daily; the second
-makes it usable by anyone else.
+Three phases. The MVP proves the stack works at all; the second phase makes Slate
+usable every day; the third makes it usable by someone else.
 
-### Phase 1 — daily-drivable
+Each phase is a stopping point where the app runs. No phase leaves the build
+broken pending the next one.
 
-1. Window opens; theme and motion ported; token-mapping layer.
-2. One hardcoded connection; blocking driver on the background executor.
-3. Query buffer with tree-sitter SQL highlighting; `cmd+enter`; inline errors.
-4. Result grid via `TableDelegate`; row limit; byte-size readout.
-5. Value inspector panel.
-6. Schema tree in the sidebar with inline filter.
-7. Profiles, the switcher, and per-profile state.
+### Phase 0 — MVP: connect, query, read results
+
+The goal is the shortest path to a window showing real rows from a real database.
+Everything here is foundation that later phases build on, not throwaway.
+
+0. **Confirm the pinned crate pair links and opens a window.** This is the
+   riskiest unverified assumption in the spec (§11) and it is cheap to settle.
+   `cargo check` has passed; linking Metal shaders and calling
+   `Application::new().run()` has not been tried.
+1. Window opens. `theme.rs` and `motion.rs` ported; token-mapping layer onto
+   gpui-component's own theme tokens.
+2. One hardcoded connection. Blocking `postgres` client on
+   `cx.background_executor()`.
+3. Query buffer with tree-sitter SQL highlighting. `cmd+enter` running the
+   selection or the statement under the cursor. Errors inline below the editor.
+4. Result grid via `TableDelegate`. Row limit and byte-size readout.
+
+**MVP is done when** a query typed into the window returns rows into the grid,
+and a syntax error shows up under the editor instead of crashing.
+
+### Phase 1 — daily driver
+
+5. Value inspector panel for large JSONB and geometry values.
+6. Schema tree in the sidebar, with the inline filter.
+7. Profiles, the switcher control, and per-profile isolated state.
 8. Surfaces and the tab strip.
-9. `cmd+p` fuzzy open and `cmd+shift+p` palette; `nucleo-matcher`.
+9. `cmd+p` fuzzy open and `cmd+shift+p` command palette; `nucleo-matcher`.
 10. Table surface with Data and Structure inner tabs.
 11. Profile persistence, Keychain, query history.
 
 ### Phase 2 — shippable
 
-12. TLS, with an SSL-mode selector. `rustls` versus `native-tls` is a decision
-    deferred until the app exists.
-13. Connection-string parsing.
+12. TLS, with an SSL-mode selector. `rustls` versus `native-tls` is deferred
+    until the app exists and the decision can be made against real code.
+13. Connection form and `postgresql://` string parsing.
 14. Homebrew tap with a source-build formula.
 
 ### Distribution ladder
