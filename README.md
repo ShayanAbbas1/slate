@@ -28,5 +28,4 @@ write SQL.
 
 ## License
 
-MIT. `theme.rs` and `motion.rs` derive from
-[zeronsh/comet](https://github.com/zeronsh/comet), MIT © Wing.
+MIT.

@@ -118,11 +118,26 @@ Read these rather than guessing at GPUI patterns. All three ship real apps.
 | `0xErwin1/dbflux` | Keyboard-first multi-DB GPUI client. Blocking `postgres` driver, a large command palette, crates.io pins. Closest analogue. |
 | `duanebester/pgui` | GPUI Postgres client. Its author contributed the editor's inline-completion support upstream to gpui-component. |
 | `vicanso/zedis` | Best-commented of the three. Its `Cargo.toml` documents the real costs of git-pinning gpui. |
-| `~/hobby-projects/zeron` | Source of our ported `theme.rs` and `motion.rs`. Also a catalogue of hand-rolled GPUI widget patterns and the popover lifecycle solution. |
+| `~/hobby-projects/zeron` | A catalogue of hand-rolled GPUI widget patterns and a working popover open/closing/closed lifecycle. **Read for approach only — do not copy code.** See below. |
 
 ---
 
-## Attribution
+## License hygiene
 
-`theme.rs` and `motion.rs` derive from [`zeronsh/comet`](https://github.com/zeronsh/comet),
-MIT © Wing. **Retain the original license headers** in any ported file.
+**Slate vendors no third-party code, and the license carries exactly one
+copyright holder. Keep it that way.**
+
+Do not copy source from other projects, including `~/hobby-projects/zeron`, even
+where the license would permit it with attribution. Reading another codebase to
+understand an approach is fine and encouraged; pasting its code is not. If a
+problem seems to require vendoring, raise it rather than doing it.
+
+## No animation in v1
+
+There is no motion system, no transitions, no easing curves. Hover states are
+instant. A query in flight is shown with static text and a disabled control, not
+a spinner.
+
+This is deliberate — see the spec §7.4. It also means none of the GPUI animation
+hazards above are currently reachable. Do not introduce `with_animation` without
+raising it first.

@@ -281,42 +281,66 @@ Hand-rolling those would cost months and be invisible when correct. For
 reference, a comparable GPUI application spent 6,417 lines on a single text
 input.
 
-### 7.3 Theme and motion
+### 7.3 Theme — written here, not ported
 
-Ported from `zeron` (MIT, © Wing), both near-standalone with their own tests:
+Slate's theme is its own module, written from scratch. An earlier draft planned to
+port `theme.rs` and `motion.rs` from another GPUI project under MIT. That was
+rejected: roughly 2,600 lines and a third-party copyright clause in Slate's
+license, for an appearance Slate can define itself.
 
-- **`theme.rs`** — two appearances designed separately rather than inverted, an
-  oklch-derived neutral scale for perceptually even lightness steps, a WCAG
-  contrast calculator as a first-class function, hairline alpha-over-content
-  borders instead of solid strokes, glass tokens with platform-aware alpha, and a
-  deliberately tiny scale: four spacing values and three radii.
-- **`motion.rs`** — a `cubic-bezier` evaluator with Newton-Raphson solve, a named
-  motion catalog, and a manual hover-fade system that exists because gpui's
-  `.hover()` snaps instantly with no transition.
+The design principles are standard practice and are what the module implements:
 
-The signature easing is `cubic-bezier(0.16, 1, 0.3, 1)` — hard early
-acceleration, long settle. Most of the perceived smoothness lives there.
+- **Two appearances designed separately, not inverted.** Dark's darkest plane is
+  the content panel with chrome one step lighter; light's content plane is white
+  with chrome one step darker. Elevation direction differs per appearance rather
+  than mirroring lightness. Accents shift weight between appearances at the same
+  hue to hold contrast.
+- **An oklch-derived neutral scale**, so lightness steps are perceptually even
+  rather than evenly spaced in sRGB.
+- **A contrast-ratio function in the theme module itself**, with tests asserting
+  text pairs clear WCAG AA in both appearances. Contrast is checked, not assumed.
+- **Hairline borders as alpha over content** — a low-alpha wash rather than a
+  solid stroke, so edges read soft. Light appearances need proportionally more
+  alpha than dark ones to stay visible.
+- **A deliberately small scale.** Four spacing values and three radii. Arbitrary
+  one-off pixel values are a code-review failure.
+- **Numbers drive layout, colours are paint.** Layout constants live separately
+  from colour tokens so the two never entangle.
 
-A token-mapping layer bridges gpui-component's own theme tokens to this palette.
-Where a component resists, the escape hatch is to hand-roll that specific widget
+A token-mapping layer bridges gpui-component's own theme tokens to these. Where a
+component resists mapping, the escape hatch is hand-rolling that specific widget
 while keeping the library's editor and table.
 
-### 7.4 Known GPUI hazards
+### 7.4 No animation in v1
 
-Documented so they are not rediscovered:
+There is no motion system, no transitions, and no easing curves. Zed is largely
+static and reads as fast and modern; "buttery smooth" is a property of frame
+timing and input latency, not of things sliding around.
+
+This is a deliberate cut with a real payoff — it avoids the entire class of GPUI
+animation hazards in §7.5, including the one that costs 36% CPU. Animation is
+deferred (§10) and additive.
+
+The concrete consequence: a query in flight is indicated by static state — text
+and a disabled control — not a spinner.
+
+### 7.5 Known GPUI hazards
+
+Not currently reachable, since v1 has no animation. Recorded because they are
+expensive to rediscover the day someone adds a loading indicator.
 
 - **A repeating `with_animation` element requests a redraw every display frame
   while mounted.** One spinner has been measured pinning a window at 120Hz and
   36% CPU. The fix is a single shared throttled clock with per-view leases, stale
-  leases reaped, parking when the lease list empties. Any query-in-flight
-  indicator hits this.
+  leases reaped, parking when the lease list empties.
 - **`with_animation` replays from zero on remount**, so anything that must
   survive being unmounted mid-animation needs a wall-clock-driven tween evaluated
   fresh each render.
 - **GPUI drops view state the same frame the view unmounts**, so exit animations
   need an explicit open → closing → closed lifecycle with a reaping timer.
-- **No scale transform on `div`s** at the referenced revision — SVG only.
-  Approximate with fade plus translate.
+- **No scale transform on `div`s** at this revision — SVG only.
+- **`.hover()` snaps with no transition.** Colour fades require a manual system.
+  In v1 this is a feature: hover states are instant.
 - `translateY` is a relative-position inset applied after layout, so siblings do
   not shift.
 
@@ -359,8 +383,8 @@ Everything here is foundation that later phases build on, not throwaway.
    riskiest unverified assumption in the spec (§11) and it is cheap to settle.
    `cargo check` has passed; linking Metal shaders and calling
    `Application::new().run()` has not been tried.
-1. Window opens. `theme.rs` and `motion.rs` ported; token-mapping layer onto
-   gpui-component's own theme tokens.
+1. Window opens. Theme module written, with contrast tests; token-mapping layer
+   onto gpui-component's own theme tokens.
 2. One hardcoded connection. Blocking `postgres` client on
    `cx.background_executor()`.
 3. Query buffer with tree-sitter SQL highlighting. `cmd+enter` running the
@@ -400,9 +424,10 @@ and a syntax error shows up under the editor instead of crashing.
 
 ## 10. Deferred, in likely order
 
-SSH tunneling · cloud IAM authentication · CSV export · configurable keybindings
-· views and functions in the schema inspector · server-side cursors for unbounded
-result sets · a second database engine · row editing.
+Animation and transitions · SSH tunneling · cloud IAM authentication · CSV export
+· configurable keybindings · views and functions in the schema inspector ·
+server-side cursors for unbounded result sets · a second database engine · row
+editing.
 
 ---
 
@@ -416,16 +441,19 @@ Carried forward as risk, not fact.
   demo, but that demonstrates the virtualizer, not a cell renderer holding large
   values. Needs measurement against a wide table with geometry.
 - **How hard the token-mapping layer fights gpui-component's own theming.** The
-  main risk to §7.2.
-- **Name collisions** for "Slate" on crates.io, GitHub and Homebrew. Worth
-  checking before the first public push. A JavaScript rich-text library shares
-  the name in a different domain, judged acceptable.
+  main risk to §7.2 and §7.3.
+
+### Settled
+
+- **The crate name `slate` is taken on crates.io** by an abandoned CLI tool last
+  published in 2017. This blocks publishing Slate as a crate and nothing else —
+  distribution is a Homebrew tap, whose formulas are namespaced. The app, repo,
+  binary and bundle names are all unaffected. A JavaScript rich-text library
+  shares the name in a different domain, judged acceptable.
 
 ---
 
-## 12. Attribution
+## 12. License
 
-`theme.rs` and `motion.rs` derive from [`zeronsh/comet`](https://github.com/zeronsh/comet),
-MIT © Wing. Original license headers retained.
-
-Slate is MIT licensed.
+MIT. No third-party code is vendored, and Slate's license carries no other
+copyright holders — see §7.3 for the decision that keeps it that way.
