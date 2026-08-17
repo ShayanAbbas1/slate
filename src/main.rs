@@ -5,11 +5,13 @@ mod sql;
 mod theme;
 
 use gpui::{
-    App, AppContext, Application, Context, Entity, EntityInputHandler, InteractiveElement,
-    IntoElement, KeyBinding, ParentElement, Render, Styled, Window, WindowOptions, actions, div, px,
+    App, AppContext, Application, ClickEvent, Context, Entity, EntityInputHandler,
+    InteractiveElement, IntoElement, KeyBinding, ParentElement, Render, Styled, Window,
+    WindowOptions, actions, div, px,
 };
 use gpui_component::{
-    Root,
+    Disableable, Root,
+    button::{Button, ButtonVariants},
     input::{Input, InputState},
     table::{Table, TableState},
 };
@@ -23,14 +25,124 @@ actions!(slate, [RunQuery]);
 
 enum ConnectionState {
     NotConfigured,
-    Connecting {
-        endpoint: String,
-    },
-    Connected {
-        connection: Connection,
-        endpoint: String,
-    },
+    Connecting { endpoint: String },
+    Connected(Profile),
     Failed(String),
+}
+
+struct Profile {
+    name: String,
+    config: ConnectionConfig,
+    connection: Connection,
+}
+
+struct ConnectionForm {
+    url: Entity<InputState>,
+    name: Entity<InputState>,
+    host: Entity<InputState>,
+    port: Entity<InputState>,
+    database: Entity<InputState>,
+    user: Entity<InputState>,
+    password: Entity<InputState>,
+    error: Option<String>,
+}
+
+impl ConnectionForm {
+    fn new(
+        config: Option<&ConnectionConfig>,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) -> Self {
+        let value = |value: Option<&str>| value.unwrap_or_default().to_string();
+        let url = cx.new(|cx| InputState::new(window, cx).placeholder("postgresql://…"));
+        let name = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Display name")
+                .default_value(value(config.map(|config| config.database.as_str())))
+        });
+        let host = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Host")
+                .default_value(value(config.map(|config| config.host.as_str())))
+        });
+        let port = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Port (optional)")
+                .default_value(
+                    config
+                        .and_then(|config| config.port)
+                        .map(|port| port.to_string())
+                        .unwrap_or_default(),
+                )
+        });
+        let database = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Database")
+                .default_value(value(config.map(|config| config.database.as_str())))
+        });
+        let user = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Username")
+                .default_value(value(config.map(|config| config.user.as_str())))
+        });
+        let password = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Password (optional)")
+                .default_value(value(config.map(|config| config.password.as_str())))
+                .masked(true)
+        });
+
+        Self {
+            url,
+            name,
+            host,
+            port,
+            database,
+            user,
+            password,
+            error: None,
+        }
+    }
+
+    fn config(&self, cx: &App) -> Result<(String, ConnectionConfig), String> {
+        let read = |input: &Entity<InputState>| input.read(cx).value().trim().to_string();
+        let name = read(&self.name);
+        let host = read(&self.host);
+        let database = read(&self.database);
+        let user = read(&self.user);
+        let port = read(&self.port);
+
+        for (label, value) in [
+            ("Display name", &name),
+            ("Host", &host),
+            ("Database", &database),
+            ("Username", &user),
+        ] {
+            if value.is_empty() {
+                return Err(format!("{label} is required."));
+            }
+        }
+
+        let port = if port.is_empty() {
+            None
+        } else {
+            Some(
+                port.parse()
+                    .map_err(|_| "Port must be a number from 1 to 65535.".to_string())?,
+            )
+        };
+
+        Ok((
+            name,
+            ConnectionConfig {
+                host,
+                port,
+                database,
+                user,
+                password: self.password.read(cx).unmask_value().to_string(),
+            },
+        ))
+    }
 }
 
 enum QueryState {
@@ -47,6 +159,7 @@ enum QueryState {
 
 struct Workspace {
     connection: ConnectionState,
+    connection_form: ConnectionForm,
     editor: Entity<InputState>,
     results: Entity<TableState<ResultGrid>>,
     query: QueryState,
@@ -54,6 +167,12 @@ struct Workspace {
 
 impl Workspace {
     fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let environment_config = connection_config_from_environment();
+        let connection_form = ConnectionForm::new(
+            environment_config.as_ref().ok().and_then(Option::as_ref),
+            window,
+            cx,
+        );
         let editor = cx.new(|cx| {
             InputState::new(window, cx)
                 .code_editor("sql")
@@ -67,11 +186,12 @@ impl Workspace {
                 .col_selectable(true)
         });
 
-        let config = match connection_config_from_environment() {
+        let config = match environment_config {
             Ok(Some(config)) => config,
             Ok(None) => {
                 return Self {
                     connection: ConnectionState::NotConfigured,
+                    connection_form,
                     editor,
                     results,
                     query: QueryState::Idle,
@@ -80,6 +200,7 @@ impl Workspace {
             Err(message) => {
                 return Self {
                     connection: ConnectionState::Failed(message),
+                    connection_form,
                     editor,
                     results,
                     query: QueryState::Idle,
@@ -88,20 +209,21 @@ impl Workspace {
         };
 
         let endpoint = config.endpoint();
+        let task_config = config.clone();
         let connection_task = cx
             .background_executor()
-            .spawn(async move { Connection::open(config) });
-        let task_endpoint = endpoint.clone();
+            .spawn(async move { Connection::open(task_config) });
 
         cx.spawn(async move |workspace, cx| {
             let result = connection_task.await;
             workspace
                 .update(cx, |workspace, cx| {
                     workspace.connection = match result {
-                        Ok(connection) => ConnectionState::Connected {
+                        Ok(connection) => ConnectionState::Connected(Profile {
+                            name: config.database.clone(),
+                            config,
                             connection,
-                            endpoint: task_endpoint,
-                        },
+                        }),
                         Err(error) => ConnectionState::Failed(error.message),
                     };
                     cx.notify();
@@ -112,10 +234,88 @@ impl Workspace {
 
         Self {
             connection: ConnectionState::Connecting { endpoint },
+            connection_form,
             editor,
             results,
             query: QueryState::Idle,
         }
+    }
+
+    fn apply_connection_url(
+        &mut self,
+        _: &ClickEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let url = self.connection_form.url.read(cx).value();
+        let config = match ConnectionConfig::from_url(url.trim()) {
+            Ok(config) => config,
+            Err(error) => {
+                self.connection_form.error = Some(error);
+                cx.notify();
+                return;
+            }
+        };
+
+        for (input, value) in [
+            (&self.connection_form.name, config.database.clone()),
+            (&self.connection_form.host, config.host),
+            (
+                &self.connection_form.port,
+                config.port.map(|port| port.to_string()).unwrap_or_default(),
+            ),
+            (&self.connection_form.database, config.database),
+            (&self.connection_form.user, config.user),
+            (&self.connection_form.password, config.password),
+        ] {
+            input.update(cx, |input, cx| input.set_value(value, window, cx));
+        }
+        self.connection_form.error = None;
+        cx.notify();
+    }
+
+    fn connect(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if matches!(self.connection, ConnectionState::Connecting { .. }) {
+            return;
+        }
+
+        let (name, config) = match self.connection_form.config(cx) {
+            Ok(profile) => profile,
+            Err(error) => {
+                self.connection_form.error = Some(error);
+                cx.notify();
+                return;
+            }
+        };
+        let endpoint = config.endpoint();
+        let task_config = config.clone();
+        let connection_task = cx
+            .background_executor()
+            .spawn(async move { Connection::open(task_config) });
+
+        self.connection_form.error = None;
+        self.connection = ConnectionState::Connecting {
+            endpoint: endpoint.clone(),
+        };
+        cx.notify();
+
+        cx.spawn(async move |workspace, cx| {
+            let result = connection_task.await;
+            workspace
+                .update(cx, |workspace, cx| {
+                    workspace.connection = match result {
+                        Ok(connection) => ConnectionState::Connected(Profile {
+                            name,
+                            config,
+                            connection,
+                        }),
+                        Err(error) => ConnectionState::Failed(error.message),
+                    };
+                    cx.notify();
+                })
+                .ok();
+        })
+        .detach();
     }
 
     fn run_query(&mut self, _: &RunQuery, window: &mut Window, cx: &mut Context<Self>) {
@@ -124,7 +324,7 @@ impl Workspace {
         }
 
         let connection = match &self.connection {
-            ConnectionState::Connected { connection, .. } => connection.clone(),
+            ConnectionState::Connected(profile) => profile.connection.clone(),
             ConnectionState::NotConfigured => {
                 self.query = QueryState::Failed(DbError {
                     message: "No connection is configured.".into(),
@@ -214,6 +414,78 @@ impl Workspace {
         let range = Buffer::parse(&sql).statement_at(editor.cursor())?;
         Some(sql[range].to_string())
     }
+
+    fn render_connection_form(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let t = *theme(cx);
+        let connecting = matches!(self.connection, ConnectionState::Connecting { .. });
+        let message = self.connection_form.error.as_ref().cloned().or_else(|| {
+            if let ConnectionState::Failed(message) = &self.connection {
+                Some(message.clone())
+            } else {
+                None
+            }
+        });
+
+        div()
+            .size_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(
+                div()
+                    .w(px(layout::SIDEBAR_MAX_WIDTH))
+                    .p(px(layout::SPACE_LG))
+                    .bg(t.surface)
+                    .border_1()
+                    .border_color(t.border)
+                    .rounded(px(layout::RADIUS_PANEL))
+                    .flex()
+                    .flex_col()
+                    .gap(px(layout::SPACE_MD))
+                    .child(div().text_size(px(20.)).child("Connect to Postgres"))
+                    .child(
+                        div()
+                            .text_color(t.text_muted)
+                            .child("Paste a connection URL or enter the profile fields."),
+                    )
+                    .child(self.form_field("Connection URL", &self.connection_form.url))
+                    .child(
+                        div().flex().justify_end().child(
+                            Button::new("apply-connection-url")
+                                .label("Use URL")
+                                .disabled(connecting)
+                                .on_click(cx.listener(Self::apply_connection_url)),
+                        ),
+                    )
+                    .child(self.form_field("Display name", &self.connection_form.name))
+                    .child(self.form_field("Host", &self.connection_form.host))
+                    .child(self.form_field("Port", &self.connection_form.port))
+                    .child(self.form_field("Database", &self.connection_form.database))
+                    .child(self.form_field("Username", &self.connection_form.user))
+                    .child(self.form_field("Password", &self.connection_form.password))
+                    .children(message.map(|message| div().text_color(t.danger).child(message)))
+                    .child(
+                        Button::new("connect")
+                            .label(if connecting {
+                                "Connecting…"
+                            } else {
+                                "Connect"
+                            })
+                            .primary()
+                            .disabled(connecting)
+                            .on_click(cx.listener(Self::connect)),
+                    ),
+            )
+    }
+
+    fn form_field(&self, label: &'static str, input: &Entity<InputState>) -> impl IntoElement {
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(layout::SPACE_XS))
+            .child(label)
+            .child(Input::new(input).w_full())
+    }
 }
 
 impl Render for Workspace {
@@ -226,9 +498,10 @@ impl Render for Workspace {
             ConnectionState::Connecting { endpoint } => {
                 (format!("Connecting to {endpoint}…"), t.text_muted)
             }
-            ConnectionState::Connected { endpoint, .. } => {
-                (format!("Connected to {endpoint}"), t.success)
-            }
+            ConnectionState::Connected(profile) => (
+                format!("{} · {}", profile.name, profile.config.endpoint()),
+                t.success,
+            ),
             ConnectionState::Failed(message) => (message.clone(), t.danger),
         };
         let result_lines = match &self.query {
@@ -261,6 +534,15 @@ impl Render for Workspace {
             } => Some(format!("{rows} row(s) · {bytes} bytes · {elapsed:.1?}")),
             _ => None,
         };
+
+        if !matches!(self.connection, ConnectionState::Connected(_)) {
+            return div()
+                .id("connection-form")
+                .size_full()
+                .bg(t.bg)
+                .text_color(t.text)
+                .child(self.render_connection_form(cx));
+        }
 
         div()
             .id("workspace")
@@ -307,17 +589,17 @@ impl Render for Workspace {
                         div()
                             .size_full()
                             .p(px(layout::SPACE_LG))
-                            .font_family(
-                                gpui_component::Theme::global(cx).mono_font_family.clone(),
-                            )
+                            .font_family(gpui_component::Theme::global(cx).mono_font_family.clone())
                             .text_color(if matches!(self.query, QueryState::Failed(_)) {
                                 t.danger
                             } else {
                                 t.text
                             })
-                            .children(result_lines.into_iter().map(|line| {
-                                div().w_full().py(px(layout::SPACE_XS)).child(line)
-                            }))
+                            .children(
+                                result_lines.into_iter().map(|line| {
+                                    div().w_full().py(px(layout::SPACE_XS)).child(line)
+                                }),
+                            )
                     })),
             )
             .child(
@@ -354,7 +636,6 @@ fn connection_config_from_environment() -> Result<Option<ConnectionConfig>, Stri
 
     let missing = [
         ("PGHOST", &host),
-        ("PGPORT", &port),
         ("PGDATABASE", &database),
         ("PGUSER", &user),
     ]
@@ -370,9 +651,11 @@ fn connection_config_from_environment() -> Result<Option<ConnectionConfig>, Stri
     }
 
     let port = port
-        .expect("checked above")
-        .parse()
-        .map_err(|_| "PGPORT is not a valid port.".to_string())?;
+        .map(|port| {
+            port.parse()
+                .map_err(|_| "PGPORT is not a valid port.".to_string())
+        })
+        .transpose()?;
 
     Ok(Some(ConnectionConfig {
         host: host.expect("checked above"),

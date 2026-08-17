@@ -54,6 +54,24 @@ client, which owns its runtime internally, spawned onto the background executor.
 
 **Do not fork gpui.** Decided in the spec, §7.1.
 
+### Local build and run
+
+```sh
+cargo build
+docker compose up -d
+cargo run
+```
+
+The app opens the connection form when no `PG*` environment is configured. The
+repository-owned development database accepts:
+
+```text
+postgresql://slate:slate@127.0.0.1:55432/slate_dev
+```
+
+Paste that URL into the form and choose **Use URL**, then **Connect**. Connecting
+is the connection test; there is deliberately no separate test button.
+
 ### What gpui-component provides
 
 Use these rather than hand-rolling: `InputMode::CodeEditor` (rope-backed

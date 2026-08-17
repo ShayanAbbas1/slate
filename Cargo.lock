@@ -5452,6 +5452,7 @@ dependencies = [
  "serde_json",
  "tree-sitter",
  "tree-sitter-sequel",
+ "url",
 ]
 
 [[package]]

@@ -15,12 +15,12 @@
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use postgres::{Client, NoTls, SimpleQueryMessage};
+use postgres::{Client, NoTls, SimpleQueryMessage, config::Host};
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConnectionConfig {
     pub host: String,
-    pub port: u16,
+    pub port: Option<u16>,
     pub database: String,
     pub user: String,
     /// Blank is valid and must never be warned about — cloud IAM auth issues a
@@ -29,6 +29,57 @@ pub struct ConnectionConfig {
 }
 
 impl ConnectionConfig {
+    pub fn from_url(url: &str) -> Result<Self, String> {
+        if !url.starts_with("postgres://") && !url.starts_with("postgresql://") {
+            return Err("Connection URL must start with postgres:// or postgresql://.".into());
+        }
+
+        let url_parts =
+            url::Url::parse(url).map_err(|error| format!("Connection URL is invalid: {error}"))?;
+        let has_explicit_port = url_parts.port().is_some()
+            || url_parts
+                .query_pairs()
+                .any(|(key, _)| key.as_ref() == "port");
+        let parsed: postgres::Config = url
+            .parse()
+            .map_err(|error| format!("Connection URL is invalid: {error}"))?;
+        let host = match parsed.get_hosts() {
+            [Host::Tcp(host)] => host.clone(),
+            [] => return Err("Connection URL does not contain a host.".into()),
+            [_] => return Err("Connection URL contains a Unix socket host.".into()),
+            _ => return Err("Connection URL contains more than one host.".into()),
+        };
+        let database = parsed
+            .get_dbname()
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| "Connection URL does not contain a database.".to_string())?
+            .to_string();
+        let user = parsed
+            .get_user()
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| "Connection URL does not contain a username.".to_string())?
+            .to_string();
+        let password = parsed
+            .get_password()
+            .map(|password| {
+                std::str::from_utf8(password)
+                    .map(str::to_string)
+                    .map_err(|_| "Connection URL password is not valid UTF-8.".to_string())
+            })
+            .transpose()?
+            .unwrap_or_default();
+
+        Ok(Self {
+            host,
+            port: has_explicit_port
+                .then(|| parsed.get_ports().first().copied())
+                .flatten(),
+            database,
+            user,
+            password,
+        })
+    }
+
     /// libpq key/value connection string.
     ///
     /// Values are single-quoted and escaped rather than interpolated bare, so
@@ -37,10 +88,12 @@ impl ConnectionConfig {
     pub fn connection_string(&self) -> String {
         let mut parts = vec![
             format!("host={}", quote(&self.host)),
-            format!("port={}", self.port),
             format!("dbname={}", quote(&self.database)),
             format!("user={}", quote(&self.user)),
         ];
+        if let Some(port) = self.port {
+            parts.push(format!("port={port}"));
+        }
         if !self.password.is_empty() {
             parts.push(format!("password={}", quote(&self.password)));
         }
@@ -48,7 +101,10 @@ impl ConnectionConfig {
     }
 
     pub fn endpoint(&self) -> String {
-        format!("{}:{}", self.host, self.port)
+        match self.port {
+            Some(port) => format!("{}:{port}", self.host),
+            None => self.host.clone(),
+        }
     }
 }
 
@@ -260,7 +316,7 @@ mod tests {
     fn config() -> ConnectionConfig {
         ConnectionConfig {
             host: "db.example.test".into(),
-            port: 8432,
+            port: Some(8432),
             database: "slate_test".into(),
             user: "someone".into(),
             password: String::new(),
@@ -272,8 +328,18 @@ mod tests {
         let config = config();
         assert_eq!(
             config.connection_string(),
-            "host='db.example.test' port=8432 dbname='slate_test' user='someone'"
+            "host='db.example.test' dbname='slate_test' user='someone' port=8432"
         );
+    }
+
+    #[test]
+    fn connection_string_omits_an_unspecified_port() {
+        let config = ConnectionConfig {
+            port: None,
+            ..config()
+        };
+        assert!(!config.connection_string().contains("port="));
+        assert_eq!(config.endpoint(), "db.example.test");
     }
 
     #[test]
@@ -322,6 +388,36 @@ mod tests {
     }
 
     #[test]
+    fn url_populates_fields_without_inventing_a_port() {
+        let config = ConnectionConfig::from_url(
+            "postgresql://person%40example.com@db.example.test/slate_test",
+        )
+        .unwrap();
+
+        assert_eq!(
+            config,
+            ConnectionConfig {
+                host: "db.example.test".into(),
+                port: None,
+                database: "slate_test".into(),
+                user: "person@example.com".into(),
+                password: String::new(),
+            }
+        );
+    }
+
+    #[test]
+    fn url_preserves_an_explicit_port_and_password() {
+        let config = ConnectionConfig::from_url(
+            "postgres://someone:pa%20ss@db.example.test:8432/slate_test",
+        )
+        .unwrap();
+
+        assert_eq!(config.port, Some(8432));
+        assert_eq!(config.password, "pa ss");
+    }
+
+    #[test]
     fn server_character_positions_become_utf8_byte_offsets() {
         let sql = "SELECT 'é', broken";
         let broken_byte_offset = sql.find("broken").unwrap();
@@ -344,9 +440,8 @@ mod tests {
         let config = ConnectionConfig {
             host: std::env::var("PGHOST").expect("PGHOST is required"),
             port: std::env::var("PGPORT")
-                .expect("PGPORT is required")
-                .parse()
-                .expect("PGPORT must be a number"),
+                .ok()
+                .map(|port| port.parse().expect("PGPORT must be a number")),
             database: std::env::var("PGDATABASE").expect("PGDATABASE is required"),
             user: std::env::var("PGUSER").expect("PGUSER is required"),
             password: std::env::var("PGPASSWORD").unwrap_or_default(),
