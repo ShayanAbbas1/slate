@@ -1,4 +1,5 @@
 mod db;
+mod explorer;
 mod result_grid;
 mod sql;
 
@@ -12,11 +13,14 @@ use gpui::{
 use gpui_component::{
     Disableable, Root,
     button::{Button, ButtonVariants},
-    input::{Input, InputState},
+    input::{Input, InputEvent, InputState},
+    list::ListItem,
     table::{Table, TableState},
+    tree::{TreeState, tree},
 };
 
-use db::{Connection, ConnectionConfig, DbError};
+use db::{Catalog, Connection, ConnectionConfig, DbError};
+use explorer::tree_items;
 use result_grid::ResultGrid;
 use sql::Buffer;
 use theme::{Appearance, Theme, layout, theme};
@@ -34,6 +38,13 @@ struct Profile {
     name: String,
     config: ConnectionConfig,
     connection: Connection,
+    catalog: CatalogState,
+}
+
+enum CatalogState {
+    Loading,
+    Loaded(Catalog),
+    Failed(String),
 }
 
 struct ConnectionForm {
@@ -160,6 +171,8 @@ enum QueryState {
 struct Workspace {
     connection: ConnectionState,
     connection_form: ConnectionForm,
+    explorer_filter: Entity<InputState>,
+    explorer_tree: Entity<TreeState>,
     editor: Entity<InputState>,
     results: Entity<TableState<ResultGrid>>,
     query: QueryState,
@@ -173,6 +186,15 @@ impl Workspace {
             window,
             cx,
         );
+        let explorer_filter =
+            cx.new(|cx| InputState::new(window, cx).placeholder("Filter database objects…"));
+        let explorer_tree = cx.new(|cx| TreeState::new(cx));
+        cx.subscribe(&explorer_filter, |workspace, _, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::Change) {
+                workspace.refresh_explorer(cx);
+            }
+        })
+        .detach();
         let editor = cx.new(|cx| {
             InputState::new(window, cx)
                 .code_editor("sql")
@@ -192,6 +214,8 @@ impl Workspace {
                 return Self {
                     connection: ConnectionState::NotConfigured,
                     connection_form,
+                    explorer_filter,
+                    explorer_tree,
                     editor,
                     results,
                     query: QueryState::Idle,
@@ -201,6 +225,8 @@ impl Workspace {
                 return Self {
                     connection: ConnectionState::Failed(message),
                     connection_form,
+                    explorer_filter,
+                    explorer_tree,
                     editor,
                     results,
                     query: QueryState::Idle,
@@ -223,9 +249,11 @@ impl Workspace {
                             name: config.database.clone(),
                             config,
                             connection,
+                            catalog: CatalogState::Loading,
                         }),
                         Err(error) => ConnectionState::Failed(error.message),
                     };
+                    workspace.load_catalog(cx);
                     cx.notify();
                 })
                 .ok();
@@ -235,6 +263,8 @@ impl Workspace {
         Self {
             connection: ConnectionState::Connecting { endpoint },
             connection_form,
+            explorer_filter,
+            explorer_tree,
             editor,
             results,
             query: QueryState::Idle,
@@ -308,14 +338,57 @@ impl Workspace {
                             name,
                             config,
                             connection,
+                            catalog: CatalogState::Loading,
                         }),
                         Err(error) => ConnectionState::Failed(error.message),
                     };
+                    workspace.load_catalog(cx);
                     cx.notify();
                 })
                 .ok();
         })
         .detach();
+    }
+
+    fn load_catalog(&mut self, cx: &mut Context<Self>) {
+        let connection = match &self.connection {
+            ConnectionState::Connected(profile) => profile.connection.clone(),
+            _ => return,
+        };
+        let catalog_task = cx
+            .background_executor()
+            .spawn(async move { connection.catalog() });
+
+        cx.spawn(async move |workspace, cx| {
+            let result = catalog_task.await;
+            workspace
+                .update(cx, |workspace, cx| {
+                    if let ConnectionState::Connected(profile) = &mut workspace.connection {
+                        profile.catalog = match result {
+                            Ok(catalog) => CatalogState::Loaded(catalog),
+                            Err(error) => CatalogState::Failed(error.message),
+                        };
+                    }
+                    workspace.refresh_explorer(cx);
+                    cx.notify();
+                })
+                .ok();
+        })
+        .detach();
+    }
+
+    fn refresh_explorer(&mut self, cx: &mut Context<Self>) {
+        let filter = self.explorer_filter.read(cx).value();
+        let items = match &self.connection {
+            ConnectionState::Connected(Profile {
+                catalog: CatalogState::Loaded(catalog),
+                ..
+            }) => tree_items(catalog, &filter),
+            _ => Vec::new(),
+        };
+
+        self.explorer_tree
+            .update(cx, |tree, cx| tree.set_items(items, cx));
     }
 
     fn run_query(&mut self, _: &RunQuery, window: &mut Window, cx: &mut Context<Self>) {
@@ -486,6 +559,76 @@ impl Workspace {
             .child(label)
             .child(Input::new(input).w_full())
     }
+
+    fn render_explorer(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let t = *theme(cx);
+        let content = match &self.connection {
+            ConnectionState::Connected(Profile {
+                catalog: CatalogState::Loading,
+                ..
+            }) => div()
+                .p(px(layout::SPACE_MD))
+                .text_color(t.text_muted)
+                .child("Loading database objects…")
+                .into_any_element(),
+            ConnectionState::Connected(Profile {
+                catalog: CatalogState::Failed(message),
+                ..
+            }) => div()
+                .p(px(layout::SPACE_MD))
+                .text_color(t.danger)
+                .child(message.clone())
+                .into_any_element(),
+            ConnectionState::Connected(Profile {
+                catalog: CatalogState::Loaded(catalog),
+                ..
+            }) if catalog.schemas.is_empty() => div()
+                .p(px(layout::SPACE_MD))
+                .text_color(t.text_muted)
+                .child("No database objects found.")
+                .into_any_element(),
+            ConnectionState::Connected(Profile {
+                catalog: CatalogState::Loaded(_),
+                ..
+            }) => tree(&self.explorer_tree, |index, entry, _, _, cx| {
+                let t = *theme(cx);
+                ListItem::new(index)
+                    .pl(px(
+                        layout::SPACE_SM + entry.depth() as f32 * layout::SPACE_MD
+                    ))
+                    .text_color(t.text)
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .whitespace_nowrap()
+                            .child(entry.item().label.clone()),
+                    )
+            })
+            .into_any_element(),
+            _ => div().into_any_element(),
+        };
+
+        div()
+            .w(px(layout::SIDEBAR_DEFAULT_WIDTH))
+            .min_w(px(layout::SIDEBAR_MIN_WIDTH))
+            .h_full()
+            .bg(t.surface)
+            .border_r_1()
+            .border_color(t.border)
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .p(px(layout::SPACE_SM))
+                    .border_b_1()
+                    .border_color(t.border)
+                    .child(Input::new(&self.explorer_filter).w_full()),
+            )
+            .child(div().flex_1().min_h_0().child(content))
+    }
 }
 
 impl Render for Workspace {
@@ -568,39 +711,60 @@ impl Render for Workspace {
                 div()
                     .flex_1()
                     .min_h_0()
-                    .p(px(layout::SPACE_LG))
-                    .font_family(gpui_component::Theme::global(cx).mono_font_family.clone())
+                    .flex()
+                    .child(self.render_explorer(cx))
                     .child(
-                        Input::new(&self.editor)
-                            .h_full()
-                            .appearance(false)
-                            .bordered(false)
-                            .focus_bordered(false),
-                    ),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .min_h_0()
-                    .border_t_1()
-                    .border_color(t.border)
-                    .child(Table::new(&self.results).bordered(false))
-                    .children((!result_lines.is_empty()).then(|| {
                         div()
-                            .size_full()
-                            .p(px(layout::SPACE_LG))
-                            .font_family(gpui_component::Theme::global(cx).mono_font_family.clone())
-                            .text_color(if matches!(self.query, QueryState::Failed(_)) {
-                                t.danger
-                            } else {
-                                t.text
-                            })
-                            .children(
-                                result_lines.into_iter().map(|line| {
-                                    div().w_full().py(px(layout::SPACE_XS)).child(line)
-                                }),
+                            .flex_1()
+                            .min_w_0()
+                            .h_full()
+                            .flex()
+                            .flex_col()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_h_0()
+                                    .p(px(layout::SPACE_LG))
+                                    .font_family(
+                                        gpui_component::Theme::global(cx).mono_font_family.clone(),
+                                    )
+                                    .child(
+                                        Input::new(&self.editor)
+                                            .h_full()
+                                            .appearance(false)
+                                            .bordered(false)
+                                            .focus_bordered(false),
+                                    ),
                             )
-                    })),
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_h_0()
+                                    .border_t_1()
+                                    .border_color(t.border)
+                                    .child(Table::new(&self.results).bordered(false))
+                                    .children((!result_lines.is_empty()).then(|| {
+                                        div()
+                                            .size_full()
+                                            .p(px(layout::SPACE_LG))
+                                            .font_family(
+                                                gpui_component::Theme::global(cx)
+                                                    .mono_font_family
+                                                    .clone(),
+                                            )
+                                            .text_color(
+                                                if matches!(self.query, QueryState::Failed(_)) {
+                                                    t.danger
+                                                } else {
+                                                    t.text
+                                                },
+                                            )
+                                            .children(result_lines.into_iter().map(|line| {
+                                                div().w_full().py(px(layout::SPACE_XS)).child(line)
+                                            }))
+                                    })),
+                            ),
+                    ),
             )
             .child(
                 div()
