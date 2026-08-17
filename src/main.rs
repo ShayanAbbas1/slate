@@ -1,26 +1,25 @@
 mod db;
+mod result_grid;
 mod sql;
 
 mod theme;
 
 use gpui::{
     App, AppContext, Application, Context, Entity, EntityInputHandler, InteractiveElement,
-    IntoElement, KeyBinding, ParentElement, Render, Styled, Window, WindowOptions, actions, div,
-    px,
+    IntoElement, KeyBinding, ParentElement, Render, Styled, Window, WindowOptions, actions, div, px,
 };
 use gpui_component::{
     Root,
     input::{Input, InputState},
-    scroll::ScrollableElement,
+    table::{Table, TableState},
 };
 
-use db::{Connection, ConnectionConfig, DbError, QueryResult};
+use db::{Connection, ConnectionConfig, DbError};
+use result_grid::ResultGrid;
 use sql::Buffer;
 use theme::{Appearance, Theme, layout, theme};
 
 actions!(slate, [RunQuery]);
-
-const RESULT_PREVIEW_ROWS: usize = 100;
 
 enum ConnectionState {
     NotConfigured,
@@ -37,13 +36,19 @@ enum ConnectionState {
 enum QueryState {
     Idle,
     Running,
-    Complete(QueryResult),
+    Complete {
+        rows: usize,
+        bytes: usize,
+        elapsed: std::time::Duration,
+        rows_affected: Option<u64>,
+    },
     Failed(DbError),
 }
 
 struct Workspace {
     connection: ConnectionState,
     editor: Entity<InputState>,
+    results: Entity<TableState<ResultGrid>>,
     query: QueryState,
 }
 
@@ -54,6 +59,13 @@ impl Workspace {
                 .code_editor("sql")
                 .placeholder("Write SQL…")
         });
+        let results = cx.new(|cx| {
+            TableState::new(ResultGrid::empty(), window, cx)
+                .sortable(false)
+                .col_movable(false)
+                .row_selectable(true)
+                .col_selectable(true)
+        });
 
         let config = match connection_config_from_environment() {
             Ok(Some(config)) => config,
@@ -61,6 +73,7 @@ impl Workspace {
                 return Self {
                     connection: ConnectionState::NotConfigured,
                     editor,
+                    results,
                     query: QueryState::Idle,
                 };
             }
@@ -68,6 +81,7 @@ impl Workspace {
                 return Self {
                     connection: ConnectionState::Failed(message),
                     editor,
+                    results,
                     query: QueryState::Idle,
                 };
             }
@@ -99,6 +113,7 @@ impl Workspace {
         Self {
             connection: ConnectionState::Connecting { endpoint },
             editor,
+            results,
             query: QueryState::Idle,
         }
     }
@@ -157,7 +172,19 @@ impl Workspace {
             workspace
                 .update(cx, |workspace, cx| {
                     workspace.query = match result {
-                        Ok(result) => QueryState::Complete(result),
+                        Ok(result) => {
+                            let summary = QueryState::Complete {
+                                rows: result.rows.len(),
+                                bytes: result.bytes,
+                                elapsed: result.elapsed,
+                                rows_affected: result.rows_affected,
+                            };
+                            workspace.results.update(cx, |table, cx| {
+                                *table.delegate_mut() = ResultGrid::new(result);
+                                table.refresh(cx);
+                            });
+                            summary
+                        }
                         Err(error) => QueryState::Failed(error),
                     };
                     cx.notify();
@@ -214,43 +241,25 @@ impl Render for Workspace {
                     .unwrap_or_default();
                 vec![format!("{}{position}", error.message)]
             }
-            QueryState::Complete(result) => {
-                let mut lines = Vec::new();
-                if !result.columns.is_empty() {
-                    lines.push(
-                        result
-                            .columns
-                            .iter()
-                            .map(|column| column.name.as_str())
-                            .collect::<Vec<_>>()
-                            .join("  |  "),
-                    );
-                }
-                lines.extend(result.rows.iter().take(RESULT_PREVIEW_ROWS).map(|row| {
-                    row.iter()
-                        .map(|cell| cell.as_deref().unwrap_or("NULL"))
-                        .collect::<Vec<_>>()
-                        .join("  |  ")
-                }));
-                if result.rows.len() > RESULT_PREVIEW_ROWS {
-                    lines.push(format!(
-                        "Showing {RESULT_PREVIEW_ROWS} of {} rows.",
-                        result.rows.len()
-                    ));
-                } else if result.rows.is_empty() {
-                    lines.push(match result.rows_affected {
-                        Some(rows) => format!("Query completed. Server row count: {rows}."),
-                        None => "Query completed.".into(),
-                    });
-                }
-                lines.push(format!(
-                    "{} row(s) · {} bytes · {:.1?}",
-                    result.rows.len(),
-                    result.bytes,
-                    result.elapsed
-                ));
-                lines
-            }
+            QueryState::Complete {
+                rows,
+                bytes,
+                elapsed,
+                rows_affected,
+            } if *rows == 0 => vec![match rows_affected {
+                Some(rows) => format!("Query completed. Server row count: {rows}."),
+                None => "Query completed.".into(),
+            }],
+            QueryState::Complete { .. } => Vec::new(),
+        };
+        let query_status = match &self.query {
+            QueryState::Complete {
+                rows,
+                bytes,
+                elapsed,
+                ..
+            } => Some(format!("{rows} row(s) · {bytes} bytes · {elapsed:.1?}")),
+            _ => None,
         };
 
         div()
@@ -291,21 +300,24 @@ impl Render for Workspace {
                 div()
                     .flex_1()
                     .min_h_0()
-                    .overflow_y_scrollbar()
                     .border_t_1()
                     .border_color(t.border)
-                    .p(px(layout::SPACE_LG))
-                    .font_family(gpui_component::Theme::global(cx).mono_font_family.clone())
-                    .text_color(if matches!(self.query, QueryState::Failed(_)) {
-                        t.danger
-                    } else {
-                        t.text
-                    })
-                    .children(result_lines.into_iter().map(|line| {
+                    .child(Table::new(&self.results).bordered(false))
+                    .children((!result_lines.is_empty()).then(|| {
                         div()
-                            .w_full()
-                            .py(px(layout::SPACE_XS))
-                            .child(line)
+                            .size_full()
+                            .p(px(layout::SPACE_LG))
+                            .font_family(
+                                gpui_component::Theme::global(cx).mono_font_family.clone(),
+                            )
+                            .text_color(if matches!(self.query, QueryState::Failed(_)) {
+                                t.danger
+                            } else {
+                                t.text
+                            })
+                            .children(result_lines.into_iter().map(|line| {
+                                div().w_full().py(px(layout::SPACE_XS)).child(line)
+                            }))
                     })),
             )
             .child(
@@ -319,7 +331,10 @@ impl Render for Workspace {
                     .items_center()
                     .px(px(layout::SPACE_MD))
                     .text_color(status_color)
-                    .child(status),
+                    .child(status)
+                    .children(query_status.map(|query_status| {
+                        div().ml_auto().text_color(t.text_muted).child(query_status)
+                    })),
             )
     }
 }

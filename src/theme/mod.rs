@@ -38,6 +38,7 @@ pub mod layout {
 
     pub const TITLEBAR_HEIGHT: f32 = 38.0;
     pub const STATUS_HEIGHT: f32 = 24.0;
+    pub const GRID_COLUMN_WIDTH: f32 = 180.0;
     pub const SIDEBAR_DEFAULT_WIDTH: f32 = 256.0;
     pub const SIDEBAR_MIN_WIDTH: f32 = 180.0;
     pub const SIDEBAR_MAX_WIDTH: f32 = 420.0;
@@ -175,6 +176,14 @@ impl Theme {
         component.colors.scrollbar = self.bg.into();
         component.colors.scrollbar_thumb = self.border_strong.into();
         component.colors.scrollbar_thumb_hover = self.element_active.into();
+        component.colors.table = self.bg.into();
+        component.colors.table_active = self.selection.into();
+        component.colors.table_active_border = self.accent.into();
+        component.colors.table_even = self.element_hover.into();
+        component.colors.table_head = self.surface.into();
+        component.colors.table_head_foreground = self.text_muted.into();
+        component.colors.table_hover = self.element_hover.into();
+        component.colors.table_row_border = self.border.into();
         component.highlight_theme = self.highlight_theme();
     }
 
