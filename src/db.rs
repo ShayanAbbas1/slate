@@ -17,6 +17,49 @@ use std::time::{Duration, Instant};
 
 use postgres::{Client, NoTls, SimpleQueryMessage, config::Host};
 
+const RELATIONS_SQL: &str = "
+SELECT
+    namespace.nspname AS schema_name,
+    class.relname AS relation_name,
+    CASE class.relkind
+        WHEN 'r' THEN 'table'
+        WHEN 'p' THEN 'partitioned_table'
+        WHEN 'v' THEN 'view'
+        WHEN 'm' THEN 'materialized_view'
+        WHEN 'f' THEN 'foreign_table'
+    END AS relation_kind
+FROM pg_catalog.pg_class AS class
+JOIN pg_catalog.pg_namespace AS namespace
+    ON namespace.oid = class.relnamespace
+WHERE class.relkind IN ('r', 'p', 'v', 'm', 'f')
+    AND namespace.nspname <> 'information_schema'
+    AND namespace.nspname NOT LIKE 'pg\\_%' ESCAPE '\\'
+ORDER BY namespace.nspname, class.relname
+";
+
+const ROUTINES_SQL: &str = "
+SELECT
+    namespace.nspname AS schema_name,
+    procedure.proname AS routine_name,
+    CASE procedure.prokind
+        WHEN 'f' THEN 'function'
+        WHEN 'p' THEN 'procedure'
+    END AS routine_kind,
+    pg_catalog.pg_get_function_identity_arguments(procedure.oid) AS identity_arguments,
+    COALESCE(pg_catalog.pg_get_function_result(procedure.oid), '') AS result_type,
+    language.lanname AS language,
+    pg_catalog.pg_get_functiondef(procedure.oid) AS definition
+FROM pg_catalog.pg_proc AS procedure
+JOIN pg_catalog.pg_namespace AS namespace
+    ON namespace.oid = procedure.pronamespace
+JOIN pg_catalog.pg_language AS language
+    ON language.oid = procedure.prolang
+WHERE procedure.prokind IN ('f', 'p')
+    AND namespace.nspname <> 'information_schema'
+    AND namespace.nspname NOT LIKE 'pg\\_%' ESCAPE '\\'
+ORDER BY namespace.nspname, procedure.proname, identity_arguments
+";
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConnectionConfig {
     pub host: String,
@@ -123,6 +166,49 @@ pub struct Column {
 /// distinct from an empty string and must stay distinguishable in the grid.
 pub type Cell = Option<String>;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RelationKind {
+    Table,
+    PartitionedTable,
+    View,
+    MaterializedView,
+    ForeignTable,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Relation {
+    pub name: String,
+    pub kind: RelationKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RoutineKind {
+    Function,
+    Procedure,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Routine {
+    pub name: String,
+    pub kind: RoutineKind,
+    pub identity_arguments: String,
+    pub result_type: String,
+    pub language: String,
+    pub definition: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Schema {
+    pub name: String,
+    pub relations: Vec<Relation>,
+    pub routines: Vec<Routine>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Catalog {
+    pub schemas: Vec<Schema>,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct QueryResult {
     pub columns: Vec<Column>,
@@ -193,6 +279,12 @@ impl Connection {
 
         Ok(assemble(messages, started.elapsed()))
     }
+
+    pub fn catalog(&self) -> Result<Catalog, DbError> {
+        let relations = self.query(RELATIONS_SQL)?;
+        let routines = self.query(ROUTINES_SQL)?;
+        assemble_catalog(relations, routines)
+    }
 }
 
 fn assemble(messages: Vec<SimpleQueryMessage>, elapsed: Duration) -> QueryResult {
@@ -232,6 +324,89 @@ fn assemble(messages: Vec<SimpleQueryMessage>, elapsed: Duration) -> QueryResult
     }
 
     result
+}
+
+fn assemble_catalog(relations: QueryResult, routines: QueryResult) -> Result<Catalog, DbError> {
+    let mut schemas = std::collections::BTreeMap::<String, Schema>::new();
+
+    for row in &relations.rows {
+        let schema_name = required_cell(&relations, row, "schema_name")?;
+        let name = required_cell(&relations, row, "relation_name")?;
+        let kind = match required_cell(&relations, row, "relation_kind")? {
+            "table" => RelationKind::Table,
+            "partitioned_table" => RelationKind::PartitionedTable,
+            "view" => RelationKind::View,
+            "materialized_view" => RelationKind::MaterializedView,
+            "foreign_table" => RelationKind::ForeignTable,
+            kind => return Err(unexpected_catalog_value("relation kind", kind)),
+        };
+
+        schema(&mut schemas, schema_name).relations.push(Relation {
+            name: name.to_string(),
+            kind,
+        });
+    }
+
+    for row in &routines.rows {
+        let schema_name = required_cell(&routines, row, "schema_name")?;
+        let name = required_cell(&routines, row, "routine_name")?;
+        let kind = match required_cell(&routines, row, "routine_kind")? {
+            "function" => RoutineKind::Function,
+            "procedure" => RoutineKind::Procedure,
+            kind => return Err(unexpected_catalog_value("routine kind", kind)),
+        };
+
+        schema(&mut schemas, schema_name).routines.push(Routine {
+            name: name.to_string(),
+            kind,
+            identity_arguments: required_cell(&routines, row, "identity_arguments")?.to_string(),
+            result_type: required_cell(&routines, row, "result_type")?.to_string(),
+            language: required_cell(&routines, row, "language")?.to_string(),
+            definition: required_cell(&routines, row, "definition")?.to_string(),
+        });
+    }
+
+    Ok(Catalog {
+        schemas: schemas.into_values().collect(),
+    })
+}
+
+fn schema<'a>(
+    schemas: &'a mut std::collections::BTreeMap<String, Schema>,
+    name: &str,
+) -> &'a mut Schema {
+    schemas.entry(name.to_string()).or_insert_with(|| Schema {
+        name: name.to_string(),
+        relations: Vec::new(),
+        routines: Vec::new(),
+    })
+}
+
+fn required_cell<'a>(
+    result: &'a QueryResult,
+    row: &'a [Cell],
+    column_name: &str,
+) -> Result<&'a str, DbError> {
+    let index = result
+        .columns
+        .iter()
+        .position(|column| column.name == column_name)
+        .ok_or_else(|| catalog_error(format!("Catalog query omitted column {column_name}.")))?;
+
+    row.get(index)
+        .and_then(Option::as_deref)
+        .ok_or_else(|| catalog_error(format!("Catalog query returned no {column_name}.")))
+}
+
+fn unexpected_catalog_value(label: &str, value: &str) -> DbError {
+    catalog_error(format!("Catalog query returned unknown {label} {value}."))
+}
+
+fn catalog_error(message: String) -> DbError {
+    DbError {
+        message,
+        position: None,
+    }
 }
 
 fn connect_error(error: &postgres::Error, config: &ConnectionConfig) -> DbError {
@@ -434,6 +609,96 @@ mod tests {
         assert_eq!(character_position_to_byte_offset("SELECT 1", 100), None);
     }
 
+    fn result(columns: &[&str], rows: &[&[Option<&str>]]) -> QueryResult {
+        QueryResult {
+            columns: columns
+                .iter()
+                .map(|name| Column {
+                    name: (*name).to_string(),
+                })
+                .collect(),
+            rows: rows
+                .iter()
+                .map(|row| row.iter().map(|cell| cell.map(str::to_string)).collect())
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn catalog_groups_relations_and_routines_by_schema() {
+        let relations = result(
+            &["schema_name", "relation_name", "relation_kind"],
+            &[
+                &[Some("analytics"), Some("events"), Some("partitioned_table")],
+                &[Some("public"), Some("accounts"), Some("table")],
+                &[Some("public"), Some("account_overview"), Some("view")],
+            ],
+        );
+        let routines = result(
+            &[
+                "schema_name",
+                "routine_name",
+                "routine_kind",
+                "identity_arguments",
+                "result_type",
+                "language",
+                "definition",
+            ],
+            &[
+                &[
+                    Some("analytics"),
+                    Some("refresh_events"),
+                    Some("procedure"),
+                    Some("full boolean"),
+                    Some(""),
+                    Some("plpgsql"),
+                    Some("CREATE PROCEDURE analytics.refresh_events(full boolean)"),
+                ],
+                &[
+                    Some("public"),
+                    Some("account_name"),
+                    Some("function"),
+                    Some("account_id bigint"),
+                    Some("text"),
+                    Some("sql"),
+                    Some("CREATE FUNCTION public.account_name(account_id bigint)"),
+                ],
+            ],
+        );
+
+        let catalog = assemble_catalog(relations, routines).unwrap();
+
+        assert_eq!(catalog.schemas.len(), 2);
+        assert_eq!(catalog.schemas[0].name, "analytics");
+        assert_eq!(
+            catalog.schemas[0].relations,
+            vec![Relation {
+                name: "events".into(),
+                kind: RelationKind::PartitionedTable,
+            }]
+        );
+        assert_eq!(catalog.schemas[0].routines[0].kind, RoutineKind::Procedure);
+        assert_eq!(catalog.schemas[1].name, "public");
+        assert_eq!(catalog.schemas[1].relations[1].kind, RelationKind::View);
+        assert_eq!(catalog.schemas[1].routines[0].result_type, "text");
+    }
+
+    #[test]
+    fn catalog_rejects_unknown_object_kinds() {
+        let relations = result(
+            &["schema_name", "relation_name", "relation_kind"],
+            &[&[Some("public"), Some("mystery"), Some("unknown")]],
+        );
+
+        let error = assemble_catalog(relations, QueryResult::default()).unwrap_err();
+
+        assert_eq!(
+            error.message,
+            "Catalog query returned unknown relation kind unknown."
+        );
+    }
+
     #[test]
     #[ignore = "requires a local Postgres server configured through PG*"]
     fn live_query_round_trip() {
@@ -470,5 +735,39 @@ mod tests {
         );
         assert_eq!(result.bytes, 7);
         assert_eq!(result.rows_affected, Some(2));
+    }
+
+    #[test]
+    #[ignore = "requires the repository development database configured through PG*"]
+    fn live_catalog_round_trip() {
+        let config = ConnectionConfig {
+            host: std::env::var("PGHOST").expect("PGHOST is required"),
+            port: std::env::var("PGPORT")
+                .ok()
+                .map(|port| port.parse().expect("PGPORT must be a number")),
+            database: std::env::var("PGDATABASE").expect("PGDATABASE is required"),
+            user: std::env::var("PGUSER").expect("PGUSER is required"),
+            password: std::env::var("PGPASSWORD").unwrap_or_default(),
+        };
+
+        let catalog = Connection::open(config)
+            .expect("connection should open")
+            .catalog()
+            .expect("catalog should load");
+        let public = catalog
+            .schemas
+            .iter()
+            .find(|schema| schema.name == "public")
+            .expect("public schema should exist");
+
+        assert!(
+            public
+                .relations
+                .iter()
+                .any(|relation| relation.name == "accounts" && relation.kind == RelationKind::Table)
+        );
+        assert!(public.relations.iter().any(|relation| {
+            relation.name == "account_overview" && relation.kind == RelationKind::View
+        }));
     }
 }
