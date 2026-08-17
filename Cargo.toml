@@ -18,6 +18,11 @@ gpui-component = { version = "=0.5.1", features = ["tree-sitter-languages"] }
 tree-sitter = "0.25.4"
 tree-sitter-sequel = "0.3.8"
 
+# Blocking client, deliberately. GPUI's executor is async-task over Grand
+# Central Dispatch with no reactor, so a tokio future panics on it. This owns
+# its runtime and runs on the background executor. See AGENTS.md.
+postgres = "0.19"
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

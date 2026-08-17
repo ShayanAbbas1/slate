@@ -1,3 +1,4 @@
+mod db;
 mod sql;
 
 mod theme;
