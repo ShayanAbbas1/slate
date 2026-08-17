@@ -47,7 +47,7 @@ impl ConnectionConfig {
         parts.join(" ")
     }
 
-    fn endpoint(&self) -> String {
+    pub fn endpoint(&self) -> String {
         format!("{}:{}", self.host, self.port)
     }
 }
