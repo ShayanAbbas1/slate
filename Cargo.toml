@@ -1,0 +1,17 @@
+[package]
+name = "slate"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "A native macOS Postgres client"
+publish = false
+
+# Exact pins: gpui is pre-1.0 and breaks on minor bumps. See AGENTS.md before
+# touching these, and commit Cargo.lock with any change.
+[dependencies]
+gpui = "=0.2.2"
+gpui-component = { version = "=0.5.1", features = ["tree-sitter-languages"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
