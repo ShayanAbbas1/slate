@@ -1,3 +1,5 @@
+mod sql;
+
 mod theme;
 
 use gpui::{

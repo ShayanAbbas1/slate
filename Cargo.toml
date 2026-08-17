@@ -12,6 +12,12 @@ publish = false
 gpui = "=0.2.2"
 gpui-component = { version = "=0.5.1", features = ["tree-sitter-languages"] }
 
+# gpui-component keeps its parse tree private, so we run our own parser to find
+# statement boundaries. Versions match what gpui-component pulls, to avoid
+# linking two copies of tree-sitter.
+tree-sitter = "0.25.4"
+tree-sitter-sequel = "0.3.8"
+
 [profile.release]
 lto = "thin"
 codegen-units = 1
