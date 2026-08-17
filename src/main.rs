@@ -5,10 +5,12 @@ mod sql;
 
 mod theme;
 
+use std::{collections::HashMap, sync::Arc};
+
 use gpui::{
     App, AppContext, Application, ClickEvent, Context, Entity, EntityInputHandler,
-    InteractiveElement, IntoElement, KeyBinding, ParentElement, Render, Styled, Window,
-    WindowOptions, actions, div, px,
+    InteractiveElement, IntoElement, KeyBinding, ParentElement, Render, StatefulInteractiveElement,
+    Styled, Window, WindowOptions, actions, div, px,
 };
 use gpui_component::{
     Disableable, Root,
@@ -16,11 +18,11 @@ use gpui_component::{
     input::{Input, InputEvent, InputState},
     list::ListItem,
     table::{Table, TableState},
-    tree::{TreeState, tree},
+    tree::{TreeState, tree as render_tree},
 };
 
-use db::{Catalog, Connection, ConnectionConfig, DbError};
-use explorer::tree_items;
+use db::{Catalog, Connection, ConnectionConfig, DbError, Routine, RoutineKind};
+use explorer::{ExplorerTarget, preview_sql, tree as build_explorer_tree};
 use result_grid::ResultGrid;
 use sql::Buffer;
 use theme::{Appearance, Theme, layout, theme};
@@ -45,6 +47,16 @@ enum CatalogState {
     Loading,
     Loaded(Catalog),
     Failed(String),
+}
+
+struct RoutineDetails {
+    schema: String,
+    routine: Routine,
+}
+
+enum OpenedObject {
+    Relation { schema: String, name: String },
+    Routine(RoutineDetails),
 }
 
 struct ConnectionForm {
@@ -173,6 +185,8 @@ struct Workspace {
     connection_form: ConnectionForm,
     explorer_filter: Entity<InputState>,
     explorer_tree: Entity<TreeState>,
+    explorer_targets: Arc<HashMap<String, ExplorerTarget>>,
+    routine_details: Option<RoutineDetails>,
     editor: Entity<InputState>,
     results: Entity<TableState<ResultGrid>>,
     query: QueryState,
@@ -189,6 +203,7 @@ impl Workspace {
         let explorer_filter =
             cx.new(|cx| InputState::new(window, cx).placeholder("Filter database objects…"));
         let explorer_tree = cx.new(|cx| TreeState::new(cx));
+        let explorer_targets = Arc::new(HashMap::new());
         cx.subscribe(&explorer_filter, |workspace, _, event: &InputEvent, cx| {
             if matches!(event, InputEvent::Change) {
                 workspace.refresh_explorer(cx);
@@ -216,6 +231,8 @@ impl Workspace {
                     connection_form,
                     explorer_filter,
                     explorer_tree,
+                    explorer_targets,
+                    routine_details: None,
                     editor,
                     results,
                     query: QueryState::Idle,
@@ -227,6 +244,8 @@ impl Workspace {
                     connection_form,
                     explorer_filter,
                     explorer_tree,
+                    explorer_targets,
+                    routine_details: None,
                     editor,
                     results,
                     query: QueryState::Idle,
@@ -265,6 +284,8 @@ impl Workspace {
             connection_form,
             explorer_filter,
             explorer_tree,
+            explorer_targets,
+            routine_details: None,
             editor,
             results,
             query: QueryState::Idle,
@@ -379,16 +400,84 @@ impl Workspace {
 
     fn refresh_explorer(&mut self, cx: &mut Context<Self>) {
         let filter = self.explorer_filter.read(cx).value();
-        let items = match &self.connection {
+        let explorer = match &self.connection {
             ConnectionState::Connected(Profile {
                 catalog: CatalogState::Loaded(catalog),
                 ..
-            }) => tree_items(catalog, &filter),
-            _ => Vec::new(),
+            }) => build_explorer_tree(catalog, &filter),
+            _ => explorer::ExplorerTree {
+                items: Vec::new(),
+                targets: HashMap::new(),
+            },
         };
+        self.explorer_targets = Arc::new(explorer.targets);
 
         self.explorer_tree
-            .update(cx, |tree, cx| tree.set_items(items, cx));
+            .update(cx, |tree, cx| tree.set_items(explorer.items, cx));
+    }
+
+    fn open_explorer_target(
+        &mut self,
+        target: ExplorerTarget,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let object = match (&self.connection, target) {
+            (
+                ConnectionState::Connected(Profile {
+                    catalog: CatalogState::Loaded(catalog),
+                    ..
+                }),
+                ExplorerTarget::Relation {
+                    schema_index,
+                    relation_index,
+                },
+            ) => catalog.schemas.get(schema_index).and_then(|schema| {
+                schema
+                    .relations
+                    .get(relation_index)
+                    .map(|relation| OpenedObject::Relation {
+                        schema: schema.name.clone(),
+                        name: relation.name.clone(),
+                    })
+            }),
+            (
+                ConnectionState::Connected(Profile {
+                    catalog: CatalogState::Loaded(catalog),
+                    ..
+                }),
+                ExplorerTarget::Routine {
+                    schema_index,
+                    routine_index,
+                },
+            ) => catalog.schemas.get(schema_index).and_then(|schema| {
+                schema.routines.get(routine_index).cloned().map(|routine| {
+                    OpenedObject::Routine(RoutineDetails {
+                        schema: schema.name.clone(),
+                        routine,
+                    })
+                })
+            }),
+            _ => None,
+        };
+
+        match object {
+            Some(OpenedObject::Relation { schema, name }) => {
+                if matches!(self.query, QueryState::Running) {
+                    return;
+                }
+                let sql = preview_sql(&schema, &name);
+                self.routine_details = None;
+                self.editor
+                    .update(cx, |editor, cx| editor.set_value(sql.clone(), window, cx));
+                self.execute_sql(sql, cx);
+            }
+            Some(OpenedObject::Routine(details)) => {
+                self.routine_details = Some(details);
+                cx.notify();
+            }
+            None => {}
+        }
     }
 
     fn run_query(&mut self, _: &RunQuery, window: &mut Window, cx: &mut Context<Self>) {
@@ -396,6 +485,20 @@ impl Workspace {
             return;
         }
 
+        let Some(sql) = self.sql_to_run(window, cx) else {
+            self.query = QueryState::Failed(DbError {
+                message: "There is no statement to run.".into(),
+                position: None,
+            });
+            cx.notify();
+            return;
+        };
+
+        self.routine_details = None;
+        self.execute_sql(sql, cx);
+    }
+
+    fn execute_sql(&mut self, sql: String, cx: &mut Context<Self>) {
         let connection = match &self.connection {
             ConnectionState::Connected(profile) => profile.connection.clone(),
             ConnectionState::NotConfigured => {
@@ -422,15 +525,6 @@ impl Workspace {
                 cx.notify();
                 return;
             }
-        };
-
-        let Some(sql) = self.sql_to_run(window, cx) else {
-            self.query = QueryState::Failed(DbError {
-                message: "There is no statement to run.".into(),
-                position: None,
-            });
-            cx.notify();
-            return;
         };
 
         self.query = QueryState::Running;
@@ -560,8 +654,108 @@ impl Workspace {
             .child(Input::new(input).w_full())
     }
 
+    fn render_main_content(
+        &self,
+        result_lines: Vec<String>,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let t = *theme(cx);
+
+        if let Some(details) = &self.routine_details {
+            let kind = match details.routine.kind {
+                RoutineKind::Function => "Function",
+                RoutineKind::Procedure => "Procedure",
+            };
+            return div()
+                .size_full()
+                .flex()
+                .flex_col()
+                .child(
+                    div()
+                        .p(px(layout::SPACE_LG))
+                        .border_b_1()
+                        .border_color(t.border)
+                        .flex()
+                        .flex_col()
+                        .gap(px(layout::SPACE_SM))
+                        .child(div().text_size(px(18.)).child(format!(
+                            "{}.{}({})",
+                            details.schema,
+                            details.routine.name,
+                            details.routine.identity_arguments
+                        )))
+                        .child(
+                            div()
+                                .flex()
+                                .gap(px(layout::SPACE_LG))
+                                .text_color(t.text_muted)
+                                .child(kind)
+                                .child(format!("Language: {}", details.routine.language))
+                                .children((!details.routine.result_type.is_empty()).then(|| {
+                                    div().child(format!("Returns: {}", details.routine.result_type))
+                                })),
+                        ),
+                )
+                .child(
+                    div()
+                        .id("routine-definition")
+                        .flex_1()
+                        .min_h_0()
+                        .overflow_y_scroll()
+                        .p(px(layout::SPACE_LG))
+                        .font_family(gpui_component::Theme::global(cx).mono_font_family.clone())
+                        .child(details.routine.definition.clone()),
+                );
+        }
+
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .p(px(layout::SPACE_LG))
+                    .font_family(gpui_component::Theme::global(cx).mono_font_family.clone())
+                    .child(
+                        Input::new(&self.editor)
+                            .h_full()
+                            .appearance(false)
+                            .bordered(false)
+                            .focus_bordered(false),
+                    ),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .border_t_1()
+                    .border_color(t.border)
+                    .child(Table::new(&self.results).bordered(false))
+                    .children((!result_lines.is_empty()).then(|| {
+                        div()
+                            .size_full()
+                            .p(px(layout::SPACE_LG))
+                            .font_family(gpui_component::Theme::global(cx).mono_font_family.clone())
+                            .text_color(if matches!(self.query, QueryState::Failed(_)) {
+                                t.danger
+                            } else {
+                                t.text
+                            })
+                            .children(
+                                result_lines.into_iter().map(|line| {
+                                    div().w_full().py(px(layout::SPACE_XS)).child(line)
+                                }),
+                            )
+                    })),
+            )
+    }
+
     fn render_explorer(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let t = *theme(cx);
+        let workspace = cx.entity().downgrade();
+        let targets = self.explorer_targets.clone();
         let content = match &self.connection {
             ConnectionState::Connected(Profile {
                 catalog: CatalogState::Loading,
@@ -590,9 +784,9 @@ impl Workspace {
             ConnectionState::Connected(Profile {
                 catalog: CatalogState::Loaded(_),
                 ..
-            }) => tree(&self.explorer_tree, |index, entry, _, _, cx| {
+            }) => render_tree(&self.explorer_tree, move |index, entry, _, _, cx| {
                 let t = *theme(cx);
-                ListItem::new(index)
+                let row = ListItem::new(index)
                     .pl(px(
                         layout::SPACE_SM + entry.depth() as f32 * layout::SPACE_MD
                     ))
@@ -605,7 +799,16 @@ impl Workspace {
                             .text_ellipsis()
                             .whitespace_nowrap()
                             .child(entry.item().label.clone()),
-                    )
+                    );
+                let Some(target) = targets.get(entry.item().id.as_str()).copied() else {
+                    return row;
+                };
+                let workspace = workspace.clone();
+                row.on_click(move |_, window, cx| {
+                    _ = workspace.update(cx, |workspace, cx| {
+                        workspace.open_explorer_target(target, window, cx);
+                    });
+                })
             })
             .into_any_element(),
             _ => div().into_any_element(),
@@ -718,52 +921,7 @@ impl Render for Workspace {
                             .flex_1()
                             .min_w_0()
                             .h_full()
-                            .flex()
-                            .flex_col()
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_h_0()
-                                    .p(px(layout::SPACE_LG))
-                                    .font_family(
-                                        gpui_component::Theme::global(cx).mono_font_family.clone(),
-                                    )
-                                    .child(
-                                        Input::new(&self.editor)
-                                            .h_full()
-                                            .appearance(false)
-                                            .bordered(false)
-                                            .focus_bordered(false),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_h_0()
-                                    .border_t_1()
-                                    .border_color(t.border)
-                                    .child(Table::new(&self.results).bordered(false))
-                                    .children((!result_lines.is_empty()).then(|| {
-                                        div()
-                                            .size_full()
-                                            .p(px(layout::SPACE_LG))
-                                            .font_family(
-                                                gpui_component::Theme::global(cx)
-                                                    .mono_font_family
-                                                    .clone(),
-                                            )
-                                            .text_color(
-                                                if matches!(self.query, QueryState::Failed(_)) {
-                                                    t.danger
-                                                } else {
-                                                    t.text
-                                                },
-                                            )
-                                            .children(result_lines.into_iter().map(|line| {
-                                                div().w_full().py(px(layout::SPACE_XS)).child(line)
-                                            }))
-                                    })),
-                            ),
+                            .child(self.render_main_content(result_lines, cx)),
                     ),
             )
             .child(

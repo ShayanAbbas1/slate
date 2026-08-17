@@ -1,38 +1,79 @@
+use std::collections::HashMap;
+
 use gpui_component::tree::TreeItem;
 
 use crate::db::{Catalog, Relation, Routine};
 
-pub fn tree_items(catalog: &Catalog, filter: &str) -> Vec<TreeItem> {
-    let filter = filter.trim().to_lowercase();
+pub const PREVIEW_ROW_LIMIT: usize = 1_000;
 
-    catalog
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExplorerTarget {
+    Relation {
+        schema_index: usize,
+        relation_index: usize,
+    },
+    Routine {
+        schema_index: usize,
+        routine_index: usize,
+    },
+}
+
+pub struct ExplorerTree {
+    pub items: Vec<TreeItem>,
+    pub targets: HashMap<String, ExplorerTarget>,
+}
+
+pub fn tree(catalog: &Catalog, filter: &str) -> ExplorerTree {
+    let filter = filter.trim().to_lowercase();
+    let mut targets = HashMap::new();
+
+    let items = catalog
         .schemas
         .iter()
-        .filter_map(|schema| {
+        .enumerate()
+        .filter_map(|(schema_index, schema)| {
             let schema_matches = matches_filter(&schema.name, &filter);
             let relations = schema
                 .relations
                 .iter()
-                .filter(|relation| schema_matches || relation_matches(relation, &filter))
-                .map(|relation| {
-                    TreeItem::new(
-                        format!("relation:{}:{}", schema.name, relation.name),
-                        relation.name.clone(),
-                    )
+                .enumerate()
+                .filter_map(|(relation_index, relation)| {
+                    if !schema_matches && !relation_matches(relation, &filter) {
+                        return None;
+                    }
+
+                    let id = format!("relation-{schema_index}-{relation_index}");
+                    targets.insert(
+                        id.clone(),
+                        ExplorerTarget::Relation {
+                            schema_index,
+                            relation_index,
+                        },
+                    );
+                    Some(TreeItem::new(id, relation.name.clone()))
                 })
                 .collect::<Vec<_>>();
             let routines = schema
                 .routines
                 .iter()
-                .filter(|routine| schema_matches || routine_matches(routine, &filter))
-                .map(|routine| {
-                    TreeItem::new(
-                        format!(
-                            "routine:{}:{}:{}",
-                            schema.name, routine.name, routine.identity_arguments
-                        ),
+                .enumerate()
+                .filter_map(|(routine_index, routine)| {
+                    if !schema_matches && !routine_matches(routine, &filter) {
+                        return None;
+                    }
+
+                    let id = format!("routine-{schema_index}-{routine_index}");
+                    targets.insert(
+                        id.clone(),
+                        ExplorerTarget::Routine {
+                            schema_index,
+                            routine_index,
+                        },
+                    );
+                    Some(TreeItem::new(
+                        id,
                         format!("{}({})", routine.name, routine.identity_arguments),
-                    )
+                    ))
                 })
                 .collect::<Vec<_>>();
 
@@ -43,29 +84,40 @@ pub fn tree_items(catalog: &Catalog, filter: &str) -> Vec<TreeItem> {
             let mut groups = Vec::new();
             if !relations.is_empty() {
                 groups.push(
-                    TreeItem::new(format!("relations:{}", schema.name), "Tables & Views")
+                    TreeItem::new(format!("relations-{schema_index}"), "Tables & Views")
                         .expanded(true)
                         .children(relations),
                 );
             }
             if !routines.is_empty() {
                 groups.push(
-                    TreeItem::new(
-                        format!("routines:{}", schema.name),
-                        "Functions & Procedures",
-                    )
-                    .expanded(true)
-                    .children(routines),
+                    TreeItem::new(format!("routines-{schema_index}"), "Functions & Procedures")
+                        .expanded(true)
+                        .children(routines),
                 );
             }
 
             Some(
-                TreeItem::new(format!("schema:{}", schema.name), schema.name.clone())
+                TreeItem::new(format!("schema-{schema_index}"), schema.name.clone())
                     .expanded(true)
                     .children(groups),
             )
         })
-        .collect()
+        .collect();
+
+    ExplorerTree { items, targets }
+}
+
+pub fn preview_sql(schema: &str, relation: &str) -> String {
+    format!(
+        "SELECT * FROM {}.{} LIMIT {PREVIEW_ROW_LIMIT}",
+        quote_identifier(schema),
+        quote_identifier(relation)
+    )
+}
+
+fn quote_identifier(identifier: &str) -> String {
+    format!("\"{}\"", identifier.replace('"', "\"\""))
 }
 
 fn relation_matches(relation: &Relation, filter: &str) -> bool {
@@ -121,7 +173,8 @@ mod tests {
 
     #[test]
     fn filter_keeps_the_matching_object_hierarchy() {
-        let items = tree_items(&catalog(), "account_name");
+        let explorer = tree(&catalog(), "account_name");
+        let items = explorer.items;
 
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].label, "public");
@@ -135,10 +188,32 @@ mod tests {
 
     #[test]
     fn matching_a_schema_keeps_all_of_its_objects() {
-        let items = tree_items(&catalog(), "analytics");
+        let explorer = tree(&catalog(), "analytics");
+        let items = explorer.items;
 
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].label, "analytics");
         assert_eq!(items[0].children[0].children[0].label, "events");
+    }
+
+    #[test]
+    fn tree_targets_use_catalog_indices_not_database_names() {
+        let explorer = tree(&catalog(), "account_name");
+
+        assert_eq!(
+            explorer.targets.get("routine-1-0"),
+            Some(&ExplorerTarget::Routine {
+                schema_index: 1,
+                routine_index: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn preview_sql_quotes_every_identifier_and_exposes_the_limit() {
+        assert_eq!(
+            preview_sql(r#"odd"schema"#, r#"table"name"#),
+            r#"SELECT * FROM "odd""schema"."table""name" LIMIT 1000"#
+        );
     }
 }
