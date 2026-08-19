@@ -1001,6 +1001,34 @@ impl Workspace {
         cx.notify();
     }
 
+    fn open_scratch_query(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self
+            .profile()
+            .is_some_and(|profile| profile.session.open_query.is_none())
+        {
+            return;
+        }
+        if let Err(message) = self.persist_buffer(cx) {
+            self.note(message, cx);
+            return;
+        }
+        let Some(profile) = self.profile_mut() else {
+            return;
+        };
+        let sql = store::read_scratch(&profile.id).unwrap_or_default();
+        profile
+            .session
+            .editor
+            .update(cx, |editor, cx| editor.set_value(sql, window, cx));
+        profile.session.open_query = None;
+        profile.session.content = Content::Query;
+        profile.session.query = QueryState::Idle;
+        profile.session.editor_needs_focus = true;
+        profile.session.notice = None;
+        self.remember_profiles(cx);
+        cx.notify();
+    }
+
     fn delete_saved_query(&mut self, name: String, cx: &mut Context<Self>) {
         let Some(profile) = self.profile_mut() else {
             return;
@@ -1488,10 +1516,39 @@ impl Workspace {
             .into_any_element()
     }
 
-    fn render_saved_queries(profile: &Profile, cx: &mut Context<Self>) -> AnyElement {
+    fn render_query_tabs(profile: &Profile, cx: &mut Context<Self>) -> AnyElement {
         let t = *theme(cx);
         let workspace = cx.entity().downgrade();
-        let mut rows = profile
+        let scratch_workspace = workspace.clone();
+        let scratch_active = profile.session.open_query.is_none();
+        let scratch = div()
+            .id("scratch-query-tab")
+            .h_full()
+            .flex()
+            .flex_shrink_0()
+            .items_center()
+            .gap(px(layout::SPACE_SM))
+            .px(px(layout::SPACE_MD))
+            .border_r_1()
+            .border_color(t.border)
+            .text_color(if scratch_active { t.text } else { t.text_muted })
+            .child(row_icon(t, icon::SAVED_QUERY))
+            .child("New Query")
+            .hover(|style| style.bg(t.element_hover))
+            .on_click(move |_, window, cx| {
+                _ = scratch_workspace.update(cx, |workspace, cx| {
+                    workspace.open_scratch_query(window, cx);
+                });
+            });
+        let scratch = if scratch_active {
+            scratch.bg(t.bg).font_weight(FontWeight::MEDIUM)
+        } else {
+            scratch
+        };
+
+        let mut tabs = vec![scratch.into_any_element()];
+        tabs.extend(
+            profile
             .session
             .saved_queries
             .iter()
@@ -1502,20 +1559,24 @@ impl Workspace {
                 let open_workspace = workspace.clone();
                 let delete_workspace = workspace.clone();
                 let pending = profile.session.pending_delete.as_deref() == Some(name);
-                div()
+                let active = profile.session.open_query.as_deref() == Some(name);
+                let tab = div()
                     .id(("saved-query", index))
-                    .h(px(30.))
+                    .h_full()
                     .flex()
+                    .flex_shrink_0()
                     .items_center()
                     .gap(px(layout::SPACE_SM))
-                    .px(px(layout::SPACE_SM))
-                    .text_color(t.text_muted)
+                    .pl(px(layout::SPACE_MD))
+                    .pr(px(layout::SPACE_XS))
+                    .border_r_1()
+                    .border_color(t.border)
+                    .text_color(if active { t.text } else { t.text_muted })
                     .hover(|style| style.bg(t.element_hover))
                     .child(row_icon(t, icon::SAVED_QUERY))
                     .child(
                         div()
-                            .flex_1()
-                            .min_w_0()
+                            .max_w(px(180.))
                             .overflow_hidden()
                             .text_ellipsis()
                             .whitespace_nowrap()
@@ -1537,19 +1598,27 @@ impl Workspace {
                         _ = open_workspace.update(cx, |workspace, cx| {
                             workspace.open_saved_query(open_name.clone(), window, cx);
                         });
-                    })
-                    .into_any_element()
-            })
-            .collect::<Vec<_>>();
+                    });
+                if active {
+                    tab.bg(t.bg)
+                        .font_weight(FontWeight::MEDIUM)
+                        .into_any_element()
+                } else {
+                    tab.into_any_element()
+                }
+            }),
+        );
 
-        if profile.session.naming {
+        let naming = if profile.session.naming {
             let workspace = workspace.clone();
-            rows.push(
+            Some(
                 div()
+                    .w(px(260.))
+                    .flex_shrink_0()
                     .flex()
                     .items_center()
                     .gap(px(layout::SPACE_XS))
-                    .p(px(layout::SPACE_SM))
+                    .px(px(layout::SPACE_SM))
                     .child(Input::new(&profile.session.save_name).flex_1())
                     .child(
                         Button::new("confirm-save-query")
@@ -1562,26 +1631,43 @@ impl Workspace {
                             }),
                     )
                     .into_any_element(),
-            );
-        }
+            )
+        } else {
+            None
+        };
 
+        let new_workspace = workspace.clone();
         div()
+            .h(px(38.))
+            .w_full()
             .flex_shrink_0()
-            .border_t_1()
+            .flex()
+            .items_center()
+            .bg(t.surface)
+            .border_b_1()
             .border_color(t.border)
             .child(
                 div()
-                    .px(px(layout::SPACE_SM))
-                    .pt(px(layout::SPACE_SM))
-                    .child(section_label(t, "Saved queries")),
+                    .id("query-tabs-scroll")
+                    .h_full()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .overflow_x_scroll()
+                    .children(tabs),
             )
             .child(
-                div()
-                    .id("saved-query-scroll")
-                    .max_h(px(148.))
-                    .overflow_y_scroll()
-                    .children(rows),
+                Button::new("new-query-tab")
+                    .label("+")
+                    .ghost()
+                    .small()
+                    .on_click(move |_, window, cx| {
+                        _ = new_workspace.update(cx, |workspace, cx| {
+                            workspace.new_query(&NewQuery, window, cx);
+                        });
+                    }),
             )
+            .children(naming)
             .into_any_element()
     }
 
@@ -1802,7 +1888,6 @@ impl Workspace {
                 ),
             )
             .child(div().flex_1().min_h_0().child(content))
-            .child(Self::render_saved_queries(profile, cx))
             .child(self.render_profile_switcher(cx))
     }
 }
@@ -1928,9 +2013,14 @@ impl Render for Workspace {
                             .min_w_0()
                             .h_full()
                             .p(px(layout::SPACE_SM))
+                            .flex()
+                            .flex_col()
+                            .child(Self::render_query_tabs(profile, cx))
                             .child(
                                 div()
-                                    .size_full()
+                                    .flex_1()
+                                    .min_h_0()
+                                    .w_full()
                                     .overflow_hidden()
                                     .bg(t.bg)
                                     .border_1()
