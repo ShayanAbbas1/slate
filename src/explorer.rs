@@ -2,9 +2,22 @@ use std::collections::HashMap;
 
 use gpui_component::tree::TreeItem;
 
-use crate::db::{Catalog, Relation, Routine};
+use crate::db::{Catalog, Relation, RelationKind, Routine, RoutineKind};
 
 pub const PREVIEW_ROW_LIMIT: usize = 1_000;
+
+const RELATION_CATEGORIES: [(RelationKind, &str); 5] = [
+    (RelationKind::Table, "Tables"),
+    (RelationKind::PartitionedTable, "Partitioned Tables"),
+    (RelationKind::View, "Views"),
+    (RelationKind::MaterializedView, "Materialized Views"),
+    (RelationKind::ForeignTable, "Foreign Tables"),
+];
+
+const ROUTINE_CATEGORIES: [(RoutineKind, &str); 2] = [
+    (RoutineKind::Function, "Functions"),
+    (RoutineKind::Procedure, "Procedures"),
+];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ExplorerTarget {
@@ -33,68 +46,66 @@ pub fn tree(catalog: &Catalog, filter: &str) -> ExplorerTree {
         .enumerate()
         .filter_map(|(schema_index, schema)| {
             let schema_matches = matches_filter(&schema.name, &filter);
-            let relations = schema
-                .relations
-                .iter()
-                .enumerate()
-                .filter_map(|(relation_index, relation)| {
-                    if !schema_matches && !relation_matches(relation, &filter) {
-                        return None;
-                    }
-
-                    let id = format!("relation-{schema_index}-{relation_index}");
-                    targets.insert(
-                        id.clone(),
-                        ExplorerTarget::Relation {
-                            schema_index,
-                            relation_index,
-                        },
-                    );
-                    Some(TreeItem::new(id, relation.name.clone()))
-                })
-                .collect::<Vec<_>>();
-            let routines = schema
-                .routines
-                .iter()
-                .enumerate()
-                .filter_map(|(routine_index, routine)| {
-                    if !schema_matches && !routine_matches(routine, &filter) {
-                        return None;
-                    }
-
-                    let id = format!("routine-{schema_index}-{routine_index}");
-                    targets.insert(
-                        id.clone(),
-                        ExplorerTarget::Routine {
-                            schema_index,
-                            routine_index,
-                        },
-                    );
-                    Some(TreeItem::new(
-                        id,
-                        format!("{}({})", routine.name, routine.identity_arguments),
-                    ))
-                })
-                .collect::<Vec<_>>();
-
-            if !schema_matches && relations.is_empty() && routines.is_empty() {
-                return None;
-            }
-
             let mut groups = Vec::new();
-            if !relations.is_empty() {
-                groups.push(
-                    TreeItem::new(format!("relations-{schema_index}"), "Tables & Views")
-                        .expanded(true)
-                        .children(relations),
-                );
+
+            for (kind, label) in RELATION_CATEGORIES {
+                let children = schema
+                    .relations
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, relation)| {
+                        relation.kind == kind
+                            && (schema_matches || relation_matches(relation, &filter))
+                    })
+                    .map(|(relation_index, relation)| {
+                        let id = format!("relation-{schema_index}-{relation_index}");
+                        targets.insert(
+                            id.clone(),
+                            ExplorerTarget::Relation {
+                                schema_index,
+                                relation_index,
+                            },
+                        );
+                        TreeItem::new(id, relation.name.clone())
+                    })
+                    .collect::<Vec<_>>();
+
+                if !children.is_empty() {
+                    groups.push(category(label, schema_index, children));
+                }
             }
-            if !routines.is_empty() {
-                groups.push(
-                    TreeItem::new(format!("routines-{schema_index}"), "Functions & Procedures")
-                        .expanded(true)
-                        .children(routines),
-                );
+
+            for (kind, label) in ROUTINE_CATEGORIES {
+                let children = schema
+                    .routines
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, routine)| {
+                        routine.kind == kind && (schema_matches || routine_matches(routine, &filter))
+                    })
+                    .map(|(routine_index, routine)| {
+                        let id = format!("routine-{schema_index}-{routine_index}");
+                        targets.insert(
+                            id.clone(),
+                            ExplorerTarget::Routine {
+                                schema_index,
+                                routine_index,
+                            },
+                        );
+                        TreeItem::new(
+                            id,
+                            format!("{}({})", routine.name, routine.identity_arguments),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+
+                if !children.is_empty() {
+                    groups.push(category(label, schema_index, children));
+                }
+            }
+
+            if !schema_matches && groups.is_empty() {
+                return None;
             }
 
             Some(
@@ -106,6 +117,12 @@ pub fn tree(catalog: &Catalog, filter: &str) -> ExplorerTree {
         .collect();
 
     ExplorerTree { items, targets }
+}
+
+fn category(label: &'static str, schema_index: usize, children: Vec<TreeItem>) -> TreeItem {
+    TreeItem::new(format!("category-{label}-{schema_index}"), label)
+        .expanded(true)
+        .children(children)
 }
 
 pub fn preview_sql(schema: &str, relation: &str) -> String {
@@ -154,18 +171,34 @@ mod tests {
                 },
                 Schema {
                     name: "public".into(),
-                    relations: vec![Relation {
-                        name: "accounts".into(),
-                        kind: RelationKind::Table,
-                    }],
-                    routines: vec![Routine {
-                        name: "account_name".into(),
-                        kind: RoutineKind::Function,
-                        identity_arguments: "account_id bigint".into(),
-                        result_type: "text".into(),
-                        language: "sql".into(),
-                        definition: String::new(),
-                    }],
+                    relations: vec![
+                        Relation {
+                            name: "active_accounts".into(),
+                            kind: RelationKind::View,
+                        },
+                        Relation {
+                            name: "accounts".into(),
+                            kind: RelationKind::Table,
+                        },
+                    ],
+                    routines: vec![
+                        Routine {
+                            name: "reindex".into(),
+                            kind: RoutineKind::Procedure,
+                            identity_arguments: String::new(),
+                            result_type: String::new(),
+                            language: "plpgsql".into(),
+                            definition: String::new(),
+                        },
+                        Routine {
+                            name: "account_name".into(),
+                            kind: RoutineKind::Function,
+                            identity_arguments: "account_id bigint".into(),
+                            result_type: "text".into(),
+                            language: "sql".into(),
+                            definition: String::new(),
+                        },
+                    ],
                 },
             ],
         }
@@ -179,11 +212,25 @@ mod tests {
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].label, "public");
         assert_eq!(items[0].children.len(), 1);
-        assert_eq!(items[0].children[0].label, "Functions & Procedures");
+        assert_eq!(items[0].children[0].label, "Functions");
         assert_eq!(
             items[0].children[0].children[0].label,
             "account_name(account_id bigint)"
         );
+    }
+
+    #[test]
+    fn each_object_kind_gets_its_own_category() {
+        let explorer = tree(&catalog(), "public");
+        let categories = &explorer.items[0].children;
+
+        assert_eq!(
+            categories.iter().map(|c| c.label.as_ref()).collect::<Vec<_>>(),
+            ["Tables", "Views", "Functions", "Procedures"]
+        );
+        assert_eq!(categories[0].children[0].label, "accounts");
+        assert_eq!(categories[1].children[0].label, "active_accounts");
+        assert_eq!(categories[3].children[0].label, "reindex()");
     }
 
     #[test]
@@ -201,10 +248,10 @@ mod tests {
         let explorer = tree(&catalog(), "account_name");
 
         assert_eq!(
-            explorer.targets.get("routine-1-0"),
+            explorer.targets.get("routine-1-1"),
             Some(&ExplorerTarget::Routine {
                 schema_index: 1,
-                routine_index: 0,
+                routine_index: 1,
             })
         );
     }
