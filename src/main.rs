@@ -8,7 +8,7 @@ mod theme;
 use std::{collections::HashMap, sync::Arc};
 
 use gpui::{
-    App, AppContext, Application, ClickEvent, Context, Entity, EntityInputHandler,
+    App, AppContext, Application, ClickEvent, Context, Entity, EntityInputHandler, Focusable,
     InteractiveElement, IntoElement, KeyBinding, ParentElement, Render, StatefulInteractiveElement,
     Styled, Window, WindowOptions, actions, div, px,
 };
@@ -27,7 +27,9 @@ use result_grid::ResultGrid;
 use sql::Buffer;
 use theme::{Appearance, Theme, layout, theme};
 
-actions!(slate, [RunQuery]);
+actions!(slate, [RunQuery, ShowEditor]);
+
+const RETURN_HINT: &str = "esc returns to the editor";
 
 enum ConnectionState {
     NotConfigured,
@@ -54,8 +56,12 @@ struct RoutineDetails {
     routine: Routine,
 }
 
-enum OpenedObject {
-    Relation { schema: String, name: String },
+/// What the main pane is showing. One field rather than a set of mode flags:
+/// the editor must never be hidden while `cmd+enter` still runs its contents,
+/// and a generated preview must never be written over the user's buffer.
+enum Content {
+    Query,
+    Preview { sql: String },
     Routine(RoutineDetails),
 }
 
@@ -186,10 +192,17 @@ struct Workspace {
     explorer_filter: Entity<InputState>,
     explorer_tree: Entity<TreeState>,
     explorer_targets: Arc<HashMap<String, ExplorerTarget>>,
-    routine_details: Option<RoutineDetails>,
+    content: Content,
     editor: Entity<InputState>,
     results: Entity<TableState<ResultGrid>>,
     query: QueryState,
+    /// Bumped on every connection attempt. A spawned task captures the value it
+    /// was issued under and drops its result if the connection has moved on,
+    /// so one profile's catalog or rows can never land on another's.
+    connection_generation: u64,
+    /// `cmd+enter` reaches the workspace only through the focused element's
+    /// dispatch path, so an unfocused editor makes the primary keystroke dead.
+    editor_needs_focus: bool,
 }
 
 impl Workspace {
@@ -223,73 +236,27 @@ impl Workspace {
                 .col_selectable(true)
         });
 
-        let config = match environment_config {
-            Ok(Some(config)) => config,
-            Ok(None) => {
-                return Self {
-                    connection: ConnectionState::NotConfigured,
-                    connection_form,
-                    explorer_filter,
-                    explorer_tree,
-                    explorer_targets,
-                    routine_details: None,
-                    editor,
-                    results,
-                    query: QueryState::Idle,
-                };
-            }
-            Err(message) => {
-                return Self {
-                    connection: ConnectionState::Failed(message),
-                    connection_form,
-                    explorer_filter,
-                    explorer_tree,
-                    explorer_targets,
-                    routine_details: None,
-                    editor,
-                    results,
-                    query: QueryState::Idle,
-                };
-            }
-        };
-
-        let endpoint = config.endpoint();
-        let task_config = config.clone();
-        let connection_task = cx
-            .background_executor()
-            .spawn(async move { Connection::open(task_config) });
-
-        cx.spawn(async move |workspace, cx| {
-            let result = connection_task.await;
-            workspace
-                .update(cx, |workspace, cx| {
-                    workspace.connection = match result {
-                        Ok(connection) => ConnectionState::Connected(Profile {
-                            name: config.database.clone(),
-                            config,
-                            connection,
-                            catalog: CatalogState::Loading,
-                        }),
-                        Err(error) => ConnectionState::Failed(error.message),
-                    };
-                    workspace.load_catalog(cx);
-                    cx.notify();
-                })
-                .ok();
-        })
-        .detach();
-
-        Self {
-            connection: ConnectionState::Connecting { endpoint },
+        let mut workspace = Self {
+            connection: ConnectionState::NotConfigured,
             connection_form,
             explorer_filter,
             explorer_tree,
             explorer_targets,
-            routine_details: None,
+            content: Content::Query,
             editor,
             results,
             query: QueryState::Idle,
+            connection_generation: 0,
+            editor_needs_focus: true,
+        };
+
+        match environment_config {
+            Ok(Some(config)) => workspace.begin_connect(config.database.clone(), config, cx),
+            Ok(None) => {}
+            Err(message) => workspace.connection = ConnectionState::Failed(message),
         }
+
+        workspace
     }
 
     fn apply_connection_url(
@@ -338,22 +305,31 @@ impl Workspace {
                 return;
             }
         };
-        let endpoint = config.endpoint();
+
+        self.connection_form.error = None;
+        self.begin_connect(name, config, cx);
+    }
+
+    fn begin_connect(&mut self, name: String, config: ConnectionConfig, cx: &mut Context<Self>) {
+        self.connection_generation += 1;
+        let generation = self.connection_generation;
+        self.connection = ConnectionState::Connecting {
+            endpoint: config.endpoint(),
+        };
+        cx.notify();
+
         let task_config = config.clone();
         let connection_task = cx
             .background_executor()
             .spawn(async move { Connection::open(task_config) });
 
-        self.connection_form.error = None;
-        self.connection = ConnectionState::Connecting {
-            endpoint: endpoint.clone(),
-        };
-        cx.notify();
-
         cx.spawn(async move |workspace, cx| {
             let result = connection_task.await;
             workspace
                 .update(cx, |workspace, cx| {
+                    if workspace.connection_generation != generation {
+                        return;
+                    }
                     workspace.connection = match result {
                         Ok(connection) => ConnectionState::Connected(Profile {
                             name,
@@ -363,6 +339,7 @@ impl Workspace {
                         }),
                         Err(error) => ConnectionState::Failed(error.message),
                     };
+                    workspace.editor_needs_focus = true;
                     workspace.load_catalog(cx);
                     cx.notify();
                 })
@@ -376,6 +353,7 @@ impl Workspace {
             ConnectionState::Connected(profile) => profile.connection.clone(),
             _ => return,
         };
+        let generation = self.connection_generation;
         let catalog_task = cx
             .background_executor()
             .spawn(async move { connection.catalog() });
@@ -384,6 +362,9 @@ impl Workspace {
             let result = catalog_task.await;
             workspace
                 .update(cx, |workspace, cx| {
+                    if workspace.connection_generation != generation {
+                        return;
+                    }
                     if let ConnectionState::Connected(profile) = &mut workspace.connection {
                         profile.catalog = match result {
                             Ok(catalog) => CatalogState::Loaded(catalog),
@@ -416,72 +397,78 @@ impl Workspace {
             .update(cx, |tree, cx| tree.set_items(explorer.items, cx));
     }
 
-    fn open_explorer_target(
-        &mut self,
-        target: ExplorerTarget,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let object = match (&self.connection, target) {
-            (
-                ConnectionState::Connected(Profile {
-                    catalog: CatalogState::Loaded(catalog),
-                    ..
-                }),
-                ExplorerTarget::Relation {
-                    schema_index,
-                    relation_index,
-                },
-            ) => catalog.schemas.get(schema_index).and_then(|schema| {
-                schema
-                    .relations
-                    .get(relation_index)
-                    .map(|relation| OpenedObject::Relation {
-                        schema: schema.name.clone(),
-                        name: relation.name.clone(),
+    fn open_explorer_target(&mut self, target: ExplorerTarget, cx: &mut Context<Self>) {
+        let Some(catalog) = self.catalog() else {
+            return;
+        };
+
+        match target {
+            ExplorerTarget::Relation {
+                schema_index,
+                relation_index,
+            } => {
+                let Some((schema, relation)) =
+                    catalog.schemas.get(schema_index).and_then(|schema| {
+                        let relation = schema.relations.get(relation_index)?;
+                        Some((schema.name.clone(), relation.name.clone()))
                     })
-            }),
-            (
-                ConnectionState::Connected(Profile {
-                    catalog: CatalogState::Loaded(catalog),
-                    ..
-                }),
-                ExplorerTarget::Routine {
-                    schema_index,
-                    routine_index,
-                },
-            ) => catalog.schemas.get(schema_index).and_then(|schema| {
-                schema.routines.get(routine_index).cloned().map(|routine| {
-                    OpenedObject::Routine(RoutineDetails {
+                else {
+                    return;
+                };
+
+                // The preview is shown in its own read-only surface rather than
+                // written into the editor: `set_value` is not undoable, so that
+                // would destroy an unsaved buffer on a misclick.
+                let sql = preview_sql(&schema, &relation);
+                self.content = Content::Preview { sql: sql.clone() };
+                self.execute_sql(sql, cx);
+            }
+            ExplorerTarget::Routine {
+                schema_index,
+                routine_index,
+            } => {
+                let Some(details) = catalog.schemas.get(schema_index).and_then(|schema| {
+                    let routine = schema.routines.get(routine_index)?.clone();
+                    Some(RoutineDetails {
                         schema: schema.name.clone(),
                         routine,
                     })
-                })
-            }),
-            _ => None,
-        };
-
-        match object {
-            Some(OpenedObject::Relation { schema, name }) => {
-                if matches!(self.query, QueryState::Running) {
+                }) else {
                     return;
-                }
-                let sql = preview_sql(&schema, &name);
-                self.routine_details = None;
-                self.editor
-                    .update(cx, |editor, cx| editor.set_value(sql.clone(), window, cx));
-                self.execute_sql(sql, cx);
-            }
-            Some(OpenedObject::Routine(details)) => {
-                self.routine_details = Some(details);
+                };
+
+                self.content = Content::Routine(details);
                 cx.notify();
             }
-            None => {}
         }
     }
 
+    fn catalog(&self) -> Option<&Catalog> {
+        match &self.connection {
+            ConnectionState::Connected(Profile {
+                catalog: CatalogState::Loaded(catalog),
+                ..
+            }) => Some(catalog),
+            _ => None,
+        }
+    }
+
+    /// Return to the editor. Without this the routine and preview surfaces are
+    /// one-way doors, since they replace the editor entirely.
+    fn show_editor(&mut self, _: &ShowEditor, _: &mut Window, cx: &mut Context<Self>) {
+        if matches!(self.content, Content::Query) {
+            return;
+        }
+        self.content = Content::Query;
+        self.editor_needs_focus = true;
+        cx.notify();
+    }
+
     fn run_query(&mut self, _: &RunQuery, window: &mut Window, cx: &mut Context<Self>) {
-        if matches!(self.query, QueryState::Running) {
+        // The editor is hidden behind the routine and preview surfaces, and
+        // running SQL the user cannot see is how an unrelated statement left in
+        // the buffer gets executed by muscle memory.
+        if !matches!(self.content, Content::Query) {
             return;
         }
 
@@ -494,11 +481,17 @@ impl Workspace {
             return;
         };
 
-        self.routine_details = None;
         self.execute_sql(sql, cx);
     }
 
     fn execute_sql(&mut self, sql: String, cx: &mut Context<Self>) {
+        // Guarded here rather than in each caller: every path that runs SQL
+        // routes through this one, and a caller that forgets would let two
+        // results race into the grid with the older one landing last.
+        if matches!(self.query, QueryState::Running) {
+            return;
+        }
+
         let connection = match &self.connection {
             ConnectionState::Connected(profile) => profile.connection.clone(),
             ConnectionState::NotConfigured => {
@@ -528,8 +521,15 @@ impl Workspace {
         };
 
         self.query = QueryState::Running;
+        // Rows from the previous statement must not sit under the one now on
+        // screen -- a reader cannot tell stale rows from fresh ones.
+        self.results.update(cx, |table, cx| {
+            *table.delegate_mut() = ResultGrid::empty();
+            table.refresh(cx);
+        });
         cx.notify();
 
+        let generation = self.connection_generation;
         let query_task = cx
             .background_executor()
             .spawn(async move { connection.query(&sql) });
@@ -538,6 +538,9 @@ impl Workspace {
             let result = query_task.await;
             workspace
                 .update(cx, |workspace, cx| {
+                    if workspace.connection_generation != generation {
+                        return;
+                    }
                     workspace.query = match result {
                         Ok(result) => {
                             let summary = QueryState::Complete {
@@ -600,7 +603,7 @@ impl Workspace {
             .justify_center()
             .child(
                 div()
-                    .w(px(layout::SIDEBAR_MAX_WIDTH))
+                    .w(px(layout::DIALOG_WIDTH))
                     .p(px(layout::SPACE_LG))
                     .bg(t.surface)
                     .border_1()
@@ -660,8 +663,9 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let t = *theme(cx);
+        let mono = gpui_component::Theme::global(cx).mono_font_family.clone();
 
-        if let Some(details) = &self.routine_details {
+        if let Content::Routine(details) = &self.content {
             let kind = match details.routine.kind {
                 RoutineKind::Function => "Function",
                 RoutineKind::Procedure => "Procedure",
@@ -693,7 +697,8 @@ impl Workspace {
                                 .child(format!("Language: {}", details.routine.language))
                                 .children((!details.routine.result_type.is_empty()).then(|| {
                                     div().child(format!("Returns: {}", details.routine.result_type))
-                                })),
+                                }))
+                                .child(RETURN_HINT),
                         ),
                 )
                 .child(
@@ -703,29 +708,49 @@ impl Workspace {
                         .min_h_0()
                         .overflow_y_scroll()
                         .p(px(layout::SPACE_LG))
-                        .font_family(gpui_component::Theme::global(cx).mono_font_family.clone())
+                        .font_family(mono)
                         .child(details.routine.definition.clone()),
                 );
         }
+
+        // The generated preview is shown as its own read-only surface, so it is
+        // always distinguishable from SQL the user wrote.
+        let top = match &self.content {
+            Content::Preview { sql } => div()
+                .flex_1()
+                .min_h_0()
+                .p(px(layout::SPACE_LG))
+                .font_family(mono)
+                .flex()
+                .flex_col()
+                .gap(px(layout::SPACE_SM))
+                .child(
+                    div()
+                        .text_color(t.text_muted)
+                        .child(format!("Generated preview · {RETURN_HINT}")),
+                )
+                .child(sql.clone())
+                .into_any_element(),
+            _ => div()
+                .flex_1()
+                .min_h_0()
+                .p(px(layout::SPACE_LG))
+                .font_family(mono)
+                .child(
+                    Input::new(&self.editor)
+                        .h_full()
+                        .appearance(false)
+                        .bordered(false)
+                        .focus_bordered(false),
+                )
+                .into_any_element(),
+        };
 
         div()
             .size_full()
             .flex()
             .flex_col()
-            .child(
-                div()
-                    .flex_1()
-                    .min_h_0()
-                    .p(px(layout::SPACE_LG))
-                    .font_family(gpui_component::Theme::global(cx).mono_font_family.clone())
-                    .child(
-                        Input::new(&self.editor)
-                            .h_full()
-                            .appearance(false)
-                            .bordered(false)
-                            .focus_bordered(false),
-                    ),
-            )
+            .child(top)
             .child(
                 div()
                     .flex_1()
@@ -804,9 +829,9 @@ impl Workspace {
                     return row;
                 };
                 let workspace = workspace.clone();
-                row.on_click(move |_, window, cx| {
+                row.on_click(move |_, _, cx| {
                     _ = workspace.update(cx, |workspace, cx| {
-                        workspace.open_explorer_target(target, window, cx);
+                        workspace.open_explorer_target(target, cx);
                     });
                 })
             })
@@ -835,8 +860,17 @@ impl Workspace {
 }
 
 impl Render for Workspace {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = *theme(cx);
+        // Deferred to render because the editor has to be mounted before it can
+        // take focus, and the connection that reveals it resolves off-thread.
+        if self.editor_needs_focus
+            && matches!(self.connection, ConnectionState::Connected(_))
+            && matches!(self.content, Content::Query)
+        {
+            self.editor.focus_handle(cx).focus(window);
+            self.editor_needs_focus = false;
+        }
         let (status, status_color) = match &self.connection {
             ConnectionState::NotConfigured => {
                 ("No connection configured.".to_string(), t.text_muted)
@@ -893,6 +927,7 @@ impl Render for Workspace {
         div()
             .id("workspace")
             .on_action(cx.listener(Self::run_query))
+            .on_action(cx.listener(Self::show_editor))
             .size_full()
             .bg(t.bg)
             .text_color(t.text)
@@ -965,11 +1000,17 @@ fn connection_config_from_environment() -> Result<Option<ConnectionConfig>, Stri
     .filter_map(|(name, value)| value.is_none().then_some(name))
     .collect::<Vec<_>>();
 
-    if !missing.is_empty() {
+    // Destructured rather than unwrapped, so the compiler -- not a list of
+    // names twenty lines up -- is what guarantees these are present.
+    let (Some(host), Some(database), Some(user)) = (host, database, user) else {
         return Err(format!(
             "Connection configuration is missing {}.",
             missing.join(", ")
         ));
+    };
+
+    if let Ok(sslmode) = std::env::var("PGSSLMODE") {
+        db::reject_unsupported_sslmode(&sslmode)?;
     }
 
     let port = port
@@ -980,10 +1021,10 @@ fn connection_config_from_environment() -> Result<Option<ConnectionConfig>, Stri
         .transpose()?;
 
     Ok(Some(ConnectionConfig {
-        host: host.expect("checked above"),
+        host,
         port,
-        database: database.expect("checked above"),
-        user: user.expect("checked above"),
+        database,
+        user,
         password: std::env::var("PGPASSWORD").unwrap_or_default(),
     }))
 }
@@ -994,7 +1035,10 @@ fn main() {
         let theme = Theme::new(Appearance::Dark);
         theme.apply_to_components(cx);
         cx.set_global(theme);
-        cx.bind_keys([KeyBinding::new("cmd-enter", RunQuery, None)]);
+        cx.bind_keys([
+            KeyBinding::new("cmd-enter", RunQuery, None),
+            KeyBinding::new("escape", ShowEditor, None),
+        ]);
 
         // Root must be the window's first layer or dialog and notification
         // layers panic when they look for it.

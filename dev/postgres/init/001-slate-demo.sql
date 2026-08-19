@@ -171,3 +171,20 @@ SELECT
     count(*) FILTER (WHERE active) AS active_accounts
 FROM accounts
 GROUP BY plan;
+
+-- Routines the explorer can actually show. Extension-owned routines are
+-- filtered out of the catalog, so without these the routine surface has
+-- nothing to display against this database.
+CREATE FUNCTION account_label(account_id bigint) RETURNS text
+LANGUAGE sql STABLE AS $$
+    SELECT name || ' (' || plan::text || ')'
+    FROM accounts
+    WHERE id = account_id;
+$$;
+
+CREATE PROCEDURE deactivate_account(account_id bigint)
+LANGUAGE plpgsql AS $$
+BEGIN
+    UPDATE accounts SET active = false WHERE id = account_id;
+END;
+$$;

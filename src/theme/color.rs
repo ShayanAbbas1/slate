@@ -121,6 +121,10 @@ impl Srgb {
 /// WCAG 2.1 contrast ratio, always `>= 1.0` regardless of argument order.
 ///
 /// AA wants 4.5 for body text and 3.0 for large text; AAA wants 7.0.
+///
+/// Test-only by design: the spec requires contrast to be *checked*, not painted
+/// with. Nothing at runtime should be picking colours by measuring them.
+#[cfg(test)]
 pub fn contrast_ratio(a: Srgb, b: Srgb) -> f32 {
     let (l1, l2) = (a.relative_luminance(), b.relative_luminance());
     let (hi, lo) = if l1 > l2 { (l1, l2) } else { (l2, l1) };

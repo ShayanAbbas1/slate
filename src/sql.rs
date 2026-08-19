@@ -17,36 +17,29 @@ use std::ops::Range;
 
 use tree_sitter::{Parser, Tree};
 
-/// A parsed query buffer. Holds the tree so repeated cursor moves don't reparse.
+/// The runnable statements of a query buffer, as byte ranges into it.
 pub struct Buffer {
-    tree: Option<Tree>,
     statements: Vec<Range<usize>>,
 }
 
 impl Buffer {
     pub fn parse(sql: &str) -> Self {
         let mut parser = Parser::new();
-        let tree = parser
+        let statements = parser
             .set_language(&tree_sitter_sequel::LANGUAGE.into())
             .ok()
-            .and_then(|_| parser.parse(sql, None));
-
-        let statements = tree
-            .as_ref()
-            .map(|tree| collect_statements(tree, sql))
+            .and_then(|_| parser.parse(sql, None))
+            .map(|tree| collect_statements(&tree, sql))
             .unwrap_or_default();
 
-        Self { tree, statements }
+        Self { statements }
     }
 
     /// Byte ranges of each statement, in source order, trimmed of surrounding
     /// whitespace. Empty if the buffer holds no statements.
+    #[cfg(test)]
     pub fn statements(&self) -> &[Range<usize>] {
         &self.statements
-    }
-
-    pub fn parsed(&self) -> bool {
-        self.tree.is_some()
     }
 
     /// The statement to run for a cursor at `offset`.
@@ -76,14 +69,18 @@ impl Buffer {
     }
 }
 
-/// Top-level named children of the root are statements. Taking them from the
-/// tree rather than matching node kind names keeps this working across grammar
-/// revisions, which rename node kinds more often than they restructure the root.
+/// The grammar declares exactly these three as the root's statement children.
+/// Filtering on them is not optional: comments are tree-sitter *extras*, so
+/// `comment`, `marginalia` and `ERROR` also land at the root, and sending one
+/// of those to the server returns an empty response the user cannot explain.
+const STATEMENT_KINDS: [&str; 3] = ["statement", "block", "transaction"];
+
 fn collect_statements(tree: &Tree, sql: &str) -> Vec<Range<usize>> {
     let root = tree.root_node();
     let mut cursor = root.walk();
 
     root.named_children(&mut cursor)
+        .filter(|node| STATEMENT_KINDS.contains(&node.kind()))
         .filter_map(|node| trim_range(sql, node.byte_range()))
         .collect()
 }
@@ -110,9 +107,53 @@ mod tests {
 
     #[test]
     fn grammar_loads() {
-        assert!(
-            Buffer::parse("SELECT 1;").parsed(),
+        assert_eq!(
+            texts("SELECT 1;"),
+            vec!["SELECT 1"],
             "SQL grammar failed to load"
+        );
+    }
+
+    #[test]
+    fn a_leading_comment_is_not_a_runnable_statement() {
+        // Cursor at 0 in a buffer that opens with a header comment. Running the
+        // comment returns an empty response with no error to explain it.
+        let sql = "-- notes; about this\nSELECT 1;";
+        let buffer = Buffer::parse(sql);
+
+        assert_eq!(&sql[buffer.statement_at(0).unwrap()], "SELECT 1");
+    }
+
+    #[test]
+    fn a_trailing_comment_is_not_a_runnable_statement() {
+        let sql = "SELECT 1; -- trailing";
+        let buffer = Buffer::parse(sql);
+
+        assert_eq!(&sql[buffer.statement_at(sql.len()).unwrap()], "SELECT 1");
+    }
+
+    #[test]
+    fn a_cursor_inside_a_gap_comment_selects_the_preceding_statement() {
+        // The contract statement_at documents, which the block comment used to
+        // win against by matching its own range.
+        let sql = "SELECT 1;\n/* gap comment */\nSELECT 2;";
+        let buffer = Buffer::parse(sql);
+        let inside = sql.find("gap").unwrap();
+
+        assert_eq!(&sql[buffer.statement_at(inside).unwrap()], "SELECT 1");
+    }
+
+    #[test]
+    fn a_buffer_of_only_comments_has_nothing_to_run() {
+        assert!(Buffer::parse("-- only a comment").statement_at(0).is_none());
+        assert!(Buffer::parse(";;;").statement_at(0).is_none());
+    }
+
+    #[test]
+    fn a_transaction_block_runs_as_one_statement() {
+        assert_eq!(
+            texts("BEGIN; SELECT 1; COMMIT;"),
+            vec!["BEGIN; SELECT 1; COMMIT"]
         );
     }
 
@@ -185,9 +226,15 @@ mod tests {
 
     #[test]
     fn incomplete_input_still_reports_something_runnable() {
-        // Half-typed queries must not panic or wipe the statement list.
-        let buffer = Buffer::parse("SELECT * FROM");
-        assert!(buffer.parsed());
+        // Half-typed queries must not panic or wipe the statement list. The
+        // dangling `FROM` parses as an ERROR node and is dropped, so the cursor
+        // at the end runs `SELECT *` and the server explains the problem --
+        // better than shipping `FROM` on its own.
+        let sql = "SELECT * FROM";
+        let buffer = Buffer::parse(sql);
+
         assert!(buffer.statement_at(3).is_some());
+        assert_eq!(&sql[buffer.statement_at(sql.len()).unwrap()], "SELECT *");
     }
 }
+

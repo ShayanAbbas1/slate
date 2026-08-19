@@ -41,7 +41,7 @@ pub mod layout {
     pub const GRID_COLUMN_WIDTH: f32 = 180.0;
     pub const SIDEBAR_DEFAULT_WIDTH: f32 = 256.0;
     pub const SIDEBAR_MIN_WIDTH: f32 = 180.0;
-    pub const SIDEBAR_MAX_WIDTH: f32 = 420.0;
+    pub const DIALOG_WIDTH: f32 = 420.0;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -53,8 +53,8 @@ pub enum Appearance {
 
 impl gpui::Global for Theme {}
 
-/// Read the active theme. Panics if [`Theme::install`] has not run, which can
-/// only happen if a view renders before app setup.
+/// Read the active theme. Panics unless [`Theme::apply_to_components`] and
+/// `cx.set_global` have run, which `main` does before opening the window.
 pub fn theme(cx: &gpui::App) -> &Theme {
     cx.global::<Theme>()
 }
@@ -118,8 +118,6 @@ pub struct Theme {
     pub bg: Srgb,
     /// Chrome one step from `bg`: sidebar, tab strip, status bar.
     pub surface: Srgb,
-    /// Popovers, dialogs, the value inspector.
-    pub surface_raised: Srgb,
 
     pub element_hover: Rgba,
     pub element_active: Rgba,
@@ -137,7 +135,6 @@ pub struct Theme {
     pub cursor: Srgb,
 
     pub danger: Srgb,
-    pub warning: Srgb,
     pub success: Srgb,
 
     pub syntax_comment: Srgb,
@@ -171,6 +168,11 @@ impl Theme {
         component.colors.caret = self.cursor.into();
         component.colors.selection = self.selection.into();
         component.colors.ring = self.accent.into();
+        // Without these the primary button paints gpui-component's own blue.
+        component.colors.primary = self.accent.into();
+        component.colors.primary_foreground = self.on_accent.into();
+        component.colors.primary_hover = self.element_hover.flatten(self.accent).into();
+        component.colors.primary_active = self.element_active.flatten(self.accent).into();
         component.colors.muted = self.surface.into();
         component.colors.muted_foreground = self.text_muted.into();
         component.colors.scrollbar = self.bg.into();
@@ -187,6 +189,8 @@ impl Theme {
         component.highlight_theme = self.highlight_theme();
     }
 
+    /// Built through serde because `ThemeStyle`'s fields are private and it has
+    /// no constructor — deserialization is the only way to make one from here.
     fn highlight_theme(self) -> Arc<HighlightTheme> {
         let style = |color: Srgb| json!({ "color": color.hex() });
         let syntax: SyntaxColors = serde_json::from_value(json!({
@@ -231,7 +235,10 @@ impl Theme {
             "variable.special": style(self.syntax_keyword),
             "variant": style(self.syntax_type)
         }))
-        .expect("Slate's syntax theme must be valid");
+        // Unstyled syntax is a bad afternoon; a window that will not open is a
+        // worse one. A gpui-component bump that renames a key must not be able
+        // to stop the app from starting -- the test below is what catches it.
+        .unwrap_or_default();
 
         Arc::new(HighlightTheme {
             name: "Slate".into(),
@@ -257,7 +264,6 @@ impl Theme {
 
             bg: neutral(0.155),
             surface: neutral(0.195),
-            surface_raised: neutral(0.235),
 
             element_hover: WHITE.alpha(0.05),
             element_active: WHITE.alpha(0.09),
@@ -275,7 +281,6 @@ impl Theme {
             cursor: Oklch::new(0.72, 0.14, 250.0).to_srgb(),
 
             danger: Oklch::new(0.68, 0.19, 25.0).to_srgb(),
-            warning: Oklch::new(0.80, 0.13, 85.0).to_srgb(),
             success: Oklch::new(0.72, 0.15, 150.0).to_srgb(),
 
             syntax_comment: neutral(0.64),
@@ -295,7 +300,6 @@ impl Theme {
 
             bg: WHITE,
             surface: neutral(0.975),
-            surface_raised: WHITE,
 
             element_hover: BLACK.alpha(0.04),
             element_active: BLACK.alpha(0.08),
@@ -313,7 +317,6 @@ impl Theme {
             cursor: Oklch::new(0.48, 0.18, 250.0).to_srgb(),
 
             danger: Oklch::new(0.52, 0.20, 25.0).to_srgb(),
-            warning: Oklch::new(0.58, 0.14, 75.0).to_srgb(),
             success: Oklch::new(0.52, 0.15, 150.0).to_srgb(),
 
             syntax_comment: neutral(0.46),

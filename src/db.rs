@@ -49,6 +49,9 @@ SELECT
     COALESCE(pg_catalog.pg_get_function_result(procedure.oid), '') AS result_type,
     language.lanname AS language,
     pg_catalog.pg_get_functiondef(procedure.oid) AS definition
+-- Extension-owned routines are excluded. PostGIS alone installs some 750 of
+-- them into `public`, and fetching every body at connect buries the handful of
+-- routines the user actually wrote.
 FROM pg_catalog.pg_proc AS procedure
 JOIN pg_catalog.pg_namespace AS namespace
     ON namespace.oid = procedure.pronamespace
@@ -57,8 +60,17 @@ JOIN pg_catalog.pg_language AS language
 WHERE procedure.prokind IN ('f', 'p')
     AND namespace.nspname <> 'information_schema'
     AND namespace.nspname NOT LIKE 'pg\\_%' ESCAPE '\\'
+    AND NOT EXISTS (
+        SELECT 1
+        FROM pg_catalog.pg_depend AS dependency
+        WHERE dependency.objid = procedure.oid
+            AND dependency.classid = 'pg_catalog.pg_proc'::regclass
+            AND dependency.deptype = 'e'
+    )
 ORDER BY namespace.nspname, procedure.proname, identity_arguments
 ";
+
+const CONNECT_TIMEOUT_SECONDS: u64 = 10;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConnectionConfig {
@@ -86,6 +98,11 @@ impl ConnectionConfig {
         let parsed: postgres::Config = url
             .parse()
             .map_err(|error| format!("Connection URL is invalid: {error}"))?;
+        for (key, value) in url_parts.query_pairs() {
+            if key.as_ref() == "sslmode" {
+                reject_unsupported_sslmode(value.as_ref())?;
+            }
+        }
         let host = match parsed.get_hosts() {
             [Host::Tcp(host)] => host.clone(),
             [] => return Err("Connection URL does not contain a host.".into()),
@@ -140,6 +157,10 @@ impl ConnectionConfig {
         if !self.password.is_empty() {
             parts.push(format!("password={}", quote(&self.password)));
         }
+        // Without this the driver waits out the OS SYN retry budget, so a host
+        // that resolves but drops packets pins the UI in "Connecting…" for
+        // minutes with no cancel.
+        parts.push(format!("connect_timeout={CONNECT_TIMEOUT_SECONDS}"));
         parts.join(" ")
     }
 
@@ -154,6 +175,19 @@ impl ConnectionConfig {
 fn quote(value: &str) -> String {
     let escaped = value.replace('\\', r"\\").replace('\'', r"\'");
     format!("'{escaped}'")
+}
+
+/// Slate connects with `NoTls`. The driver's default `sslmode` is `prefer`,
+/// which silently falls back to plaintext without even sending an SSLRequest —
+/// so a pasted `?sslmode=require` would put the user's credentials on the wire
+/// in the clear while the UI reported success. Refuse instead, until TLS lands.
+pub fn reject_unsupported_sslmode(mode: &str) -> Result<(), String> {
+    match mode.trim().to_ascii_lowercase().as_str() {
+        "" | "disable" | "prefer" => Ok(()),
+        other => Err(format!(
+            "sslmode={other} requires TLS, which Slate does not support yet."
+        )),
+    }
 }
 
 /// One column of a result set.
@@ -266,18 +300,20 @@ impl Connection {
     /// limits belong to the caller that *generated* a query, never to one the
     /// user typed.
     pub fn query(&self, sql: &str) -> Result<QueryResult, DbError> {
-        let started = Instant::now();
-
         let mut client = self.client.lock().map_err(|_| DbError {
             message: "The connection is unavailable after an earlier internal failure.".into(),
             position: None,
         })?;
 
+        // Timed from here, not from the call: one client serialises a profile's
+        // queries, and time spent waiting behind the catalog load is not time
+        // the server spent on this statement.
+        let started = Instant::now();
         let messages = client
             .simple_query(sql)
             .map_err(|error| query_error(&error, sql))?;
 
-        Ok(assemble(messages, started.elapsed()))
+        assemble(messages, started.elapsed())
     }
 
     pub fn catalog(&self) -> Result<Catalog, DbError> {
@@ -287,7 +323,10 @@ impl Connection {
     }
 }
 
-fn assemble(messages: Vec<SimpleQueryMessage>, elapsed: Duration) -> QueryResult {
+fn assemble(
+    messages: Vec<SimpleQueryMessage>,
+    elapsed: Duration,
+) -> Result<QueryResult, DbError> {
     let mut result = QueryResult {
         elapsed,
         ..Default::default()
@@ -295,7 +334,25 @@ fn assemble(messages: Vec<SimpleQueryMessage>, elapsed: Duration) -> QueryResult
 
     for message in messages {
         match message {
+            // One selection can carry several statements, and the grid shows
+            // one result set -- so each new description starts the kept set
+            // over and the last statement wins. Accumulating across statements
+            // would put one statement's rows under another's column names.
+            SimpleQueryMessage::RowDescription(columns) => {
+                result.columns = columns
+                    .iter()
+                    .map(|column| Column {
+                        name: column.name().to_string(),
+                    })
+                    .collect();
+                result.rows.clear();
+                result.bytes = 0;
+                result.rows_affected = None;
+            }
             SimpleQueryMessage::Row(row) => {
+                // A row arriving with no description before it is not a path
+                // the driver takes today; without this the grid would render
+                // headerless and drop every value it was handed.
                 if result.columns.is_empty() {
                     result.columns = row
                         .columns()
@@ -306,9 +363,17 @@ fn assemble(messages: Vec<SimpleQueryMessage>, elapsed: Duration) -> QueryResult
                         .collect();
                 }
 
+                // `get` panics on a value the driver cannot decode as UTF-8,
+                // and it would panic here holding the client mutex — poisoning
+                // it and taking the process down with it. A database whose
+                // encoding is SQL_ASCII can return such bytes for ordinary text.
                 let cells: Vec<Cell> = (0..row.len())
-                    .map(|index| row.get(index).map(str::to_string))
-                    .collect();
+                    .map(|index| {
+                        row.try_get(index)
+                            .map(|cell| cell.map(str::to_string))
+                            .map_err(|_| non_utf8_error(&result.columns, index))
+                    })
+                    .collect::<Result<_, _>>()?;
 
                 result.bytes += cells
                     .iter()
@@ -323,7 +388,7 @@ fn assemble(messages: Vec<SimpleQueryMessage>, elapsed: Duration) -> QueryResult
         }
     }
 
-    result
+    Ok(result)
 }
 
 fn assemble_catalog(relations: QueryResult, routines: QueryResult) -> Result<Catalog, DbError> {
@@ -400,6 +465,17 @@ fn required_cell<'a>(
 
 fn unexpected_catalog_value(label: &str, value: &str) -> DbError {
     catalog_error(format!("Catalog query returned unknown {label} {value}."))
+}
+
+fn non_utf8_error(columns: &[Column], index: usize) -> DbError {
+    let column = columns
+        .get(index)
+        .map(|column| format!("column {}", column.name))
+        .unwrap_or_else(|| format!("column {index}"));
+
+    catalog_error(format!(
+        "A value in {column} is not valid UTF-8 text and cannot be displayed."
+    ))
 }
 
 fn catalog_error(message: String) -> DbError {
@@ -498,12 +574,25 @@ mod tests {
         }
     }
 
+    /// The server the `live_` tests talk to, from the standard `PG*` variables.
+    fn live_config() -> ConnectionConfig {
+        ConnectionConfig {
+            host: std::env::var("PGHOST").expect("PGHOST is required"),
+            port: std::env::var("PGPORT")
+                .ok()
+                .map(|port| port.parse().expect("PGPORT must be a number")),
+            database: std::env::var("PGDATABASE").expect("PGDATABASE is required"),
+            user: std::env::var("PGUSER").expect("PGUSER is required"),
+            password: std::env::var("PGPASSWORD").unwrap_or_default(),
+        }
+    }
+
     #[test]
     fn connection_string_quotes_values() {
         let config = config();
         assert_eq!(
             config.connection_string(),
-            "host='db.example.test' dbname='slate_test' user='someone' port=8432"
+            "host='db.example.test' dbname='slate_test' user='someone' port=8432 connect_timeout=10"
         );
     }
 
@@ -685,6 +774,27 @@ mod tests {
     }
 
     #[test]
+    fn a_url_demanding_tls_is_refused_rather_than_sent_in_the_clear() {
+        let error = ConnectionConfig::from_url(
+            "postgresql://someone@db.example.test/slate_test?sslmode=require",
+        )
+        .unwrap_err();
+
+        assert!(error.contains("TLS"), "unexpected message: {error}");
+    }
+
+    #[test]
+    fn a_url_without_tls_still_parses() {
+        for mode in ["disable", "prefer"] {
+            let url = format!("postgresql://someone@db.example.test/slate_test?sslmode={mode}");
+            assert!(
+                ConnectionConfig::from_url(&url).is_ok(),
+                "sslmode={mode} should be accepted"
+            );
+        }
+    }
+
+    #[test]
     fn catalog_rejects_unknown_object_kinds() {
         let relations = result(
             &["schema_name", "relation_name", "relation_kind"],
@@ -702,17 +812,7 @@ mod tests {
     #[test]
     #[ignore = "requires a local Postgres server configured through PG*"]
     fn live_query_round_trip() {
-        let config = ConnectionConfig {
-            host: std::env::var("PGHOST").expect("PGHOST is required"),
-            port: std::env::var("PGPORT")
-                .ok()
-                .map(|port| port.parse().expect("PGPORT must be a number")),
-            database: std::env::var("PGDATABASE").expect("PGDATABASE is required"),
-            user: std::env::var("PGUSER").expect("PGUSER is required"),
-            password: std::env::var("PGPASSWORD").unwrap_or_default(),
-        };
-
-        let connection = Connection::open(config).expect("connection should open");
+        let connection = Connection::open(live_config()).expect("connection should open");
         let result = connection
             .query("SELECT * FROM (VALUES (1, 'alpha'), (2, NULL)) AS sample(id, label)")
             .expect("query should succeed");
@@ -738,19 +838,46 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a local Postgres server configured through PG*"]
+    fn live_a_multi_statement_selection_keeps_one_result_shape() {
+        // `assemble` cannot be unit-tested -- SimpleQueryRow and SimpleColumn
+        // have no public constructor -- so the ragged-rows panic is guarded
+        // here. Before the RowDescription arm existed this produced 3 columns
+        // against a 1-cell row, and the grid aborted the process painting it.
+        let connection = Connection::open(live_config()).expect("connection should open");
+
+        let result = connection
+            .query("SELECT 1 AS a, 2 AS b, 3 AS c; SELECT 4 AS d")
+            .expect("query should succeed");
+
+        assert_eq!(result.columns, vec![Column { name: "d".into() }]);
+        assert_eq!(result.rows, vec![vec![Some("4".into())]]);
+        assert!(
+            result.rows.iter().all(|row| row.len() == result.columns.len()),
+            "every row must match the column count"
+        );
+
+        // A valid empty result still has to carry its headers.
+        let empty = connection
+            .query("SELECT 1 AS id, 'x' AS label WHERE false")
+            .expect("query should succeed");
+
+        assert_eq!(
+            empty.columns,
+            vec![
+                Column { name: "id".into() },
+                Column {
+                    name: "label".into()
+                }
+            ]
+        );
+        assert!(empty.rows.is_empty());
+    }
+
+    #[test]
     #[ignore = "requires the repository development database configured through PG*"]
     fn live_catalog_round_trip() {
-        let config = ConnectionConfig {
-            host: std::env::var("PGHOST").expect("PGHOST is required"),
-            port: std::env::var("PGPORT")
-                .ok()
-                .map(|port| port.parse().expect("PGPORT must be a number")),
-            database: std::env::var("PGDATABASE").expect("PGDATABASE is required"),
-            user: std::env::var("PGUSER").expect("PGUSER is required"),
-            password: std::env::var("PGPASSWORD").unwrap_or_default(),
-        };
-
-        let catalog = Connection::open(config)
+        let catalog = Connection::open(live_config())
             .expect("connection should open")
             .catalog()
             .expect("catalog should load");
@@ -769,5 +896,24 @@ mod tests {
         assert!(public.relations.iter().any(|relation| {
             relation.name == "account_overview" && relation.kind == RelationKind::View
         }));
+
+        assert!(
+            public
+                .routines
+                .iter()
+                .any(|routine| routine.name == "account_label"
+                    && routine.kind == RoutineKind::Function),
+            "the database's own routines must be listed"
+        );
+        // PostGIS installs ~750 routines into `public`. None of them belong in
+        // a sidebar listing what the user wrote.
+        assert!(
+            !public
+                .routines
+                .iter()
+                .any(|routine| routine.name.starts_with("st_")
+                    || routine.name.starts_with("_postgis")),
+            "extension-owned routines must not be listed"
+        );
     }
 }
