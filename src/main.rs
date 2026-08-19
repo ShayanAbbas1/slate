@@ -824,6 +824,7 @@ impl Workspace {
                         .id("routine-definition")
                         .flex_1()
                         .min_h_0()
+                        .bg(t.panel)
                         .overflow_y_scroll()
                         .p(px(layout::SPACE_LG))
                         .font_family(mono)
@@ -910,6 +911,7 @@ impl Workspace {
                 div()
                     .flex_1()
                     .min_h_0()
+                    .bg(t.panel)
                     .border_t_1()
                     .border_color(t.border)
                     .child(bottom),
@@ -1074,7 +1076,7 @@ impl Workspace {
             .w(px(layout::SIDEBAR_DEFAULT_WIDTH))
             .min_w(px(layout::SIDEBAR_MIN_WIDTH))
             .h_full()
-            .bg(t.surface)
+            .bg(t.chrome())
             .border_r_1()
             .border_color(t.border)
             .flex()
@@ -1165,7 +1167,9 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::run_query))
             .on_action(cx.listener(Self::show_editor))
             .size_full()
-            .bg(t.bg)
+            // No fill on the root: an opaque one here would sit between the
+            // frosted chrome and the blurred desktop, and the frost would have
+            // nothing to show through it.
             .text_color(t.text)
             .flex()
             .flex_col()
@@ -1173,7 +1177,7 @@ impl Render for Workspace {
                 div()
                     .h(px(layout::TITLEBAR_HEIGHT))
                     .w_full()
-                    .bg(t.surface)
+                    .bg(t.chrome())
                     .border_b_1()
                     .border_color(t.border)
                     .flex()
@@ -1192,6 +1196,7 @@ impl Render for Workspace {
                             .flex_1()
                             .min_w_0()
                             .h_full()
+                            .bg(t.bg)
                             .child(Self::render_main_content(profile, result_lines, cx)),
                     ),
             )
@@ -1199,7 +1204,7 @@ impl Render for Workspace {
                 div()
                     .h(px(layout::STATUS_HEIGHT))
                     .w_full()
-                    .bg(t.surface)
+                    .bg(t.chrome())
                     .border_t_1()
                     .border_color(t.border)
                     .flex()
@@ -1278,7 +1283,14 @@ fn main() {
 
         // Root must be the window's first layer or dialog and notification
         // layers panic when they look for it.
-        cx.open_window(WindowOptions::default(), |window, cx| {
+        let options = WindowOptions {
+            // Only the chrome is translucent, so this is what makes the
+            // sidebar and status bar frost over the desktop instead of over
+            // black. The content planes paint opaque on top of it.
+            window_background: theme.window_background(),
+            ..Default::default()
+        };
+        cx.open_window(options, |window, cx| {
             let workspace = cx.new(|cx| Workspace::new(window, cx));
             cx.new(|cx| Root::new(workspace, window, cx))
         })

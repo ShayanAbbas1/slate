@@ -101,6 +101,15 @@ const NEUTRAL_CHROMA: f32 = 0.004;
 const HAIRLINE_DARK: f32 = 0.09;
 const HAIRLINE_LIGHT: f32 = 0.12;
 
+/// How much of the chrome tint covers the blurred desktop behind the window.
+///
+/// The rest is whatever the user has on screen, so this is the knob that trades
+/// frost for legibility: the sidebar and status bar carry muted text, and at
+/// 0.80 that text falls under WCAG AA against a white desktop. Lower it for more
+/// glass and `frosted_chrome_stays_legible_over_any_desktop` will say when it
+/// has gone too far.
+const FROST_ALPHA_DARK: f32 = 0.88;
+
 fn neutral(lightness: f32) -> Srgb {
     Oklch::new(lightness, NEUTRAL_CHROMA, NEUTRAL_HUE).to_srgb()
 }
@@ -114,9 +123,13 @@ const BLACK: Srgb = Srgb::new(0.0, 0.0, 0.0);
 pub struct Theme {
     pub appearance: Appearance,
 
-    /// The content plane. Result grids and editors sit on this.
+    /// The content plane, and the deepest tone. The editor sits on this.
     pub bg: Srgb,
-    /// Chrome one step from `bg`: sidebar, tab strip, status bar.
+    /// One step from `bg`: results, structure, anything the editor sits above.
+    /// Three planes rather than two because an editor over a grid over a sidebar
+    /// is three surfaces, and two tones make one of the boundaries invisible.
+    pub panel: Srgb,
+    /// Chrome, furthest from `bg`: sidebar, titlebar, status bar, table headers.
     pub surface: Srgb,
 
     pub element_hover: Rgba,
@@ -155,6 +168,28 @@ impl Theme {
         }
     }
 
+    /// The chrome fill. Translucent in dark, so the blurred desktop behind the
+    /// window reads through the sidebar, titlebar and status bar the way a
+    /// native macOS sidebar does. The content planes stay opaque: a result grid
+    /// over an unknown wallpaper is unreadable, and SQL has to sit on a tone
+    /// Slate chose.
+    pub fn chrome(self) -> Rgba {
+        match self.appearance {
+            Appearance::Dark => self.surface.alpha(FROST_ALPHA_DARK),
+            // Light chrome is opaque by design, so it asks for no vibrancy.
+            Appearance::Light => self.surface.alpha(1.0),
+        }
+    }
+
+    /// How the platform should composite whatever the window does not paint.
+    pub fn window_background(self) -> gpui::WindowBackgroundAppearance {
+        if self.chrome().a < 1.0 {
+            gpui::WindowBackgroundAppearance::Blurred
+        } else {
+            gpui::WindowBackgroundAppearance::Opaque
+        }
+    }
+
     pub fn apply_to_components(self, cx: &mut gpui::App) {
         let component = gpui_component::Theme::global_mut(cx);
         component.shadow = false;
@@ -175,10 +210,10 @@ impl Theme {
         component.colors.primary_active = self.element_active.flatten(self.accent).into();
         component.colors.muted = self.surface.into();
         component.colors.muted_foreground = self.text_muted.into();
-        component.colors.scrollbar = self.bg.into();
+        component.colors.scrollbar = self.panel.into();
         component.colors.scrollbar_thumb = self.border_strong.into();
         component.colors.scrollbar_thumb_hover = self.element_active.into();
-        component.colors.table = self.bg.into();
+        component.colors.table = self.panel.into();
         component.colors.table_active = self.selection.into();
         component.colors.table_active_border = self.accent.into();
         component.colors.table_even = self.element_hover.into();
@@ -262,8 +297,9 @@ impl Theme {
         Self {
             appearance: Appearance::Dark,
 
-            bg: neutral(0.155),
-            surface: neutral(0.195),
+            bg: neutral(0.145),
+            panel: neutral(0.200),
+            surface: neutral(0.250),
 
             element_hover: WHITE.alpha(0.05),
             element_active: WHITE.alpha(0.09),
@@ -299,7 +335,8 @@ impl Theme {
             appearance: Appearance::Light,
 
             bg: WHITE,
-            surface: neutral(0.975),
+            panel: neutral(0.972),
+            surface: neutral(0.940),
 
             element_hover: BLACK.alpha(0.04),
             element_active: BLACK.alpha(0.08),
@@ -389,6 +426,8 @@ mod tests {
     fn dark_text_contrast_clears_wcag() {
         let t = Theme::dark();
         check("dark text on bg", t.text, t.bg, AAA_TEXT);
+        check("dark text on panel", t.text, t.panel, AAA_TEXT);
+        check("dark muted on panel", t.text_muted, t.panel, AA_TEXT);
         check("dark text on surface", t.text, t.surface, AAA_TEXT);
         check("dark muted on bg", t.text_muted, t.bg, AA_TEXT);
         check("dark faint on bg", t.text_faint, t.bg, AA_LARGE);
@@ -401,6 +440,8 @@ mod tests {
     fn light_text_contrast_clears_wcag() {
         let t = Theme::light();
         check("light text on bg", t.text, t.bg, AAA_TEXT);
+        check("light text on panel", t.text, t.panel, AAA_TEXT);
+        check("light muted on panel", t.text_muted, t.panel, AA_TEXT);
         check("light text on surface", t.text, t.surface, AAA_TEXT);
         check("light muted on bg", t.text_muted, t.bg, AA_TEXT);
         check("light faint on bg", t.text_faint, t.bg, AA_LARGE);
@@ -434,6 +475,55 @@ mod tests {
         assert!(
             light.surface.relative_luminance() < light.bg.relative_luminance(),
             "light chrome must sit darker than the content plane"
+        );
+    }
+
+    #[test]
+    fn the_three_planes_are_told_apart_at_a_glance() {
+        // The complaint this exists to catch: an editor, a grid and a sidebar
+        // all within a few sRGB levels of each other read as one black
+        // rectangle. Measured in levels rather than contrast ratio, because at
+        // near-black the ratio's flare term compresses every step into noise —
+        // #0a and #16 differ by 12 levels and score 1.09.
+        let level = |c: Srgb| (c.r + c.g + c.b) / 3.0 * 255.0;
+        for t in [Theme::dark(), Theme::light()] {
+            for (name, near, far) in [
+                ("bg to panel", t.bg, t.panel),
+                ("panel to surface", t.panel, t.surface),
+            ] {
+                let step = (level(near) - level(far)).abs();
+                assert!(
+                    step >= 8.0,
+                    "{:?} {name}: {step:.1} levels is not a visible step",
+                    t.appearance
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn frosted_chrome_stays_legible_over_any_desktop() {
+        // The frost lets an unknown wallpaper through, so the worst case is a
+        // white one: it lightens the chrome and closes the gap to its text.
+        // Muted text is the first thing to fail, and it is what the status bar
+        // and the sidebar's own messages are written in.
+        let t = Theme::dark();
+        for (name, backdrop) in [("white desktop", WHITE), ("black desktop", BLACK)] {
+            let chrome = t.chrome().flatten(backdrop);
+            check(&format!("text on chrome over a {name}"), t.text, chrome, AAA_TEXT);
+            check(&format!("muted on chrome over a {name}"), t.text_muted, chrome, AA_TEXT);
+        }
+    }
+
+    #[test]
+    fn only_a_translucent_appearance_asks_for_vibrancy() {
+        assert_eq!(
+            Theme::dark().window_background(),
+            gpui::WindowBackgroundAppearance::Blurred
+        );
+        assert_eq!(
+            Theme::light().window_background(),
+            gpui::WindowBackgroundAppearance::Opaque
         );
     }
 
