@@ -20,6 +20,7 @@ use gpui_component::{
     button::{Button, ButtonVariants},
     input::{Input, InputEvent, InputState},
     list::ListItem,
+    resizable::{h_resizable, resizable_panel, v_resizable},
     table::{Table, TableState},
     tree::{TreeState, tree as render_tree},
 };
@@ -44,10 +45,17 @@ actions!(
         NextProfile,
         PreviousProfile,
         NewConnection,
+        ZoomEditorIn,
+        ZoomEditorOut,
+        ResetEditorZoom,
     ]
 );
 
 const RETURN_HINT: &str = "esc returns to the editor";
+const EDITOR_FONT_SIZE_DEFAULT: f32 = 14.0;
+const EDITOR_FONT_SIZE_MIN: f32 = 11.0;
+const EDITOR_FONT_SIZE_MAX: f32 = 24.0;
+const EDITOR_FONT_SIZE_STEP: f32 = 1.0;
 
 /// The platform's window buttons, which Slate positions but does not draw.
 const TRAFFIC_LIGHT_DIAMETER: f32 = 14.0;
@@ -118,6 +126,7 @@ struct Session {
     naming: bool,
     pending_delete: Option<String>,
     notice: Option<String>,
+    editor_font_size: f32,
 }
 
 impl Session {
@@ -159,6 +168,7 @@ impl Session {
             editor: cx.new(|cx| {
                 InputState::new(window, cx)
                     .code_editor("sql")
+                    .soft_wrap(false)
                     .placeholder("Write SQL…")
                     .default_value(sql)
             }),
@@ -166,6 +176,7 @@ impl Session {
                 TableState::new(ResultGrid::empty(), window, cx)
                     .sortable(false)
                     .col_movable(false)
+                    .col_resizable(true)
                     .row_selectable(true)
                     .col_selectable(true)
             }),
@@ -181,6 +192,7 @@ impl Session {
             naming: false,
             pending_delete: None,
             notice: None,
+            editor_font_size: EDITOR_FONT_SIZE_DEFAULT,
         }
     }
 }
@@ -416,6 +428,29 @@ impl Workspace {
             form.error = Some(message);
         }
         cx.notify();
+    }
+
+    fn zoom_editor_in(&mut self, _: &ZoomEditorIn, _: &mut Window, cx: &mut Context<Self>) {
+        self.adjust_editor_zoom(EDITOR_FONT_SIZE_STEP, cx);
+    }
+
+    fn zoom_editor_out(&mut self, _: &ZoomEditorOut, _: &mut Window, cx: &mut Context<Self>) {
+        self.adjust_editor_zoom(-EDITOR_FONT_SIZE_STEP, cx);
+    }
+
+    fn reset_editor_zoom(&mut self, _: &ResetEditorZoom, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(profile) = self.profile_mut() {
+            profile.session.editor_font_size = EDITOR_FONT_SIZE_DEFAULT;
+            cx.notify();
+        }
+    }
+
+    fn adjust_editor_zoom(&mut self, delta: f32, cx: &mut Context<Self>) {
+        if let Some(profile) = self.profile_mut() {
+            profile.session.editor_font_size =
+                adjusted_editor_font_size(profile.session.editor_font_size, delta);
+            cx.notify();
+        }
     }
 
     fn remember_profiles(&mut self, cx: &mut Context<Self>) {
@@ -1235,7 +1270,7 @@ impl Workspace {
         profile: &Profile,
         result_lines: Vec<String>,
         cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    ) -> AnyElement {
         let t = *theme(cx);
         let mono = gpui_component::Theme::global(cx).mono_font_family.clone();
 
@@ -1291,7 +1326,8 @@ impl Workspace {
                         .p(px(layout::SPACE_LG))
                         .font_family(mono)
                         .child(details.routine.definition.clone()),
-                );
+                )
+                .into_any_element();
         }
 
         // The generated preview is shown as its own read-only surface, so it is
@@ -1341,14 +1377,55 @@ impl Workspace {
             _ => div()
                 .flex_1()
                 .min_h_0()
-                .p(px(layout::SPACE_LG))
-                .font_family(mono)
+                .flex()
+                .flex_col()
                 .child(
-                    Input::new(&profile.session.editor)
-                        .h_full()
-                        .appearance(false)
-                        .bordered(false)
-                        .focus_bordered(false),
+                    div()
+                        .h(px(layout::EDITOR_HEADER_HEIGHT))
+                        .flex_shrink_0()
+                        .flex()
+                        .items_center()
+                        .px(px(layout::SPACE_MD))
+                        .border_b_1()
+                        .border_color(t.border)
+                        .child(section_label(t, "SQL"))
+                        .child(
+                            div()
+                                .ml_auto()
+                                .text_size(px(layout::TEXT_XS))
+                                .text_color(t.text_faint)
+                                .child(format!(
+                                    "{}%",
+                                    editor_zoom_percent(profile.session.editor_font_size)
+                                )),
+                        )
+                        .child(
+                            Button::new("run-query-editor")
+                                .label("Run  ⌘↵")
+                                .ghost()
+                                .xsmall()
+                                .on_click(cx.listener(
+                                    |workspace, _: &ClickEvent, window, cx| {
+                                        workspace.run_query(&RunQuery, window, cx);
+                                    },
+                                )),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_h_0()
+                        .p(px(layout::SPACE_LG))
+                        .font_family(mono)
+                        .child(
+                            Input::new(&profile.session.editor)
+                                .h_full()
+                                .appearance(false)
+                                .bordered(false)
+                                .focus_bordered(false)
+                                .text_size(px(profile.session.editor_font_size))
+                                .line_height(px(profile.session.editor_font_size * 1.55)),
+                        ),
                 )
                 .into_any_element(),
         };
@@ -1387,20 +1464,59 @@ impl Workspace {
                 .into_any_element(),
         };
 
-        div()
-            .size_full()
-            .flex()
-            .flex_col()
-            .child(top)
+        let bottom = div().size_full().min_h_0().bg(t.panel).child(bottom);
+
+        if matches!(profile.session.content, Content::Query) {
+            let expanded = result_pane_is_expanded(&profile.session.query);
+            let split_id = gpui::ElementId::from((
+                gpui::ElementId::from("query-result-split"),
+                profile.id.clone(),
+            ));
+            let split_id = (
+                split_id,
+                if expanded { "expanded" } else { "compact" },
+            );
+            let editor_height = if expanded {
+                layout::EDITOR_DEFAULT_HEIGHT
+            } else {
+                layout::EDITOR_EMPTY_HEIGHT
+            };
+            let results_height = if expanded {
+                layout::RESULTS_DEFAULT_HEIGHT
+            } else {
+                layout::RESULTS_EMPTY_HEIGHT
+            };
+
+            v_resizable(split_id)
             .child(
-                div()
-                    .flex_1()
-                    .min_h_0()
-                    .bg(t.panel)
-                    .border_t_1()
-                    .border_color(t.border)
+                resizable_panel()
+                    .size(px(editor_height))
+                    .size_range(px(layout::EDITOR_MIN_HEIGHT)..px(layout::EDITOR_MAX_HEIGHT))
+                    .child(top),
+            )
+            .child(
+                resizable_panel()
+                    .size(px(results_height))
+                    .size_range(px(layout::RESULTS_MIN_HEIGHT)..gpui::Pixels::MAX)
                     .child(bottom),
             )
+            .into_any_element()
+        } else {
+            div()
+                .size_full()
+                .flex()
+                .flex_col()
+                .child(top)
+                .child(
+                    div()
+                        .flex_1()
+                        .min_h_0()
+                        .border_t_1()
+                        .border_color(t.border)
+                        .child(bottom),
+                )
+                .into_any_element()
+        }
     }
 
     fn preview_tab(
@@ -1549,64 +1665,64 @@ impl Workspace {
         let mut tabs = vec![scratch.into_any_element()];
         tabs.extend(
             profile
-            .session
-            .saved_queries
-            .iter()
-            .enumerate()
-            .map(|(index, name)| {
-                let open_name = name.clone();
-                let delete_name = name.clone();
-                let open_workspace = workspace.clone();
-                let delete_workspace = workspace.clone();
-                let pending = profile.session.pending_delete.as_deref() == Some(name);
-                let active = profile.session.open_query.as_deref() == Some(name);
-                let tab = div()
-                    .id(("saved-query", index))
-                    .h_full()
-                    .flex()
-                    .flex_shrink_0()
-                    .items_center()
-                    .gap(px(layout::SPACE_SM))
-                    .pl(px(layout::SPACE_MD))
-                    .pr(px(layout::SPACE_XS))
-                    .border_r_1()
-                    .border_color(t.border)
-                    .text_color(if active { t.text } else { t.text_muted })
-                    .hover(|style| style.bg(t.element_hover))
-                    .child(row_icon(t, icon::SAVED_QUERY))
-                    .child(
-                        div()
-                            .max_w(px(180.))
-                            .overflow_hidden()
-                            .text_ellipsis()
-                            .whitespace_nowrap()
-                            .child(name.clone()),
-                    )
-                    .child(
-                        Button::new(("delete-query", index))
-                            .label(if pending { "Delete?" } else { "" })
-                            .icon(icon(icon::DELETE))
-                            .ghost()
-                            .xsmall()
-                            .on_click(move |_, _, cx| {
-                                _ = delete_workspace.update(cx, |workspace, cx| {
-                                    workspace.delete_saved_query(delete_name.clone(), cx);
-                                });
-                            }),
-                    )
-                    .on_click(move |_, window, cx| {
-                        _ = open_workspace.update(cx, |workspace, cx| {
-                            workspace.open_saved_query(open_name.clone(), window, cx);
+                .session
+                .saved_queries
+                .iter()
+                .enumerate()
+                .map(|(index, name)| {
+                    let open_name = name.clone();
+                    let delete_name = name.clone();
+                    let open_workspace = workspace.clone();
+                    let delete_workspace = workspace.clone();
+                    let pending = profile.session.pending_delete.as_deref() == Some(name);
+                    let active = profile.session.open_query.as_deref() == Some(name);
+                    let tab = div()
+                        .id(("saved-query", index))
+                        .h_full()
+                        .flex()
+                        .flex_shrink_0()
+                        .items_center()
+                        .gap(px(layout::SPACE_SM))
+                        .pl(px(layout::SPACE_MD))
+                        .pr(px(layout::SPACE_XS))
+                        .border_r_1()
+                        .border_color(t.border)
+                        .text_color(if active { t.text } else { t.text_muted })
+                        .hover(|style| style.bg(t.element_hover))
+                        .child(row_icon(t, icon::SAVED_QUERY))
+                        .child(
+                            div()
+                                .max_w(px(180.))
+                                .overflow_hidden()
+                                .text_ellipsis()
+                                .whitespace_nowrap()
+                                .child(name.clone()),
+                        )
+                        .child(
+                            Button::new(("delete-query", index))
+                                .label(if pending { "Delete?" } else { "" })
+                                .icon(icon(icon::DELETE))
+                                .ghost()
+                                .xsmall()
+                                .on_click(move |_, _, cx| {
+                                    _ = delete_workspace.update(cx, |workspace, cx| {
+                                        workspace.delete_saved_query(delete_name.clone(), cx);
+                                    });
+                                }),
+                        )
+                        .on_click(move |_, window, cx| {
+                            _ = open_workspace.update(cx, |workspace, cx| {
+                                workspace.open_saved_query(open_name.clone(), window, cx);
+                            });
                         });
-                    });
-                if active {
-                    tab.bg(t.bg)
-                        .font_weight(FontWeight::MEDIUM)
-                        .into_any_element()
-                } else {
-                    tab.into_any_element()
-                }
-            }),
+                    if active {
+                        tab.bg(t.bg)
+                            .font_weight(FontWeight::MEDIUM)
+                            .into_any_element()
+                    } else {
+                        tab.into_any_element()
+                    }
+                }),
         );
 
         let naming = if profile.session.naming {
@@ -1805,85 +1921,88 @@ impl Workspace {
                 .child("No database objects found.")
                 .into_any_element(),
             CatalogState::Loaded(_) => {
-                render_tree(&profile.session.explorer_tree, move |index, entry, _, _, cx| {
-                let t = *theme(cx);
-                let leaf = leaves.get(entry.item().id.as_str()).copied();
-                let label = entry.item().label.clone();
-                // Three ranks, three weights: a schema owns the column, a
-                // category only labels the run of objects under it, and the
-                // objects themselves are what the eye is actually hunting for.
-                let (label, row) = match (leaf, entry.depth()) {
-                    (Some(_), _) => (label, ListItem::new(index).text_color(t.text)),
-                    (None, 0) => (
-                        label,
-                        ListItem::new(index)
-                            .text_color(t.text)
-                            .font_weight(FontWeight::SEMIBOLD),
-                    ),
-                    (None, _) => (
-                        label.to_uppercase().into(),
-                        ListItem::new(index)
-                            .text_color(t.text_faint)
-                            .text_size(px(layout::TEXT_XS))
-                            .font_weight(FontWeight::MEDIUM),
-                    ),
-                };
-                // A folder shows which way it is facing; an object shows what
-                // kind of object it is. Both occupy the same slot, so the
-                // labels line up down the column either way.
-                let row_icon_path = match leaf {
-                    Some(leaf) => object_icon(leaf.kind),
-                    None if entry.is_expanded() => icon::CHEVRON_DOWN,
-                    None => icon::CHEVRON_RIGHT,
-                };
-                let row = row
-                    .pl(px(
-                        layout::SPACE_SM + entry.depth() as f32 * layout::SPACE_MD
-                    ))
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(px(layout::SPACE_SM))
-                            .min_w_0()
-                            .flex_1()
-                            .child(row_icon(t, row_icon_path))
+                render_tree(
+                    &profile.session.explorer_tree,
+                    move |index, entry, _, _, cx| {
+                        let t = *theme(cx);
+                        let leaf = leaves.get(entry.item().id.as_str()).copied();
+                        let label = entry.item().label.clone();
+                        // Three ranks, three weights: a schema owns the column, a
+                        // category only labels the run of objects under it, and the
+                        // objects themselves are what the eye is actually hunting for.
+                        let (label, row) = match (leaf, entry.depth()) {
+                            (Some(_), _) => (label, ListItem::new(index).text_color(t.text)),
+                            (None, 0) => (
+                                label,
+                                ListItem::new(index)
+                                    .text_color(t.text)
+                                    .font_weight(FontWeight::SEMIBOLD),
+                            ),
+                            (None, _) => (
+                                label.to_uppercase().into(),
+                                ListItem::new(index)
+                                    .text_color(t.text_faint)
+                                    .text_size(px(layout::TEXT_XS))
+                                    .font_weight(FontWeight::MEDIUM),
+                            ),
+                        };
+                        // A folder shows which way it is facing; an object shows what
+                        // kind of object it is. Both occupy the same slot, so the
+                        // labels line up down the column either way.
+                        let row_icon_path = match leaf {
+                            Some(leaf) => object_icon(leaf.kind),
+                            None if entry.is_expanded() => icon::CHEVRON_DOWN,
+                            None => icon::CHEVRON_RIGHT,
+                        };
+                        let row = row
+                            .pl(px(
+                                layout::SPACE_SM + entry.depth() as f32 * layout::SPACE_MD
+                            ))
                             .child(
                                 div()
-                                    .flex_1()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(layout::SPACE_SM))
                                     .min_w_0()
-                                    .overflow_hidden()
-                                    .text_ellipsis()
-                                    .whitespace_nowrap()
-                                    .child(label),
-                            ),
-                    );
-                let Some(leaf) = leaf else {
-                    return row;
-                };
-                let workspace = workspace.clone();
-                row.on_click(move |_, _, cx| {
-                    _ = workspace.update(cx, |workspace, cx| {
-                        workspace.open_explorer_target(leaf.target, cx);
-                    });
-                    })
-                })
+                                    .flex_1()
+                                    .child(row_icon(t, row_icon_path))
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .overflow_hidden()
+                                            .text_ellipsis()
+                                            .whitespace_nowrap()
+                                            .child(label),
+                                    ),
+                            );
+                        let Some(leaf) = leaf else {
+                            return row;
+                        };
+                        let workspace = workspace.clone();
+                        row.on_click(move |_, _, cx| {
+                            _ = workspace.update(cx, |workspace, cx| {
+                                workspace.open_explorer_target(leaf.target, cx);
+                            });
+                        })
+                    },
+                )
                 .into_any_element()
             }
         };
 
         div()
-            .w(px(layout::SIDEBAR_DEFAULT_WIDTH))
-            .min_w(px(layout::SIDEBAR_MIN_WIDTH))
+            .size_full()
             .h_full()
             .flex()
             .flex_col()
             .border_r_1()
             .border_color(t.border)
             .child(
-                div().p(px(layout::SPACE_SM)).child(
+                div().w_full().flex().p(px(layout::SPACE_SM)).child(
                     Input::new(&profile.session.explorer_filter)
-                        .w_full()
+                        .min_w_0()
+                        .flex_1()
                         .prefix(row_icon(t, icon::SEARCH)),
                 ),
             )
@@ -1991,6 +2110,9 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::next_profile))
             .on_action(cx.listener(Self::previous_profile))
             .on_action(cx.listener(Self::open_connection_form))
+            .on_action(cx.listener(Self::zoom_editor_in))
+            .on_action(cx.listener(Self::zoom_editor_out))
+            .on_action(cx.listener(Self::reset_editor_zoom))
             .size_full()
             // The shell is the chrome tone: titlebar, sidebar and status bar
             // paint nothing of their own, they are this. The content card below
@@ -2002,33 +2124,44 @@ impl Render for Workspace {
             .flex_col()
             .child(titlebar(t, Some(profile.name.clone())))
             .child(
-                div()
-                    .flex_1()
-                    .min_h_0()
-                    .flex()
-                    .child(self.render_explorer(profile, cx))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .h_full()
-                            .p(px(layout::SPACE_SM))
-                            .flex()
-                            .flex_col()
-                            .child(Self::render_query_tabs(profile, cx))
-                            .child(
+                div().flex_1().min_h_0().child(
+                    h_resizable("workspace-shell-split")
+                        .child(
+                            resizable_panel()
+                                .size(px(layout::SIDEBAR_DEFAULT_WIDTH))
+                                .size_range(
+                                    px(layout::SIDEBAR_MIN_WIDTH)..px(layout::SIDEBAR_MAX_WIDTH),
+                                )
+                                .child(self.render_explorer(profile, cx)),
+                        )
+                        .child(
+                            resizable_panel().child(
                                 div()
-                                    .flex_1()
-                                    .min_h_0()
-                                    .w_full()
-                                    .overflow_hidden()
-                                    .bg(t.bg)
-                                    .border_1()
-                                    .border_color(t.border)
-                                    .rounded(px(layout::RADIUS_PANEL))
-                                    .child(Self::render_main_content(profile, result_lines, cx)),
+                                    .size_full()
+                                    .min_w_0()
+                                    .p(px(layout::SPACE_SM))
+                                    .flex()
+                                    .flex_col()
+                                    .child(Self::render_query_tabs(profile, cx))
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_h_0()
+                                            .w_full()
+                                            .overflow_hidden()
+                                            .bg(t.bg)
+                                            .border_1()
+                                            .border_color(t.border)
+                                            .rounded(px(layout::RADIUS_PANEL))
+                                            .child(Self::render_main_content(
+                                                profile,
+                                                result_lines,
+                                                cx,
+                                            )),
+                                    ),
                             ),
-                    ),
+                        ),
+                ),
             )
             .child(
                 div()
@@ -2142,6 +2275,18 @@ fn section_label(t: Theme, label: &str) -> impl IntoElement {
         .child(label.to_uppercase())
 }
 
+fn adjusted_editor_font_size(current: f32, delta: f32) -> f32 {
+    (current + delta).clamp(EDITOR_FONT_SIZE_MIN, EDITOR_FONT_SIZE_MAX)
+}
+
+fn editor_zoom_percent(font_size: f32) -> u32 {
+    (font_size / EDITOR_FONT_SIZE_DEFAULT * 100.0).round() as u32
+}
+
+fn result_pane_is_expanded(query: &QueryState) -> bool {
+    !matches!(query, QueryState::Idle)
+}
+
 fn connection_config_from_environment() -> Result<Option<ConnectionConfig>, String> {
     let host = std::env::var("PGHOST").ok();
     let port = std::env::var("PGPORT").ok();
@@ -2216,6 +2361,10 @@ fn main() {
             KeyBinding::new("ctrl-shift-tab", PreviousProfile, None),
             KeyBinding::new("escape", ShowEditor, None),
             KeyBinding::new("cmd-shift-t", CycleTheme, None),
+            KeyBinding::new("cmd-+", ZoomEditorIn, None),
+            KeyBinding::new("cmd-=", ZoomEditorIn, None),
+            KeyBinding::new("cmd--", ZoomEditorOut, None),
+            KeyBinding::new("cmd-0", ResetEditorZoom, None),
         ]);
 
         // The platform titlebar is kept only for its window buttons: a system
@@ -2243,4 +2392,36 @@ fn main() {
 
         cx.activate(true);
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn editor_zoom_stays_inside_its_readable_range() {
+        assert_eq!(
+            adjusted_editor_font_size(EDITOR_FONT_SIZE_MAX, EDITOR_FONT_SIZE_STEP),
+            EDITOR_FONT_SIZE_MAX
+        );
+        assert_eq!(
+            adjusted_editor_font_size(EDITOR_FONT_SIZE_MIN, -EDITOR_FONT_SIZE_STEP),
+            EDITOR_FONT_SIZE_MIN
+        );
+        assert_eq!(
+            adjusted_editor_font_size(EDITOR_FONT_SIZE_DEFAULT, EDITOR_FONT_SIZE_STEP),
+            EDITOR_FONT_SIZE_DEFAULT + EDITOR_FONT_SIZE_STEP
+        );
+    }
+
+    #[test]
+    fn default_editor_size_is_reported_as_one_hundred_percent() {
+        assert_eq!(editor_zoom_percent(EDITOR_FONT_SIZE_DEFAULT), 100);
+    }
+
+    #[test]
+    fn result_pane_expands_as_soon_as_a_query_starts() {
+        assert!(!result_pane_is_expanded(&QueryState::Idle));
+        assert!(result_pane_is_expanded(&QueryState::Running));
+    }
 }

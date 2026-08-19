@@ -55,9 +55,18 @@ pub mod layout {
     /// platform's window buttons, which are drawn over it.
     pub const TITLEBAR_LEADING_INSET: f32 = 78.0;
     pub const STATUS_HEIGHT: f32 = 24.0;
+    pub const EDITOR_HEADER_HEIGHT: f32 = 28.0;
+    pub const EDITOR_EMPTY_HEIGHT: f32 = 680.0;
+    pub const EDITOR_DEFAULT_HEIGHT: f32 = 420.0;
+    pub const EDITOR_MIN_HEIGHT: f32 = 120.0;
+    pub const EDITOR_MAX_HEIGHT: f32 = 720.0;
+    pub const RESULTS_EMPTY_HEIGHT: f32 = 100.0;
+    pub const RESULTS_DEFAULT_HEIGHT: f32 = 360.0;
+    pub const RESULTS_MIN_HEIGHT: f32 = 100.0;
     pub const GRID_COLUMN_WIDTH: f32 = 180.0;
     pub const SIDEBAR_DEFAULT_WIDTH: f32 = 256.0;
     pub const SIDEBAR_MIN_WIDTH: f32 = 180.0;
+    pub const SIDEBAR_MAX_WIDTH: f32 = 480.0;
     pub const DIALOG_WIDTH: f32 = 420.0;
 }
 

@@ -38,6 +38,7 @@ impl ResultGrid {
             .map(|(index, column)| {
                 Column::new(index.to_string(), column.name.clone())
                     .width(px(layout::GRID_COLUMN_WIDTH))
+                    .resizable(true)
                     .movable(false)
             })
             .collect();
