@@ -38,11 +38,70 @@ enum ConnectionState {
     Failed(String),
 }
 
+/// A connection and everything it owns.
+///
+/// The editor, results, explorer and query state live here rather than on
+/// `Workspace` deliberately (spec §3.1). A profile is replaced wholesale when
+/// the connection changes, so a buffer written against one database cannot be
+/// retargeted at another — it does not exist outside its profile.
 struct Profile {
     name: String,
     config: ConnectionConfig,
     connection: Connection,
     catalog: CatalogState,
+    session: Session,
+}
+
+/// The per-profile view state.
+///
+/// Separate from `Profile` only because GPUI entities need a `&mut Window` to
+/// create, and the connection resolves on a task that has none — so this is
+/// built before the spawn and moved in once the connection opens.
+struct Session {
+    editor: Entity<InputState>,
+    results: Entity<TableState<ResultGrid>>,
+    query: QueryState,
+    content: Content,
+    explorer_filter: Entity<InputState>,
+    explorer_tree: Entity<TreeState>,
+    explorer_targets: Arc<HashMap<String, ExplorerTarget>>,
+    /// `cmd+enter` reaches the workspace only through the focused element's
+    /// dispatch path, so an unfocused editor makes the primary keystroke dead.
+    editor_needs_focus: bool,
+}
+
+impl Session {
+    fn new(window: &mut Window, cx: &mut Context<Workspace>) -> Self {
+        let explorer_filter =
+            cx.new(|cx| InputState::new(window, cx).placeholder("Filter database objects…"));
+        cx.subscribe(&explorer_filter, |workspace, _, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::Change) {
+                workspace.refresh_explorer(cx);
+            }
+        })
+        .detach();
+
+        Self {
+            editor: cx.new(|cx| {
+                InputState::new(window, cx)
+                    .code_editor("sql")
+                    .placeholder("Write SQL…")
+            }),
+            results: cx.new(|cx| {
+                TableState::new(ResultGrid::empty(), window, cx)
+                    .sortable(false)
+                    .col_movable(false)
+                    .row_selectable(true)
+                    .col_selectable(true)
+            }),
+            query: QueryState::Idle,
+            content: Content::Query,
+            explorer_filter,
+            explorer_tree: cx.new(|cx| TreeState::new(cx)),
+            explorer_targets: Arc::new(HashMap::new()),
+            editor_needs_focus: true,
+        }
+    }
 }
 
 enum CatalogState {
@@ -187,22 +246,14 @@ enum QueryState {
 }
 
 struct Workspace {
+    /// The only state outside a profile: the connection lifecycle, the form
+    /// that starts one, and the generation counter that invalidates stale work.
     connection: ConnectionState,
     connection_form: ConnectionForm,
-    explorer_filter: Entity<InputState>,
-    explorer_tree: Entity<TreeState>,
-    explorer_targets: Arc<HashMap<String, ExplorerTarget>>,
-    content: Content,
-    editor: Entity<InputState>,
-    results: Entity<TableState<ResultGrid>>,
-    query: QueryState,
     /// Bumped on every connection attempt. A spawned task captures the value it
     /// was issued under and drops its result if the connection has moved on,
     /// so one profile's catalog or rows can never land on another's.
     connection_generation: u64,
-    /// `cmd+enter` reaches the workspace only through the focused element's
-    /// dispatch path, so an unfocused editor makes the primary keystroke dead.
-    editor_needs_focus: bool,
 }
 
 impl Workspace {
@@ -213,50 +264,36 @@ impl Workspace {
             window,
             cx,
         );
-        let explorer_filter =
-            cx.new(|cx| InputState::new(window, cx).placeholder("Filter database objects…"));
-        let explorer_tree = cx.new(|cx| TreeState::new(cx));
-        let explorer_targets = Arc::new(HashMap::new());
-        cx.subscribe(&explorer_filter, |workspace, _, event: &InputEvent, cx| {
-            if matches!(event, InputEvent::Change) {
-                workspace.refresh_explorer(cx);
-            }
-        })
-        .detach();
-        let editor = cx.new(|cx| {
-            InputState::new(window, cx)
-                .code_editor("sql")
-                .placeholder("Write SQL…")
-        });
-        let results = cx.new(|cx| {
-            TableState::new(ResultGrid::empty(), window, cx)
-                .sortable(false)
-                .col_movable(false)
-                .row_selectable(true)
-                .col_selectable(true)
-        });
 
         let mut workspace = Self {
             connection: ConnectionState::NotConfigured,
             connection_form,
-            explorer_filter,
-            explorer_tree,
-            explorer_targets,
-            content: Content::Query,
-            editor,
-            results,
-            query: QueryState::Idle,
             connection_generation: 0,
-            editor_needs_focus: true,
         };
 
         match environment_config {
-            Ok(Some(config)) => workspace.begin_connect(config.database.clone(), config, cx),
+            Ok(Some(config)) => {
+                workspace.begin_connect(config.database.clone(), config, window, cx)
+            }
             Ok(None) => {}
             Err(message) => workspace.connection = ConnectionState::Failed(message),
         }
 
         workspace
+    }
+
+    fn profile(&self) -> Option<&Profile> {
+        match &self.connection {
+            ConnectionState::Connected(profile) => Some(profile),
+            _ => None,
+        }
+    }
+
+    fn profile_mut(&mut self) -> Option<&mut Profile> {
+        match &mut self.connection {
+            ConnectionState::Connected(profile) => Some(profile),
+            _ => None,
+        }
     }
 
     fn apply_connection_url(
@@ -292,7 +329,7 @@ impl Workspace {
         cx.notify();
     }
 
-    fn connect(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
+    fn connect(&mut self, _: &ClickEvent, window: &mut Window, cx: &mut Context<Self>) {
         if matches!(self.connection, ConnectionState::Connecting { .. }) {
             return;
         }
@@ -307,10 +344,16 @@ impl Workspace {
         };
 
         self.connection_form.error = None;
-        self.begin_connect(name, config, cx);
+        self.begin_connect(name, config, window, cx);
     }
 
-    fn begin_connect(&mut self, name: String, config: ConnectionConfig, cx: &mut Context<Self>) {
+    fn begin_connect(
+        &mut self,
+        name: String,
+        config: ConnectionConfig,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.connection_generation += 1;
         let generation = self.connection_generation;
         self.connection = ConnectionState::Connecting {
@@ -318,6 +361,10 @@ impl Workspace {
         };
         cx.notify();
 
+        // Built here, not in the continuation: the profile owns its editor and
+        // grid, and creating those needs a Window the spawned task will not
+        // have. Dropped unused if the connection fails.
+        let session = Session::new(window, cx);
         let task_config = config.clone();
         let connection_task = cx
             .background_executor()
@@ -336,10 +383,10 @@ impl Workspace {
                             config,
                             connection,
                             catalog: CatalogState::Loading,
+                            session,
                         }),
                         Err(error) => ConnectionState::Failed(error.message),
                     };
-                    workspace.editor_needs_focus = true;
                     workspace.load_catalog(cx);
                     cx.notify();
                 })
@@ -349,9 +396,8 @@ impl Workspace {
     }
 
     fn load_catalog(&mut self, cx: &mut Context<Self>) {
-        let connection = match &self.connection {
-            ConnectionState::Connected(profile) => profile.connection.clone(),
-            _ => return,
+        let Some(connection) = self.profile().map(|profile| profile.connection.clone()) else {
+            return;
         };
         let generation = self.connection_generation;
         let catalog_task = cx
@@ -365,7 +411,7 @@ impl Workspace {
                     if workspace.connection_generation != generation {
                         return;
                     }
-                    if let ConnectionState::Connected(profile) = &mut workspace.connection {
+                    if let Some(profile) = workspace.profile_mut() {
                         profile.catalog = match result {
                             Ok(catalog) => CatalogState::Loaded(catalog),
                             Err(error) => CatalogState::Failed(error.message),
@@ -380,21 +426,23 @@ impl Workspace {
     }
 
     fn refresh_explorer(&mut self, cx: &mut Context<Self>) {
-        let filter = self.explorer_filter.read(cx).value();
-        let explorer = match &self.connection {
-            ConnectionState::Connected(Profile {
-                catalog: CatalogState::Loaded(catalog),
-                ..
-            }) => build_explorer_tree(catalog, &filter),
+        let Some(profile) = self.profile() else {
+            return;
+        };
+        let filter = profile.session.explorer_filter.read(cx).value();
+        let explorer = match &profile.catalog {
+            CatalogState::Loaded(catalog) => build_explorer_tree(catalog, &filter),
             _ => explorer::ExplorerTree {
                 items: Vec::new(),
                 targets: HashMap::new(),
             },
         };
-        self.explorer_targets = Arc::new(explorer.targets);
+        let tree = profile.session.explorer_tree.clone();
 
-        self.explorer_tree
-            .update(cx, |tree, cx| tree.set_items(explorer.items, cx));
+        if let Some(profile) = self.profile_mut() {
+            profile.session.explorer_targets = Arc::new(explorer.targets);
+        }
+        tree.update(cx, |tree, cx| tree.set_items(explorer.items, cx));
     }
 
     fn open_explorer_target(&mut self, target: ExplorerTarget, cx: &mut Context<Self>) {
@@ -420,7 +468,9 @@ impl Workspace {
                 // written into the editor: `set_value` is not undoable, so that
                 // would destroy an unsaved buffer on a misclick.
                 let sql = preview_sql(&schema, &relation);
-                self.content = Content::Preview { sql: sql.clone() };
+                if let Some(profile) = self.profile_mut() {
+                    profile.session.content = Content::Preview { sql: sql.clone() };
+                }
                 self.execute_sql(sql, cx);
             }
             ExplorerTarget::Routine {
@@ -437,18 +487,17 @@ impl Workspace {
                     return;
                 };
 
-                self.content = Content::Routine(details);
+                if let Some(profile) = self.profile_mut() {
+                    profile.session.content = Content::Routine(details);
+                }
                 cx.notify();
             }
         }
     }
 
     fn catalog(&self) -> Option<&Catalog> {
-        match &self.connection {
-            ConnectionState::Connected(Profile {
-                catalog: CatalogState::Loaded(catalog),
-                ..
-            }) => Some(catalog),
+        match self.profile().map(|profile| &profile.catalog) {
+            Some(CatalogState::Loaded(catalog)) => Some(catalog),
             _ => None,
         }
     }
@@ -456,11 +505,14 @@ impl Workspace {
     /// Return to the editor. Without this the routine and preview surfaces are
     /// one-way doors, since they replace the editor entirely.
     fn show_editor(&mut self, _: &ShowEditor, _: &mut Window, cx: &mut Context<Self>) {
-        if matches!(self.content, Content::Query) {
+        let Some(profile) = self.profile_mut() else {
+            return;
+        };
+        if matches!(profile.session.content, Content::Query) {
             return;
         }
-        self.content = Content::Query;
-        self.editor_needs_focus = true;
+        profile.session.content = Content::Query;
+        profile.session.editor_needs_focus = true;
         cx.notify();
     }
 
@@ -468,15 +520,20 @@ impl Workspace {
         // The editor is hidden behind the routine and preview surfaces, and
         // running SQL the user cannot see is how an unrelated statement left in
         // the buffer gets executed by muscle memory.
-        if !matches!(self.content, Content::Query) {
+        if !matches!(
+            self.profile().map(|profile| &profile.session.content),
+            Some(Content::Query)
+        ) {
             return;
         }
 
         let Some(sql) = self.sql_to_run(window, cx) else {
-            self.query = QueryState::Failed(DbError {
-                message: "There is no statement to run.".into(),
-                position: None,
-            });
+            if let Some(profile) = self.profile_mut() {
+                profile.session.query = QueryState::Failed(DbError {
+                    message: "There is no statement to run.".into(),
+                    position: None,
+                });
+            }
             cx.notify();
             return;
         };
@@ -484,46 +541,29 @@ impl Workspace {
         self.execute_sql(sql, cx);
     }
 
+    /// Run `sql` against the active profile.
+    ///
+    /// There is deliberately no "not connected" branch: SQL is only reachable
+    /// through a profile's own editor or explorer, so the absence of one is not
+    /// a state the user can be shown an error about.
     fn execute_sql(&mut self, sql: String, cx: &mut Context<Self>) {
+        let Some(profile) = self.profile_mut() else {
+            return;
+        };
         // Guarded here rather than in each caller: every path that runs SQL
         // routes through this one, and a caller that forgets would let two
         // results race into the grid with the older one landing last.
-        if matches!(self.query, QueryState::Running) {
+        if matches!(profile.session.query, QueryState::Running) {
             return;
         }
 
-        let connection = match &self.connection {
-            ConnectionState::Connected(profile) => profile.connection.clone(),
-            ConnectionState::NotConfigured => {
-                self.query = QueryState::Failed(DbError {
-                    message: "No connection is configured.".into(),
-                    position: None,
-                });
-                cx.notify();
-                return;
-            }
-            ConnectionState::Connecting { .. } => {
-                self.query = QueryState::Failed(DbError {
-                    message: "The connection is still opening.".into(),
-                    position: None,
-                });
-                cx.notify();
-                return;
-            }
-            ConnectionState::Failed(message) => {
-                self.query = QueryState::Failed(DbError {
-                    message: message.clone(),
-                    position: None,
-                });
-                cx.notify();
-                return;
-            }
-        };
+        let connection = profile.connection.clone();
+        let results = profile.session.results.clone();
+        profile.session.query = QueryState::Running;
 
-        self.query = QueryState::Running;
         // Rows from the previous statement must not sit under the one now on
         // screen -- a reader cannot tell stale rows from fresh ones.
-        self.results.update(cx, |table, cx| {
+        results.update(cx, |table, cx| {
             *table.delegate_mut() = ResultGrid::empty();
             table.refresh(cx);
         });
@@ -541,22 +581,26 @@ impl Workspace {
                     if workspace.connection_generation != generation {
                         return;
                     }
-                    workspace.query = match result {
+                    let Some(profile) = workspace.profile_mut() else {
+                        return;
+                    };
+
+                    match result {
                         Ok(result) => {
-                            let summary = QueryState::Complete {
+                            profile.session.query = QueryState::Complete {
                                 rows: result.rows.len(),
                                 bytes: result.bytes,
                                 elapsed: result.elapsed,
                                 rows_affected: result.rows_affected,
                             };
-                            workspace.results.update(cx, |table, cx| {
+                            let results = profile.session.results.clone();
+                            results.update(cx, |table, cx| {
                                 *table.delegate_mut() = ResultGrid::new(result);
                                 table.refresh(cx);
                             });
-                            summary
                         }
-                        Err(error) => QueryState::Failed(error),
-                    };
+                        Err(error) => profile.session.query = QueryState::Failed(error),
+                    }
                     cx.notify();
                 })
                 .ok();
@@ -565,7 +609,8 @@ impl Workspace {
     }
 
     fn sql_to_run(&self, window: &mut Window, cx: &mut Context<Self>) -> Option<String> {
-        let selection = self.editor.update(cx, |editor, cx| {
+        let editor = self.profile()?.session.editor.clone();
+        let selection = editor.update(cx, |editor, cx| {
             let selection = editor.selected_text_range(false, window, cx)?;
             if selection.range.is_empty() {
                 return None;
@@ -579,7 +624,7 @@ impl Workspace {
             return selection;
         }
 
-        let editor = self.editor.read(cx);
+        let editor = editor.read(cx);
         let sql = editor.value();
         let range = Buffer::parse(&sql).statement_at(editor.cursor())?;
         Some(sql[range].to_string())
@@ -658,14 +703,14 @@ impl Workspace {
     }
 
     fn render_main_content(
-        &self,
+        profile: &Profile,
         result_lines: Vec<String>,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let t = *theme(cx);
         let mono = gpui_component::Theme::global(cx).mono_font_family.clone();
 
-        if let Content::Routine(details) = &self.content {
+        if let Content::Routine(details) = &profile.session.content {
             let kind = match details.routine.kind {
                 RoutineKind::Function => "Function",
                 RoutineKind::Procedure => "Procedure",
@@ -715,7 +760,7 @@ impl Workspace {
 
         // The generated preview is shown as its own read-only surface, so it is
         // always distinguishable from SQL the user wrote.
-        let top = match &self.content {
+        let top = match &profile.session.content {
             Content::Preview { sql } => div()
                 .flex_1()
                 .min_h_0()
@@ -737,7 +782,7 @@ impl Workspace {
                 .p(px(layout::SPACE_LG))
                 .font_family(mono)
                 .child(
-                    Input::new(&self.editor)
+                    Input::new(&profile.session.editor)
                         .h_full()
                         .appearance(false)
                         .bordered(false)
@@ -757,13 +802,13 @@ impl Workspace {
                     .min_h_0()
                     .border_t_1()
                     .border_color(t.border)
-                    .child(Table::new(&self.results).bordered(false))
+                    .child(Table::new(&profile.session.results).bordered(false))
                     .children((!result_lines.is_empty()).then(|| {
                         div()
                             .size_full()
                             .p(px(layout::SPACE_LG))
                             .font_family(gpui_component::Theme::global(cx).mono_font_family.clone())
-                            .text_color(if matches!(self.query, QueryState::Failed(_)) {
+                            .text_color(if matches!(profile.session.query, QueryState::Failed(_)) {
                                 t.danger
                             } else {
                                 t.text
@@ -777,39 +822,28 @@ impl Workspace {
             )
     }
 
-    fn render_explorer(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_explorer(profile: &Profile, cx: &mut Context<Self>) -> impl IntoElement {
         let t = *theme(cx);
         let workspace = cx.entity().downgrade();
-        let targets = self.explorer_targets.clone();
-        let content = match &self.connection {
-            ConnectionState::Connected(Profile {
-                catalog: CatalogState::Loading,
-                ..
-            }) => div()
+        let targets = profile.session.explorer_targets.clone();
+        let content = match &profile.catalog {
+            CatalogState::Loading => div()
                 .p(px(layout::SPACE_MD))
                 .text_color(t.text_muted)
                 .child("Loading database objects…")
                 .into_any_element(),
-            ConnectionState::Connected(Profile {
-                catalog: CatalogState::Failed(message),
-                ..
-            }) => div()
+            CatalogState::Failed(message) => div()
                 .p(px(layout::SPACE_MD))
                 .text_color(t.danger)
                 .child(message.clone())
                 .into_any_element(),
-            ConnectionState::Connected(Profile {
-                catalog: CatalogState::Loaded(catalog),
-                ..
-            }) if catalog.schemas.is_empty() => div()
+            CatalogState::Loaded(catalog) if catalog.schemas.is_empty() => div()
                 .p(px(layout::SPACE_MD))
                 .text_color(t.text_muted)
                 .child("No database objects found.")
                 .into_any_element(),
-            ConnectionState::Connected(Profile {
-                catalog: CatalogState::Loaded(_),
-                ..
-            }) => render_tree(&self.explorer_tree, move |index, entry, _, _, cx| {
+            CatalogState::Loaded(_) => {
+                render_tree(&profile.session.explorer_tree, move |index, entry, _, _, cx| {
                 let t = *theme(cx);
                 let row = ListItem::new(index)
                     .pl(px(
@@ -833,10 +867,10 @@ impl Workspace {
                     _ = workspace.update(cx, |workspace, cx| {
                         workspace.open_explorer_target(target, cx);
                     });
+                    })
                 })
-            })
-            .into_any_element(),
-            _ => div().into_any_element(),
+                .into_any_element()
+            }
         };
 
         div()
@@ -853,7 +887,7 @@ impl Workspace {
                     .p(px(layout::SPACE_SM))
                     .border_b_1()
                     .border_color(t.border)
-                    .child(Input::new(&self.explorer_filter).w_full()),
+                    .child(Input::new(&profile.session.explorer_filter).w_full()),
             )
             .child(div().flex_1().min_h_0().child(content))
     }
@@ -864,13 +898,18 @@ impl Render for Workspace {
         let t = *theme(cx);
         // Deferred to render because the editor has to be mounted before it can
         // take focus, and the connection that reveals it resolves off-thread.
-        if self.editor_needs_focus
-            && matches!(self.connection, ConnectionState::Connected(_))
-            && matches!(self.content, Content::Query)
-        {
-            self.editor.focus_handle(cx).focus(window);
-            self.editor_needs_focus = false;
+        let take_focus = self.profile_mut().and_then(|profile| {
+            let wanted = profile.session.editor_needs_focus
+                && matches!(profile.session.content, Content::Query);
+            wanted.then(|| {
+                profile.session.editor_needs_focus = false;
+                profile.session.editor.clone()
+            })
+        });
+        if let Some(editor) = take_focus {
+            editor.focus_handle(cx).focus(window);
         }
+
         let (status, status_color) = match &self.connection {
             ConnectionState::NotConfigured => {
                 ("No connection configured.".to_string(), t.text_muted)
@@ -884,7 +923,16 @@ impl Render for Workspace {
             ),
             ConnectionState::Failed(message) => (message.clone(), t.danger),
         };
-        let result_lines = match &self.query {
+        let Some(profile) = self.profile() else {
+            return div()
+                .id("connection-form")
+                .size_full()
+                .bg(t.bg)
+                .text_color(t.text)
+                .child(self.render_connection_form(cx));
+        };
+
+        let result_lines = match &profile.session.query {
             QueryState::Idle => vec!["⌘↵ runs the selection or statement under the cursor.".into()],
             QueryState::Running => vec!["Running query…".into()],
             QueryState::Failed(error) => {
@@ -905,7 +953,7 @@ impl Render for Workspace {
             }],
             QueryState::Complete { .. } => Vec::new(),
         };
-        let query_status = match &self.query {
+        let query_status = match &profile.session.query {
             QueryState::Complete {
                 rows,
                 bytes,
@@ -914,15 +962,6 @@ impl Render for Workspace {
             } => Some(format!("{rows} row(s) · {bytes} bytes · {elapsed:.1?}")),
             _ => None,
         };
-
-        if !matches!(self.connection, ConnectionState::Connected(_)) {
-            return div()
-                .id("connection-form")
-                .size_full()
-                .bg(t.bg)
-                .text_color(t.text)
-                .child(self.render_connection_form(cx));
-        }
 
         div()
             .id("workspace")
@@ -950,13 +989,13 @@ impl Render for Workspace {
                     .flex_1()
                     .min_h_0()
                     .flex()
-                    .child(self.render_explorer(cx))
+                    .child(Self::render_explorer(profile, cx))
                     .child(
                         div()
                             .flex_1()
                             .min_w_0()
                             .h_full()
-                            .child(self.render_main_content(result_lines, cx)),
+                            .child(Self::render_main_content(profile, result_lines, cx)),
                     ),
             )
             .child(
