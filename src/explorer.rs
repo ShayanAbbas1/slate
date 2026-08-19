@@ -31,14 +31,32 @@ pub enum ExplorerTarget {
     },
 }
 
+/// What kind of object a row stands for. The sidebar draws an icon from this;
+/// the kind lives here rather than an `IconName` so the tree stays comparable
+/// in tests and free of the widget library's types.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ObjectKind {
+    Relation(RelationKind),
+    Routine(RoutineKind),
+}
+
+/// What the sidebar knows about one openable row: where it points, and what it
+/// is. One map rather than two, so a leaf can never end up with a target and no
+/// kind.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ExplorerLeaf {
+    pub target: ExplorerTarget,
+    pub kind: ObjectKind,
+}
+
 pub struct ExplorerTree {
     pub items: Vec<TreeItem>,
-    pub targets: HashMap<String, ExplorerTarget>,
+    pub leaves: HashMap<String, ExplorerLeaf>,
 }
 
 pub fn tree(catalog: &Catalog, filter: &str) -> ExplorerTree {
     let filter = filter.trim().to_lowercase();
-    let mut targets = HashMap::new();
+    let mut leaves = HashMap::new();
 
     let items = catalog
         .schemas
@@ -59,11 +77,14 @@ pub fn tree(catalog: &Catalog, filter: &str) -> ExplorerTree {
                     })
                     .map(|(relation_index, relation)| {
                         let id = format!("relation-{schema_index}-{relation_index}");
-                        targets.insert(
+                        leaves.insert(
                             id.clone(),
-                            ExplorerTarget::Relation {
-                                schema_index,
-                                relation_index,
+                            ExplorerLeaf {
+                                target: ExplorerTarget::Relation {
+                                    schema_index,
+                                    relation_index,
+                                },
+                                kind: ObjectKind::Relation(kind),
                             },
                         );
                         TreeItem::new(id, relation.name.clone())
@@ -85,11 +106,14 @@ pub fn tree(catalog: &Catalog, filter: &str) -> ExplorerTree {
                     })
                     .map(|(routine_index, routine)| {
                         let id = format!("routine-{schema_index}-{routine_index}");
-                        targets.insert(
+                        leaves.insert(
                             id.clone(),
-                            ExplorerTarget::Routine {
-                                schema_index,
-                                routine_index,
+                            ExplorerLeaf {
+                                target: ExplorerTarget::Routine {
+                                    schema_index,
+                                    routine_index,
+                                },
+                                kind: ObjectKind::Routine(kind),
                             },
                         );
                         TreeItem::new(
@@ -116,7 +140,7 @@ pub fn tree(catalog: &Catalog, filter: &str) -> ExplorerTree {
         })
         .collect();
 
-    ExplorerTree { items, targets }
+    ExplorerTree { items, leaves }
 }
 
 fn category(label: &'static str, schema_index: usize, children: Vec<TreeItem>) -> TreeItem {
@@ -248,11 +272,30 @@ mod tests {
         let explorer = tree(&catalog(), "account_name");
 
         assert_eq!(
-            explorer.targets.get("routine-1-1"),
-            Some(&ExplorerTarget::Routine {
-                schema_index: 1,
-                routine_index: 1,
+            explorer.leaves.get("routine-1-1"),
+            Some(&ExplorerLeaf {
+                target: ExplorerTarget::Routine {
+                    schema_index: 1,
+                    routine_index: 1,
+                },
+                kind: ObjectKind::Routine(RoutineKind::Function),
             })
+        );
+    }
+
+    #[test]
+    fn a_leaf_carries_the_kind_its_icon_is_drawn_from() {
+        let explorer = tree(&catalog(), "public");
+        let kind = |id: &str| explorer.leaves.get(id).map(|leaf| leaf.kind);
+
+        // public: relation 0 is a view, relation 1 is a table.
+        assert_eq!(
+            kind("relation-1-0"),
+            Some(ObjectKind::Relation(RelationKind::View))
+        );
+        assert_eq!(
+            kind("relation-1-1"),
+            Some(ObjectKind::Relation(RelationKind::Table))
         );
     }
 

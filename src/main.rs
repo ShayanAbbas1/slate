@@ -3,18 +3,19 @@ mod explorer;
 mod result_grid;
 mod sql;
 
+mod icons;
 mod theme;
 
 use std::{collections::HashMap, sync::Arc};
 
 use gpui::{
     AnyElement, App, AppContext, Application, ClickEvent, Context, Entity, EntityInputHandler,
-    Focusable,
-    InteractiveElement, IntoElement, KeyBinding, ParentElement, Render, StatefulInteractiveElement,
-    Styled, Window, WindowOptions, actions, div, px,
+    Focusable, FontWeight, InteractiveElement, IntoElement, KeyBinding, ParentElement, Render,
+    StatefulInteractiveElement, Styled, TitlebarOptions, Window, WindowOptions, actions, div,
+    point, px,
 };
 use gpui_component::{
-    Disableable, Root, Sizable,
+    Disableable, InteractiveElementExt, Root, Sizable,
     button::{Button, ButtonVariants},
     input::{Input, InputEvent, InputState},
     list::ListItem,
@@ -23,16 +24,20 @@ use gpui_component::{
 };
 
 use db::{
-    Catalog, Connection, ConnectionConfig, DbError, Routine, RoutineKind, Structure,
+    Catalog, Connection, ConnectionConfig, DbError, RelationKind, Routine, RoutineKind, Structure,
 };
-use explorer::{ExplorerTarget, preview_sql, tree as build_explorer_tree};
+use explorer::{ExplorerLeaf, ExplorerTarget, ObjectKind, preview_sql, tree as build_explorer_tree};
+use icons::{Icons, icon};
 use result_grid::ResultGrid;
 use sql::Buffer;
-use theme::{Appearance, Theme, layout, theme};
+use theme::{Theme, layout, theme};
 
-actions!(slate, [RunQuery, ShowEditor]);
+actions!(slate, [RunQuery, ShowEditor, CycleTheme]);
 
 const RETURN_HINT: &str = "esc returns to the editor";
+
+/// The platform's window buttons, which Slate positions but does not draw.
+const TRAFFIC_LIGHT_DIAMETER: f32 = 14.0;
 
 enum ConnectionState {
     NotConfigured,
@@ -67,7 +72,7 @@ struct Session {
     content: Content,
     explorer_filter: Entity<InputState>,
     explorer_tree: Entity<TreeState>,
-    explorer_targets: Arc<HashMap<String, ExplorerTarget>>,
+    explorer_leaves: Arc<HashMap<String, ExplorerLeaf>>,
     /// `cmd+enter` reaches the workspace only through the focused element's
     /// dispatch path, so an unfocused editor makes the primary keystroke dead.
     editor_needs_focus: bool,
@@ -101,7 +106,7 @@ impl Session {
             content: Content::Query,
             explorer_filter,
             explorer_tree: cx.new(|cx| TreeState::new(cx)),
-            explorer_targets: Arc::new(HashMap::new()),
+            explorer_leaves: Arc::new(HashMap::new()),
             editor_needs_focus: true,
         }
     }
@@ -453,13 +458,13 @@ impl Workspace {
             CatalogState::Loaded(catalog) => build_explorer_tree(catalog, &filter),
             _ => explorer::ExplorerTree {
                 items: Vec::new(),
-                targets: HashMap::new(),
+                leaves: HashMap::new(),
             },
         };
         let tree = profile.session.explorer_tree.clone();
 
         if let Some(profile) = self.profile_mut() {
-            profile.session.explorer_targets = Arc::new(explorer.targets);
+            profile.session.explorer_leaves = Arc::new(explorer.leaves);
         }
         tree.update(cx, |tree, cx| tree.set_items(explorer.items, cx));
     }
@@ -573,6 +578,16 @@ impl Workspace {
             Some(CatalogState::Loaded(catalog)) => Some(catalog),
             _ => None,
         }
+    }
+
+    /// Swap to the next registered theme. Every colour Slate paints is read
+    /// from the global at render time, so repainting is the whole change — and
+    /// side-by-side comparison is the only honest way to pick between palettes.
+    fn cycle_theme(&mut self, _: &CycleTheme, _: &mut Window, cx: &mut Context<Self>) {
+        let next = theme(cx).next();
+        next.apply_to_components(cx);
+        cx.set_global(next);
+        cx.refresh_windows();
     }
 
     /// Return to the editor. Without this the routine and preview surfaces are
@@ -730,13 +745,19 @@ impl Workspace {
                     .flex()
                     .flex_col()
                     .gap(px(layout::SPACE_MD))
-                    .child(div().text_size(px(20.)).child("Connect to Postgres"))
                     .child(
                         div()
+                            .text_size(px(layout::TEXT_XL))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child("Connect to Postgres"),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(layout::TEXT_SM))
                             .text_color(t.text_muted)
                             .child("Paste a connection URL or enter the profile fields."),
                     )
-                    .child(self.form_field("Connection URL", &self.connection_form.url))
+                    .child(self.form_field("Connection URL", &self.connection_form.url, cx))
                     .child(
                         div().flex().justify_end().child(
                             Button::new("apply-connection-url")
@@ -745,13 +766,18 @@ impl Workspace {
                                 .on_click(cx.listener(Self::apply_connection_url)),
                         ),
                     )
-                    .child(self.form_field("Display name", &self.connection_form.name))
-                    .child(self.form_field("Host", &self.connection_form.host))
-                    .child(self.form_field("Port", &self.connection_form.port))
-                    .child(self.form_field("Database", &self.connection_form.database))
-                    .child(self.form_field("Username", &self.connection_form.user))
-                    .child(self.form_field("Password", &self.connection_form.password))
-                    .children(message.map(|message| div().text_color(t.danger).child(message)))
+                    .child(self.form_field("Display name", &self.connection_form.name, cx))
+                    .child(self.form_field("Host", &self.connection_form.host, cx))
+                    .child(self.form_field("Port", &self.connection_form.port, cx))
+                    .child(self.form_field("Database", &self.connection_form.database, cx))
+                    .child(self.form_field("Username", &self.connection_form.user, cx))
+                    .child(self.form_field("Password", &self.connection_form.password, cx))
+                    .children(message.map(|message| {
+                        div()
+                            .text_size(px(layout::TEXT_SM))
+                            .text_color(t.danger)
+                            .child(message)
+                    }))
                     .child(
                         Button::new("connect")
                             .label(if connecting {
@@ -766,12 +792,23 @@ impl Workspace {
             )
     }
 
-    fn form_field(&self, label: &'static str, input: &Entity<InputState>) -> impl IntoElement {
+    fn form_field(
+        &self,
+        label: &'static str,
+        input: &Entity<InputState>,
+        cx: &App,
+    ) -> impl IntoElement {
         div()
             .flex()
             .flex_col()
             .gap(px(layout::SPACE_XS))
-            .child(label)
+            .child(
+                div()
+                    .text_size(px(layout::TEXT_SM))
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(theme(cx).text_muted)
+                    .child(label),
+            )
             .child(Input::new(input).w_full())
     }
 
@@ -800,16 +837,22 @@ impl Workspace {
                         .flex()
                         .flex_col()
                         .gap(px(layout::SPACE_SM))
-                        .child(div().text_size(px(18.)).child(format!(
-                            "{}.{}({})",
-                            details.schema,
-                            details.routine.name,
-                            details.routine.identity_arguments
-                        )))
+                        .child(
+                            div()
+                                .text_size(px(layout::TEXT_LG))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .child(format!(
+                                    "{}.{}({})",
+                                    details.schema,
+                                    details.routine.name,
+                                    details.routine.identity_arguments
+                                )),
+                        )
                         .child(
                             div()
                                 .flex()
                                 .gap(px(layout::SPACE_LG))
+                                .text_size(px(layout::TEXT_SM))
                                 .text_color(t.text_muted)
                                 .child(kind)
                                 .child(format!("Language: {}", details.routine.language))
@@ -835,9 +878,11 @@ impl Workspace {
         // The generated preview is shown as its own read-only surface, so it is
         // always distinguishable from SQL the user wrote.
         let top = match &profile.session.content {
+            // Sized by its contents, unlike the editor: a generated `SELECT` is
+            // three lines of chrome, and giving it half the pane leaves the rows
+            // it was run to show squeezed into the bottom half.
             Content::Preview(preview) => div()
-                .flex_1()
-                .min_h_0()
+                .flex_shrink_0()
                 .p(px(layout::SPACE_LG))
                 .font_family(mono)
                 .flex()
@@ -845,17 +890,30 @@ impl Workspace {
                 .gap(px(layout::SPACE_SM))
                 .child(
                     div()
-                        .text_color(t.text_muted)
-                        .child(format!("Generated preview · {RETURN_HINT}")),
+                        .flex()
+                        .gap(px(layout::SPACE_SM))
+                        .child(section_label(t, "Generated preview"))
+                        .child(
+                            div()
+                                .text_size(px(layout::TEXT_XS))
+                                .text_color(t.text_faint)
+                                .child(RETURN_HINT),
+                        ),
                 )
                 .child(preview.sql.clone())
                 .child(
                     div()
                         .flex()
                         .gap(px(layout::SPACE_XS))
-                        .child(Self::preview_tab("Data", !preview.showing_structure, cx))
+                        .child(Self::preview_tab(
+                            "Data",
+                            icon::TABLE,
+                            !preview.showing_structure,
+                            cx,
+                        ))
                         .child(Self::preview_tab(
                             "Structure",
+                            icon::STRUCTURE,
                             preview.showing_structure,
                             cx,
                         )),
@@ -900,8 +958,12 @@ impl Workspace {
                         .map(|line| div().w_full().py(px(layout::SPACE_XS)).child(line)),
                 )
                 .into_any_element(),
+            // Values are read by comparing them down a column, which only lines
+            // up in a monospaced face -- and the header inherits it, so the
+            // heading of a column sits in the same rhythm as its values.
             _ => div()
                 .size_full()
+                .font_family(gpui_component::Theme::global(cx).mono_font_family.clone())
                 .child(Table::new(&profile.session.results).bordered(false))
                 .into_any_element(),
         };
@@ -922,8 +984,13 @@ impl Workspace {
             )
     }
 
-    fn preview_tab(label: &'static str, selected: bool, cx: &mut Context<Self>) -> Button {
-        let button = Button::new(label).label(label).small();
+    fn preview_tab(
+        label: &'static str,
+        path: &'static str,
+        selected: bool,
+        cx: &mut Context<Self>,
+    ) -> Button {
+        let button = Button::new(label).icon(icon(path)).label(label).small();
         let button = if selected {
             button.primary()
         } else {
@@ -956,13 +1023,15 @@ impl Workspace {
             StructureState::Loaded(structure) => structure,
         };
 
-        let heading = |label: &'static str| {
+        let heading =
+            |label: &'static str| div().pt(px(layout::SPACE_MD)).child(section_label(t, label));
+        let name_column = |name: String| {
             div()
-                .pt(px(layout::SPACE_MD))
-                .text_color(t.text_muted)
-                .child(label)
+                .w(px(220.))
+                .min_w(px(220.))
+                .font_weight(FontWeight::MEDIUM)
+                .child(name)
         };
-        let name_column = |name: String| div().w(px(220.)).min_w(px(220.)).child(name);
         let definitions = |definitions: &[db::NamedDefinition]| {
             definitions
                 .iter()
@@ -1001,6 +1070,9 @@ impl Workspace {
                         div()
                             .w(px(200.))
                             .min_w(px(200.))
+                            // The same colour the editor gives a type name, so
+                            // structure and SQL read as one vocabulary.
+                            .text_color(t.syntax_type)
                             .child(column.data_type.clone()),
                     )
                     .child(
@@ -1028,7 +1100,7 @@ impl Workspace {
     fn render_explorer(profile: &Profile, cx: &mut Context<Self>) -> impl IntoElement {
         let t = *theme(cx);
         let workspace = cx.entity().downgrade();
-        let targets = profile.session.explorer_targets.clone();
+        let leaves = profile.session.explorer_leaves.clone();
         let content = match &profile.catalog {
             CatalogState::Loading => div()
                 .p(px(layout::SPACE_MD))
@@ -1048,27 +1120,64 @@ impl Workspace {
             CatalogState::Loaded(_) => {
                 render_tree(&profile.session.explorer_tree, move |index, entry, _, _, cx| {
                 let t = *theme(cx);
-                let row = ListItem::new(index)
+                let leaf = leaves.get(entry.item().id.as_str()).copied();
+                let label = entry.item().label.clone();
+                // Three ranks, three weights: a schema owns the column, a
+                // category only labels the run of objects under it, and the
+                // objects themselves are what the eye is actually hunting for.
+                let (label, row) = match (leaf, entry.depth()) {
+                    (Some(_), _) => (label, ListItem::new(index).text_color(t.text)),
+                    (None, 0) => (
+                        label,
+                        ListItem::new(index)
+                            .text_color(t.text)
+                            .font_weight(FontWeight::SEMIBOLD),
+                    ),
+                    (None, _) => (
+                        label.to_uppercase().into(),
+                        ListItem::new(index)
+                            .text_color(t.text_faint)
+                            .text_size(px(layout::TEXT_XS))
+                            .font_weight(FontWeight::MEDIUM),
+                    ),
+                };
+                // A folder shows which way it is facing; an object shows what
+                // kind of object it is. Both occupy the same slot, so the
+                // labels line up down the column either way.
+                let row_icon_path = match leaf {
+                    Some(leaf) => object_icon(leaf.kind),
+                    None if entry.is_expanded() => icon::CHEVRON_DOWN,
+                    None => icon::CHEVRON_RIGHT,
+                };
+                let row = row
                     .pl(px(
                         layout::SPACE_SM + entry.depth() as f32 * layout::SPACE_MD
                     ))
-                    .text_color(t.text)
                     .child(
                         div()
-                            .flex_1()
+                            .flex()
+                            .items_center()
+                            .gap(px(layout::SPACE_SM))
                             .min_w_0()
-                            .overflow_hidden()
-                            .text_ellipsis()
-                            .whitespace_nowrap()
-                            .child(entry.item().label.clone()),
+                            .flex_1()
+                            .child(row_icon(t, row_icon_path))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .overflow_hidden()
+                                    .text_ellipsis()
+                                    .whitespace_nowrap()
+                                    .child(label),
+                            ),
                     );
-                let Some(target) = targets.get(entry.item().id.as_str()).copied() else {
+                let Some(leaf) = leaf else {
                     return row;
                 };
                 let workspace = workspace.clone();
                 row.on_click(move |_, _, cx| {
                     _ = workspace.update(cx, |workspace, cx| {
-                        workspace.open_explorer_target(target, cx);
+                        workspace.open_explorer_target(leaf.target, cx);
                     });
                     })
                 })
@@ -1082,12 +1191,14 @@ impl Workspace {
             .h_full()
             .flex()
             .flex_col()
+            .border_r_1()
+            .border_color(t.border)
             .child(
-                div()
-                    .p(px(layout::SPACE_SM))
-                    .border_b_1()
-                    .border_color(t.border)
-                    .child(Input::new(&profile.session.explorer_filter).w_full()),
+                div().p(px(layout::SPACE_SM)).child(
+                    Input::new(&profile.session.explorer_filter)
+                        .w_full()
+                        .prefix(row_icon(t, icon::SEARCH)),
+                ),
             )
             .child(div().flex_1().min_h_0().child(content))
     }
@@ -1129,7 +1240,19 @@ impl Render for Workspace {
                 .size_full()
                 .bg(t.bg)
                 .text_color(t.text)
-                .child(self.render_connection_form(cx));
+                .text_size(px(layout::TEXT_MD))
+                .flex()
+                .flex_col()
+                .on_action(cx.listener(Self::cycle_theme))
+                // Without a titlebar of its own the form has no drag handle at
+                // all, since the platform's is transparent.
+                .child(titlebar(t, None))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_h_0()
+                        .child(self.render_connection_form(cx)),
+                );
         };
 
         let result_lines = match &profile.session.query {
@@ -1167,24 +1290,17 @@ impl Render for Workspace {
             .id("workspace")
             .on_action(cx.listener(Self::run_query))
             .on_action(cx.listener(Self::show_editor))
+            .on_action(cx.listener(Self::cycle_theme))
             .size_full()
-            // The shell carries the frost, and the titlebar, sidebar and status
-            // bar paint nothing of their own — they are that glass. The content
-            // card below is the only opaque plane, so it is the only thing text
-            // sits on that Slate fully controls.
-            .bg(t.chrome())
+            // The shell is the chrome tone: titlebar, sidebar and status bar
+            // paint nothing of their own, they are this. The content card below
+            // is the plane that steps away from it.
+            .bg(t.surface)
             .text_color(t.text)
+            .text_size(px(layout::TEXT_MD))
             .flex()
             .flex_col()
-            .child(
-                div()
-                    .h(px(layout::TITLEBAR_HEIGHT))
-                    .w_full()
-                    .flex()
-                    .items_center()
-                    .px(px(layout::SPACE_MD))
-                    .child("Slate"),
-            )
+            .child(titlebar(t, Some(profile.name.clone())))
             .child(
                 div()
                     .flex_1()
@@ -1215,14 +1331,111 @@ impl Render for Workspace {
                     .w_full()
                     .flex()
                     .items_center()
+                    .gap(px(layout::SPACE_SM))
                     .px(px(layout::SPACE_MD))
-                    .text_color(status_color)
-                    .child(status)
+                    .border_t_1()
+                    .border_color(t.border)
+                    .text_size(px(layout::TEXT_SM))
+                    // The dot carries the state and the text carries the words.
+                    // A whole status line in green shouts about being connected,
+                    // which is the least interesting thing Slate can tell you.
+                    .child(
+                        div()
+                            .size(px(layout::SPACE_XS + 2.))
+                            .rounded_full()
+                            .bg(status_color),
+                    )
+                    .child(
+                        div()
+                            .text_color(if matches!(self.connection, ConnectionState::Failed(_)) {
+                                t.danger
+                            } else {
+                                t.text_muted
+                            })
+                            .child(status),
+                    )
                     .children(query_status.map(|query_status| {
-                        div().ml_auto().text_color(t.text_muted).child(query_status)
+                        div().ml_auto().text_color(t.text_faint).child(query_status)
                     })),
             )
     }
+}
+
+/// The icon a sidebar row carries: a grid for a table, layers for one split
+/// into partitions, an eye for the kinds that are a saved query over a table, a
+/// disk for the one that stores its answer, and a globe for the one that lives
+/// on another server entirely.
+fn object_icon(kind: ObjectKind) -> &'static str {
+    match kind {
+        ObjectKind::Relation(RelationKind::Table) => icon::TABLE,
+        ObjectKind::Relation(RelationKind::PartitionedTable) => icon::PARTITIONED_TABLE,
+        ObjectKind::Relation(RelationKind::View) => icon::VIEW,
+        ObjectKind::Relation(RelationKind::MaterializedView) => icon::MATERIALIZED_VIEW,
+        ObjectKind::Relation(RelationKind::ForeignTable) => icon::FOREIGN_TABLE,
+        ObjectKind::Routine(RoutineKind::Function) => icon::FUNCTION,
+        ObjectKind::Routine(RoutineKind::Procedure) => icon::PROCEDURE,
+    }
+}
+
+/// One column of icons down the sidebar, so every label starts at the same x
+/// whether its row is a folder or an object.
+fn row_icon(t: Theme, path: &'static str) -> impl IntoElement {
+    icon(path).size(px(layout::ICON_SIZE)).text_color(t.text_faint)
+}
+
+/// Slate's own titlebar, drawn where the platform's would be.
+///
+/// The system titlebar is transparent (see `main`), so this row is what runs to
+/// the top of the window and the window buttons are drawn over its leading
+/// inset. It is also the drag handle the platform no longer provides.
+fn titlebar(t: Theme, subtitle: Option<String>) -> impl IntoElement {
+    div()
+        .id("titlebar")
+        .window_control_area(gpui::WindowControlArea::Drag)
+        .on_double_click(|_, window, _| window.titlebar_double_click())
+        .h(px(layout::TITLEBAR_HEIGHT))
+        .w_full()
+        .flex()
+        .flex_shrink_0()
+        .items_center()
+        .pl(px(layout::TITLEBAR_LEADING_INSET))
+        .pr(px(layout::SPACE_MD))
+        .border_b_1()
+        .border_color(t.border)
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(layout::SPACE_SM))
+                .child(div().font_weight(FontWeight::SEMIBOLD).child("Slate"))
+                .children(subtitle.map(|subtitle| {
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(layout::SPACE_XS))
+                        .text_size(px(layout::TEXT_SM))
+                        .text_color(t.text_faint)
+                        .child(row_icon(t, icon::DATABASE))
+                        .child(subtitle)
+                })),
+        )
+        .child(
+            div()
+                .ml_auto()
+                .text_size(px(layout::TEXT_XS))
+                .text_color(t.text_faint)
+                .child(format!("{} · ⌘⇧T", t.name)),
+        )
+}
+
+/// The quietest thing on screen: small, uppercase, and dim enough that the
+/// names under it are what the eye lands on first.
+fn section_label(t: Theme, label: &str) -> impl IntoElement {
+    div()
+        .text_size(px(layout::TEXT_XS))
+        .font_weight(FontWeight::MEDIUM)
+        .text_color(t.text_faint)
+        .child(label.to_uppercase())
 }
 
 fn connection_config_from_environment() -> Result<Option<ConnectionConfig>, String> {
@@ -1277,25 +1490,34 @@ fn connection_config_from_environment() -> Result<Option<ConnectionConfig>, Stri
 }
 
 fn main() {
-    Application::new().run(|cx: &mut App| {
+    Application::new().with_assets(Icons).run(|cx: &mut App| {
         gpui_component::init(cx);
-        let theme = Theme::new(Appearance::Dark);
+        let theme = Theme::default();
         theme.apply_to_components(cx);
         cx.set_global(theme);
         cx.bind_keys([
             KeyBinding::new("cmd-enter", RunQuery, None),
             KeyBinding::new("escape", ShowEditor, None),
+            KeyBinding::new("cmd-shift-t", CycleTheme, None),
         ]);
+
+        // The platform titlebar is kept only for its window buttons: a system
+        // bar in its own grey above Slate's chrome is the seam every native app
+        // avoids. Slate paints that strip itself, and the buttons sit over it.
+        let options = WindowOptions {
+            titlebar: Some(TitlebarOptions {
+                title: Some("Slate".into()),
+                appears_transparent: true,
+                traffic_light_position: Some(point(
+                    px(layout::SPACE_MD),
+                    px((layout::TITLEBAR_HEIGHT - TRAFFIC_LIGHT_DIAMETER) / 2.),
+                )),
+            }),
+            ..Default::default()
+        };
 
         // Root must be the window's first layer or dialog and notification
         // layers panic when they look for it.
-        let options = WindowOptions {
-            // Only the chrome is translucent, so this is what makes the
-            // sidebar and status bar frost over the desktop instead of over
-            // black. The content planes paint opaque on top of it.
-            window_background: theme.window_background(),
-            ..Default::default()
-        };
         cx.open_window(options, |window, cx| {
             let workspace = cx.new(|cx| Workspace::new(window, cx));
             cx.new(|cx| Root::new(workspace, window, cx))

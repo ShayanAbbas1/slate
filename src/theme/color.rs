@@ -70,6 +70,18 @@ impl Srgb {
         Self { r, g, b }
     }
 
+    /// Read a `0xRRGGBB` literal. The dark palette is transcribed from a
+    /// published colourscheme, and hex is the form it is published in —
+    /// re-deriving each swatch in Oklch would only invite transcription drift.
+    pub fn from_hex(rgb: u32) -> Self {
+        let channel = |shift: u32| ((rgb >> shift) & 0xff) as f32 / 255.0;
+        Self {
+            r: channel(16),
+            g: channel(8),
+            b: channel(0),
+        }
+    }
+
     pub const fn opaque(self) -> Rgba {
         Rgba {
             r: self.r,
@@ -200,6 +212,13 @@ mod tests {
     #[test]
     fn srgb_formats_as_hex() {
         assert_eq!(Srgb::new(1.0, 0.5, 0.0).hex(), "#ff8000");
+    }
+
+    #[test]
+    fn hex_survives_the_round_trip() {
+        // The palette is written as hex literals, so a channel swapped here
+        // would silently repaint every token.
+        assert_eq!(Srgb::from_hex(0x0fc5ed).hex(), "#0fc5ed");
     }
 
     #[test]

@@ -41,6 +41,7 @@ gpui = "=0.2.2"
 gpui-component = { version = "=0.5.1", features = ["tree-sitter-languages"] }
 postgres = "0.19"          # blocking client, NOT tokio-postgres
 nucleo-matcher = "*"       # fuzzy scoring; gpui-component ships no scorer
+icondata_lu = "=0.1.0"     # Lucide icon data; gpui-component ships no icon files
 ```
 
 **Pins are exact and the lockfile is committed. Do not bump without being asked.**
@@ -80,6 +81,12 @@ multi-line editor, IME, line numbers), `src/highlighter/` (tree-sitter; SQL via
 `src/dock/` (panels, tab bars), `Root` dialog layers (modal overlays).
 
 It does **not** provide a fuzzy matcher or a command palette. Those are ours.
+
+It also does **not** ship the icons its `IconName` names: those are Lucide file
+paths with no files behind them. `src/icons.rs` is Slate's `AssetSource` — it
+serves the same paths from `icondata_lu` in memory, so nothing is vendored into
+the repository and the library's own widgets get their icons from it too. Add a
+row to `ICONS` when something needs one; an unlisted path draws nothing.
 
 The library owns scroll math, text shaping and virtualization. **Every visible
 pixel is still ours** — `TableDelegate::render_td(row_ix, col_ix)` is pull-based,

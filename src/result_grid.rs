@@ -1,4 +1,7 @@
-use gpui::{App, Context, IntoElement, ParentElement, SharedString, Styled, Window, div, px};
+use gpui::{
+    App, Context, IntoElement, ParentElement, SharedString, Styled, Window, div,
+    prelude::FluentBuilder, px,
+};
 use gpui_component::table::{Column, TableDelegate, TableState};
 
 use crate::{
@@ -90,6 +93,8 @@ impl TableDelegate for ResultGrid {
             .px(px(layout::SPACE_SM))
             .flex()
             .items_center()
+            .text_size(px(layout::TEXT_SM))
+            .font_weight(gpui::FontWeight::MEDIUM)
             .text_color(muted)
             .child(self.columns[col_ix].name.clone())
     }
@@ -123,6 +128,8 @@ impl TableDelegate for ResultGrid {
             .whitespace_nowrap()
             .text_ellipsis()
             .text_color(if cell.is_some() { text } else { faint })
+            // Italic so a NULL cannot be mistaken for the four-letter string.
+            .when(cell.is_none(), |cell| cell.italic())
             .child(cell.cloned().unwrap_or(NULL_LABEL))
     }
 }

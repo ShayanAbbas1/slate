@@ -32,11 +32,28 @@ pub mod layout {
     pub const SPACE_MD: f32 = 12.0;
     pub const SPACE_LG: f32 = 16.0;
 
+    /// Type scale. Body is 13, not gpui-component's 16: a database client is a
+    /// dense surface, and the library default reads as a demo blown up for a
+    /// projector. `XS` is for the uppercase section labels only, which is why it
+    /// is allowed to sit below the readable body minimum.
+    pub const TEXT_XS: f32 = 11.0;
+    pub const TEXT_SM: f32 = 12.0;
+    pub const TEXT_MD: f32 = 13.0;
+    pub const TEXT_LG: f32 = 16.0;
+    pub const TEXT_XL: f32 = 19.0;
+
+    /// One icon size everywhere. Icons here label rows and buttons; nothing in
+    /// Slate is an illustration, so a second size would only be decoration.
+    pub const ICON_SIZE: f32 = 14.0;
+
     pub const RADIUS_CONTROL: f32 = 6.0;
     pub const RADIUS_PANEL: f32 = 10.0;
     pub const RADIUS_LARGE: f32 = 16.0;
 
     pub const TITLEBAR_HEIGHT: f32 = 38.0;
+    /// Where the titlebar's own content can start without colliding with the
+    /// platform's window buttons, which are drawn over it.
+    pub const TITLEBAR_LEADING_INSET: f32 = 78.0;
     pub const STATUS_HEIGHT: f32 = 24.0;
     pub const GRID_COLUMN_WIDTH: f32 = 180.0;
     pub const SIDEBAR_DEFAULT_WIDTH: f32 = 256.0;
@@ -52,6 +69,12 @@ pub enum Appearance {
 }
 
 impl gpui::Global for Theme {}
+
+impl Default for Theme {
+    fn default() -> Self {
+        Self::all()[0]
+    }
+}
 
 /// Read the active theme. Panics unless [`Theme::apply_to_components`] and
 /// `cx.set_global` have run, which `main` does before opening the window.
@@ -101,15 +124,6 @@ const NEUTRAL_CHROMA: f32 = 0.004;
 const HAIRLINE_DARK: f32 = 0.09;
 const HAIRLINE_LIGHT: f32 = 0.12;
 
-/// How much of the chrome tint covers the blurred desktop behind the window.
-///
-/// The rest is whatever the user has on screen, so this is the knob that trades
-/// frost for legibility: the sidebar and status bar carry muted text, and at
-/// 0.80 that text falls under WCAG AA against a white desktop. Lower it for more
-/// glass and `frosted_chrome_stays_legible_over_any_desktop` will say when it
-/// has gone too far.
-const FROST_ALPHA_DARK: f32 = 0.88;
-
 fn neutral(lightness: f32) -> Srgb {
     Oklch::new(lightness, NEUTRAL_CHROMA, NEUTRAL_HUE).to_srgb()
 }
@@ -119,8 +133,13 @@ const BLACK: Srgb = Srgb::new(0.0, 0.0, 0.0);
 
 /// Every colour Slate paints. Flat fields, not nested groups — a token you have
 /// to go looking for gets duplicated instead of reused.
+///
+/// A new theme is one constructor returning this struct plus one entry in
+/// [`Theme::all`]. Nothing else in the app names a theme, so anything that fills
+/// every field in is already fully supported — including its contrast tests.
 #[derive(Debug, Clone, Copy)]
 pub struct Theme {
+    pub name: &'static str,
     pub appearance: Appearance,
 
     /// The content plane, and the deepest tone. The editor sits on this.
@@ -161,33 +180,22 @@ pub struct Theme {
 }
 
 impl Theme {
-    pub fn new(appearance: Appearance) -> Self {
-        match appearance {
-            Appearance::Dark => Self::dark(),
-            Appearance::Light => Self::light(),
-        }
+    /// Every theme Slate ships, in the order the switcher cycles them. The
+    /// first is the default.
+    pub fn all() -> [Self; 3] {
+        [Self::dark(), Self::coolnight(), Self::light()]
     }
 
-    /// The chrome fill. Translucent in dark, so the blurred desktop behind the
-    /// window reads through the sidebar, titlebar and status bar the way a
-    /// native macOS sidebar does. The content planes stay opaque: a result grid
-    /// over an unknown wallpaper is unreadable, and SQL has to sit on a tone
-    /// Slate chose.
-    pub fn chrome(self) -> Rgba {
-        match self.appearance {
-            Appearance::Dark => self.surface.alpha(FROST_ALPHA_DARK),
-            // Light chrome is opaque by design, so it asks for no vibrancy.
-            Appearance::Light => self.surface.alpha(1.0),
-        }
-    }
-
-    /// How the platform should composite whatever the window does not paint.
-    pub fn window_background(self) -> gpui::WindowBackgroundAppearance {
-        if self.chrome().a < 1.0 {
-            gpui::WindowBackgroundAppearance::Blurred
-        } else {
-            gpui::WindowBackgroundAppearance::Opaque
-        }
+    /// The theme after this one, by name. Falls back to the default, so a theme
+    /// deleted from `all` cannot strand the app on a name that no longer exists.
+    pub fn next(self) -> Self {
+        let themes = Self::all();
+        let index = themes
+            .iter()
+            .position(|theme| theme.name == self.name)
+            .map(|index| (index + 1) % themes.len())
+            .unwrap_or(0);
+        themes[index]
     }
 
     pub fn apply_to_components(self, cx: &mut gpui::App) {
@@ -195,6 +203,8 @@ impl Theme {
         component.shadow = false;
         component.radius = gpui::px(layout::RADIUS_CONTROL);
         component.radius_lg = gpui::px(layout::RADIUS_LARGE);
+        component.font_size = gpui::px(layout::TEXT_MD);
+        component.mono_font_size = gpui::px(layout::TEXT_MD);
 
         component.colors.background = self.bg.into();
         component.colors.foreground = self.text.into();
@@ -203,13 +213,34 @@ impl Theme {
         component.colors.caret = self.cursor.into();
         component.colors.selection = self.selection.into();
         component.colors.ring = self.accent.into();
+        component.colors.muted = self.surface.into();
+        component.colors.muted_foreground = self.text_muted.into();
         // Without these the primary button paints gpui-component's own blue.
         component.colors.primary = self.accent.into();
         component.colors.primary_foreground = self.on_accent.into();
         component.colors.primary_hover = self.element_hover.flatten(self.accent).into();
         component.colors.primary_active = self.element_active.flatten(self.accent).into();
-        component.colors.muted = self.surface.into();
-        component.colors.muted_foreground = self.text_muted.into();
+        component.colors.secondary = self.panel.into();
+        component.colors.secondary_foreground = self.text.into();
+        component.colors.secondary_hover = self.element_hover.flatten(self.panel).into();
+        component.colors.secondary_active = self.element_active.flatten(self.panel).into();
+        // What a ghost button washes with on hover -- the tab pair lives on it.
+        component.colors.accent = self.element_hover.flatten(self.panel).into();
+        component.colors.accent_foreground = self.text.into();
+        component.colors.danger = self.danger.into();
+        component.colors.danger_foreground = self.on_accent.into();
+        component.colors.danger_hover = self.element_hover.flatten(self.danger).into();
+        component.colors.danger_active = self.element_active.flatten(self.danger).into();
+        component.colors.success = self.success.into();
+        component.colors.success_foreground = self.on_accent.into();
+        component.colors.success_hover = self.element_hover.flatten(self.success).into();
+        component.colors.success_active = self.element_active.flatten(self.success).into();
+        component.colors.list = self.surface.into();
+        component.colors.list_even = self.surface.into();
+        component.colors.list_head = self.surface.into();
+        component.colors.list_hover = self.element_hover.into();
+        component.colors.list_active = self.selection.into();
+        component.colors.list_active_border = self.accent.into();
         component.colors.scrollbar = self.panel.into();
         component.colors.scrollbar_thumb = self.border_strong.into();
         component.colors.scrollbar_thumb_hover = self.element_active.into();
@@ -293,8 +324,63 @@ impl Theme {
         })
     }
 
+    /// Coolnight — a deep-navy dark theme, after Josean Martínez's colourscheme
+    /// of that name. Slate's own palette is neutral by design; this one is here
+    /// because a client you stare at all day is allowed to have a colour.
+    ///
+    /// The tones are spread wider than the original's: an editor over a grid
+    /// over a sidebar is three planes, and Coolnight's own steps are close
+    /// enough together to read as one rectangle at Slate's density.
+    pub fn coolnight() -> Self {
+        let hex = Srgb::from_hex;
+        // The pale end of the ramp, used at low alpha for hairlines and washes
+        // so both pick up the palette's blue instead of greying it out.
+        let haze = hex(0x9FD9F6);
+
+        Self {
+            name: "Coolnight",
+            appearance: Appearance::Dark,
+
+            bg: hex(0x00111E),
+            panel: hex(0x021C30),
+            surface: hex(0x032A46),
+
+            element_hover: haze.alpha(0.06),
+            element_active: haze.alpha(0.12),
+
+            border: haze.alpha(0.12),
+            border_strong: haze.alpha(0.22),
+
+            text: hex(0xCBE0F0),
+            text_muted: hex(0x7EA3BF),
+            text_faint: hex(0x4E7CA6),
+
+            accent: hex(0x0FC5ED),
+            on_accent: hex(0x00111E),
+            selection: hex(0x0FC5ED).alpha(0.28),
+            cursor: hex(0x24EAF7),
+
+            // Lifted off Coolnight's own #E52E2E, which clears WCAG only at
+            // heading size. Slate writes query errors in it at body size.
+            danger: hex(0xFF6363),
+            success: hex(0x44FFB1),
+
+            // Coolnight's comment is #4E7CA6; at body size on this background it
+            // lands just under AA, so comments take its lighter doc-comment tone.
+            syntax_comment: hex(0x5E8CB6),
+            syntax_keyword: hex(0xA277FF),
+            syntax_string: hex(0x44FFB1),
+            syntax_number: hex(0xFFE073),
+            syntax_function: hex(0x0FC5ED),
+            syntax_type: hex(0x24EAF7),
+            syntax_variable: hex(0xCBE0F0),
+            syntax_operator: hex(0x8FB6CF),
+        }
+    }
+
     pub fn dark() -> Self {
         Self {
+            name: "Slate Dark",
             appearance: Appearance::Dark,
 
             bg: neutral(0.145),
@@ -335,6 +421,7 @@ impl Theme {
 
     pub fn light() -> Self {
         Self {
+            name: "Slate Light",
             appearance: Appearance::Light,
 
             bg: WHITE,
@@ -382,17 +469,18 @@ mod tests {
     const AA_TEXT: f32 = 4.5;
     const AA_LARGE: f32 = 3.0;
 
-    fn check(name: &str, fg: Srgb, bg: Srgb, minimum: f32) {
+    fn check(theme: Theme, name: &str, fg: Srgb, bg: Srgb, minimum: f32) {
         let ratio = contrast_ratio(fg, bg);
         assert!(
             ratio >= minimum,
-            "{name}: contrast {ratio:.2} is below the {minimum:.1} floor"
+            "{}: {name}: contrast {ratio:.2} is below the {minimum:.1} floor",
+            theme.name
         );
     }
 
     #[test]
-    fn syntax_tokens_clear_wcag_in_both_appearances() {
-        for theme in [Theme::dark(), Theme::light()] {
+    fn syntax_tokens_clear_wcag_in_every_theme() {
+        for theme in Theme::all() {
             for (name, token) in [
                 ("comment", theme.syntax_comment),
                 ("keyword", theme.syntax_keyword),
@@ -403,14 +491,14 @@ mod tests {
                 ("variable", theme.syntax_variable),
                 ("operator", theme.syntax_operator),
             ] {
-                check(name, token, theme.bg, AA_TEXT);
+                check(theme, name, token, theme.bg, AA_TEXT);
             }
         }
     }
 
     #[test]
     fn every_highlighter_category_has_a_slate_style() {
-        for theme in [Theme::dark(), Theme::light()] {
+        for theme in Theme::all() {
             let syntax = serde_json::to_value(&theme.highlight_theme().style.syntax).unwrap();
             let styles = syntax.as_object().unwrap();
             let missing = styles
@@ -426,59 +514,51 @@ mod tests {
     }
 
     #[test]
-    fn dark_text_contrast_clears_wcag() {
-        let t = Theme::dark();
-        check("dark text on bg", t.text, t.bg, AAA_TEXT);
-        check("dark text on panel", t.text, t.panel, AAA_TEXT);
-        check("dark muted on panel", t.text_muted, t.panel, AA_TEXT);
-        check("dark text on surface", t.text, t.surface, AAA_TEXT);
-        check("dark muted on bg", t.text_muted, t.bg, AA_TEXT);
-        check("dark faint on bg", t.text_faint, t.bg, AA_LARGE);
-        check("dark accent on bg", t.accent, t.bg, AA_LARGE);
-        check("dark danger on bg", t.danger, t.bg, AA_LARGE);
-        check("dark on_accent over accent", t.on_accent, t.accent, AA_LARGE);
+    fn text_contrast_clears_wcag_in_every_theme() {
+        for t in Theme::all() {
+            check(t, "text on bg", t.text, t.bg, AAA_TEXT);
+            check(t, "text on panel", t.text, t.panel, AAA_TEXT);
+            check(t, "text on surface", t.text, t.surface, AAA_TEXT);
+            check(t, "muted on bg", t.text_muted, t.bg, AA_TEXT);
+            check(t, "muted on panel", t.text_muted, t.panel, AA_TEXT);
+            check(t, "muted on surface", t.text_muted, t.surface, AA_TEXT);
+            check(t, "faint on bg", t.text_faint, t.bg, AA_LARGE);
+            check(t, "accent on bg", t.accent, t.bg, AA_LARGE);
+            // Query errors are written in `danger` at body size, not as a badge.
+            check(t, "danger on bg", t.danger, t.bg, AA_TEXT);
+            check(t, "danger on panel", t.danger, t.panel, AA_TEXT);
+            check(t, "success on surface", t.success, t.surface, AA_LARGE);
+            check(t, "on_accent over accent", t.on_accent, t.accent, AA_LARGE);
+        }
     }
 
     #[test]
-    fn light_text_contrast_clears_wcag() {
-        let t = Theme::light();
-        check("light text on bg", t.text, t.bg, AAA_TEXT);
-        check("light text on panel", t.text, t.panel, AAA_TEXT);
-        check("light muted on panel", t.text_muted, t.panel, AA_TEXT);
-        check("light text on surface", t.text, t.surface, AAA_TEXT);
-        check("light muted on bg", t.text_muted, t.bg, AA_TEXT);
-        check("light faint on bg", t.text_faint, t.bg, AA_LARGE);
-        check("light accent on bg", t.accent, t.bg, AA_LARGE);
-        check("light danger on bg", t.danger, t.bg, AA_LARGE);
-        check("light on_accent over accent", t.on_accent, t.accent, AA_LARGE);
+    fn themes_are_comparable_not_mirrored() {
+        // Every theme should land in the same contrast neighbourhood, so
+        // switching does not make one of them feel washed out next to another.
+        let ratios = Theme::all().map(|theme| contrast_ratio(theme.text, theme.bg));
+        let spread = ratios.iter().cloned().fold(f32::MIN, f32::max)
+            - ratios.iter().cloned().fold(f32::MAX, f32::min);
+        assert!(spread < 6.0, "themes drifted apart: {ratios:?}");
     }
 
     #[test]
-    fn appearances_are_comparable_not_mirrored() {
-        // Both appearances should land in the same contrast neighbourhood, so
-        // switching does not make one of them feel washed out.
-        let (dark, light) = (Theme::dark(), Theme::light());
-        let d = contrast_ratio(dark.text, dark.bg);
-        let l = contrast_ratio(light.text, light.bg);
-        assert!(
-            (d - l).abs() < 6.0,
-            "appearances drifted apart: dark {d:.2} vs light {l:.2}"
-        );
-    }
-
-    #[test]
-    fn elevation_runs_the_right_way_in_each_appearance() {
-        let dark = Theme::dark();
-        assert!(
-            dark.surface.relative_luminance() > dark.bg.relative_luminance(),
-            "dark chrome must sit lighter than the content plane"
-        );
-
-        let light = Theme::light();
-        assert!(
-            light.surface.relative_luminance() < light.bg.relative_luminance(),
-            "light chrome must sit darker than the content plane"
-        );
+    fn elevation_runs_the_right_way_in_every_theme() {
+        for theme in Theme::all() {
+            let lighter = theme.surface.relative_luminance() > theme.bg.relative_luminance();
+            match theme.appearance {
+                Appearance::Dark => assert!(
+                    lighter,
+                    "{}: dark chrome must sit lighter than the content plane",
+                    theme.name
+                ),
+                Appearance::Light => assert!(
+                    !lighter,
+                    "{}: light chrome must sit darker than the content plane",
+                    theme.name
+                ),
+            }
+        }
     }
 
     #[test]
@@ -489,7 +569,7 @@ mod tests {
         // near-black the ratio's flare term compresses every step into noise —
         // #0a and #16 differ by 12 levels and score 1.09.
         let level = |c: Srgb| (c.r + c.g + c.b) / 3.0 * 255.0;
-        for t in [Theme::dark(), Theme::light()] {
+        for t in Theme::all() {
             for (name, near, far) in [
                 ("bg to panel", t.bg, t.panel),
                 ("panel to surface", t.panel, t.surface),
@@ -497,46 +577,36 @@ mod tests {
                 let step = (level(near) - level(far)).abs();
                 assert!(
                     step >= 8.0,
-                    "{:?} {name}: {step:.1} levels is not a visible step",
-                    t.appearance
+                    "{} {name}: {step:.1} levels is not a visible step",
+                    t.name
                 );
             }
         }
     }
 
     #[test]
-    fn frosted_chrome_stays_legible_over_any_desktop() {
-        // The frost lets an unknown wallpaper through, so the worst case is a
-        // white one: it lightens the chrome and closes the gap to its text.
-        // Muted text is the first thing to fail, and it is what the status bar
-        // and the sidebar's own messages are written in.
-        let t = Theme::dark();
-        for (name, backdrop) in [("white desktop", WHITE), ("black desktop", BLACK)] {
-            let chrome = t.chrome().flatten(backdrop);
-            check(&format!("text on chrome over a {name}"), t.text, chrome, AAA_TEXT);
-            check(&format!("muted on chrome over a {name}"), t.text_muted, chrome, AA_TEXT);
-        }
-    }
-
-    #[test]
-    fn only_a_translucent_appearance_asks_for_vibrancy() {
-        assert_eq!(
-            Theme::dark().window_background(),
-            gpui::WindowBackgroundAppearance::Blurred
-        );
-        assert_eq!(
-            Theme::light().window_background(),
-            gpui::WindowBackgroundAppearance::Opaque
-        );
-    }
-
-    #[test]
     fn hairlines_are_visible_but_soft() {
-        for t in [Theme::dark(), Theme::light()] {
+        for t in Theme::all() {
             let border = t.border.flatten(t.bg);
             let ratio = contrast_ratio(border, t.bg);
-            assert!(ratio > 1.10, "{:?} border is invisible: {ratio:.3}", t.appearance);
-            assert!(ratio < 2.20, "{:?} border reads as a stroke: {ratio:.3}", t.appearance);
+            assert!(ratio > 1.10, "{} border is invisible: {ratio:.3}", t.name);
+            assert!(
+                ratio < 2.20,
+                "{} border reads as a stroke: {ratio:.3}",
+                t.name
+            );
         }
+    }
+
+    #[test]
+    fn the_switcher_visits_every_theme_and_comes_back() {
+        let mut theme = Theme::default();
+        let mut seen = vec![theme.name];
+        for _ in 1..Theme::all().len() {
+            theme = theme.next();
+            assert!(!seen.contains(&theme.name), "{} repeated", theme.name);
+            seen.push(theme.name);
+        }
+        assert_eq!(theme.next().name, Theme::default().name);
     }
 }
