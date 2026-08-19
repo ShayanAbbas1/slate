@@ -8,12 +8,13 @@ mod theme;
 use std::{collections::HashMap, sync::Arc};
 
 use gpui::{
-    App, AppContext, Application, ClickEvent, Context, Entity, EntityInputHandler, Focusable,
+    AnyElement, App, AppContext, Application, ClickEvent, Context, Entity, EntityInputHandler,
+    Focusable,
     InteractiveElement, IntoElement, KeyBinding, ParentElement, Render, StatefulInteractiveElement,
     Styled, Window, WindowOptions, actions, div, px,
 };
 use gpui_component::{
-    Disableable, Root,
+    Disableable, Root, Sizable,
     button::{Button, ButtonVariants},
     input::{Input, InputEvent, InputState},
     list::ListItem,
@@ -21,7 +22,9 @@ use gpui_component::{
     tree::{TreeState, tree as render_tree},
 };
 
-use db::{Catalog, Connection, ConnectionConfig, DbError, Routine, RoutineKind};
+use db::{
+    Catalog, Connection, ConnectionConfig, DbError, Routine, RoutineKind, Structure,
+};
 use explorer::{ExplorerTarget, preview_sql, tree as build_explorer_tree};
 use result_grid::ResultGrid;
 use sql::Buffer;
@@ -120,8 +123,24 @@ struct RoutineDetails {
 /// and a generated preview must never be written over the user's buffer.
 enum Content {
     Query,
-    Preview { sql: String },
+    Preview(Preview),
     Routine(RoutineDetails),
+}
+
+/// An opened relation: the generated `SELECT` above the grid, plus the
+/// relation's definition behind the Structure tab (spec §3.2).
+struct Preview {
+    schema: String,
+    relation: String,
+    sql: String,
+    showing_structure: bool,
+    structure: StructureState,
+}
+
+enum StructureState {
+    Loading,
+    Loaded(Structure),
+    Failed(String),
 }
 
 struct ConnectionForm {
@@ -469,8 +488,15 @@ impl Workspace {
                 // would destroy an unsaved buffer on a misclick.
                 let sql = preview_sql(&schema, &relation);
                 if let Some(profile) = self.profile_mut() {
-                    profile.session.content = Content::Preview { sql: sql.clone() };
+                    profile.session.content = Content::Preview(Preview {
+                        schema: schema.clone(),
+                        relation: relation.clone(),
+                        sql: sql.clone(),
+                        showing_structure: false,
+                        structure: StructureState::Loading,
+                    });
                 }
+                self.load_structure(schema, relation, cx);
                 self.execute_sql(sql, cx);
             }
             ExplorerTarget::Routine {
@@ -492,6 +518,53 @@ impl Workspace {
                 }
                 cx.notify();
             }
+        }
+    }
+
+    fn load_structure(&mut self, schema: String, relation: String, cx: &mut Context<Self>) {
+        let Some(profile) = self.profile() else {
+            return;
+        };
+        let connection = profile.connection.clone();
+        let generation = self.connection_generation;
+        let structure_task = cx.background_executor().spawn({
+            let (schema, relation) = (schema.clone(), relation.clone());
+            async move { connection.structure(&schema, &relation) }
+        });
+
+        cx.spawn(async move |workspace, cx| {
+            let result = structure_task.await;
+            workspace
+                .update(cx, |workspace, cx| {
+                    if workspace.connection_generation != generation {
+                        return;
+                    }
+                    // A second click while this was in flight has already
+                    // replaced the surface, and one relation's columns under
+                    // another's name is worse than no columns at all.
+                    if let Some(profile) = workspace.profile_mut()
+                        && let Content::Preview(preview) = &mut profile.session.content
+                        && preview.schema == schema
+                        && preview.relation == relation
+                    {
+                        preview.structure = match result {
+                            Ok(structure) => StructureState::Loaded(structure),
+                            Err(error) => StructureState::Failed(error.message),
+                        };
+                        cx.notify();
+                    }
+                })
+                .ok();
+        })
+        .detach();
+    }
+
+    fn show_structure(&mut self, showing_structure: bool, cx: &mut Context<Self>) {
+        if let Some(profile) = self.profile_mut()
+            && let Content::Preview(preview) = &mut profile.session.content
+        {
+            preview.showing_structure = showing_structure;
+            cx.notify();
         }
     }
 
@@ -761,7 +834,7 @@ impl Workspace {
         // The generated preview is shown as its own read-only surface, so it is
         // always distinguishable from SQL the user wrote.
         let top = match &profile.session.content {
-            Content::Preview { sql } => div()
+            Content::Preview(preview) => div()
                 .flex_1()
                 .min_h_0()
                 .p(px(layout::SPACE_LG))
@@ -774,7 +847,18 @@ impl Workspace {
                         .text_color(t.text_muted)
                         .child(format!("Generated preview · {RETURN_HINT}")),
                 )
-                .child(sql.clone())
+                .child(preview.sql.clone())
+                .child(
+                    div()
+                        .flex()
+                        .gap(px(layout::SPACE_XS))
+                        .child(Self::preview_tab("Data", !preview.showing_structure, cx))
+                        .child(Self::preview_tab(
+                            "Structure",
+                            preview.showing_structure,
+                            cx,
+                        )),
+                )
                 .into_any_element(),
             _ => div()
                 .flex_1()
@@ -791,6 +875,32 @@ impl Workspace {
                 .into_any_element(),
         };
 
+        let bottom = match &profile.session.content {
+            Content::Preview(preview) if preview.showing_structure => {
+                Self::render_structure(&preview.structure, cx)
+            }
+            _ => div()
+                .size_full()
+                .child(Table::new(&profile.session.results).bordered(false))
+                .children((!result_lines.is_empty()).then(|| {
+                    div()
+                        .size_full()
+                        .p(px(layout::SPACE_LG))
+                        .font_family(gpui_component::Theme::global(cx).mono_font_family.clone())
+                        .text_color(if matches!(profile.session.query, QueryState::Failed(_)) {
+                            t.danger
+                        } else {
+                            t.text
+                        })
+                        .children(
+                            result_lines
+                                .into_iter()
+                                .map(|line| div().w_full().py(px(layout::SPACE_XS)).child(line)),
+                        )
+                }))
+                .into_any_element(),
+        };
+
         div()
             .size_full()
             .flex()
@@ -802,24 +912,111 @@ impl Workspace {
                     .min_h_0()
                     .border_t_1()
                     .border_color(t.border)
-                    .child(Table::new(&profile.session.results).bordered(false))
-                    .children((!result_lines.is_empty()).then(|| {
-                        div()
-                            .size_full()
-                            .p(px(layout::SPACE_LG))
-                            .font_family(gpui_component::Theme::global(cx).mono_font_family.clone())
-                            .text_color(if matches!(profile.session.query, QueryState::Failed(_)) {
-                                t.danger
-                            } else {
-                                t.text
-                            })
-                            .children(
-                                result_lines.into_iter().map(|line| {
-                                    div().w_full().py(px(layout::SPACE_XS)).child(line)
-                                }),
-                            )
-                    })),
+                    .child(bottom),
             )
+    }
+
+    fn preview_tab(label: &'static str, selected: bool, cx: &mut Context<Self>) -> Button {
+        let button = Button::new(label).label(label).small();
+        let button = if selected {
+            button.primary()
+        } else {
+            button.ghost()
+        };
+        button.on_click(cx.listener(move |workspace, _: &ClickEvent, _, cx| {
+            workspace.show_structure(label == "Structure", cx);
+        }))
+    }
+
+    fn render_structure(state: &StructureState, cx: &mut Context<Self>) -> AnyElement {
+        let t = *theme(cx);
+        let mono = gpui_component::Theme::global(cx).mono_font_family.clone();
+
+        let structure = match state {
+            StructureState::Loading => {
+                return div()
+                    .p(px(layout::SPACE_LG))
+                    .text_color(t.text_muted)
+                    .child("Loading structure…")
+                    .into_any_element();
+            }
+            StructureState::Failed(message) => {
+                return div()
+                    .p(px(layout::SPACE_LG))
+                    .text_color(t.danger)
+                    .child(message.clone())
+                    .into_any_element();
+            }
+            StructureState::Loaded(structure) => structure,
+        };
+
+        let heading = |label: &'static str| {
+            div()
+                .pt(px(layout::SPACE_MD))
+                .text_color(t.text_muted)
+                .child(label)
+        };
+        let name_column = |name: String| div().w(px(220.)).min_w(px(220.)).child(name);
+        let definitions = |definitions: &[db::NamedDefinition]| {
+            definitions
+                .iter()
+                .map(|definition| {
+                    div()
+                        .flex()
+                        .gap(px(layout::SPACE_MD))
+                        .child(name_column(definition.name.clone()))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .text_color(t.text_muted)
+                                .child(definition.definition.clone()),
+                        )
+                })
+                .collect::<Vec<_>>()
+        };
+
+        div()
+            .id("structure")
+            .size_full()
+            .overflow_y_scroll()
+            .p(px(layout::SPACE_LG))
+            .font_family(mono)
+            .flex()
+            .flex_col()
+            .gap(px(layout::SPACE_XS))
+            .child(heading("Columns"))
+            .children(structure.columns.iter().map(|column| {
+                div()
+                    .flex()
+                    .gap(px(layout::SPACE_MD))
+                    .child(name_column(column.name.clone()))
+                    .child(
+                        div()
+                            .w(px(200.))
+                            .min_w(px(200.))
+                            .child(column.data_type.clone()),
+                    )
+                    .child(
+                        div()
+                            .w(px(80.))
+                            .min_w(px(80.))
+                            .text_color(t.text_muted)
+                            .child(if column.nullable { "nullable" } else { "not null" }),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_color(t.text_muted)
+                            .child(column.default.clone().unwrap_or_default()),
+                    )
+            }))
+            .children((!structure.indexes.is_empty()).then(|| heading("Indexes")))
+            .children(definitions(&structure.indexes))
+            .children((!structure.constraints.is_empty()).then(|| heading("Constraints")))
+            .children(definitions(&structure.constraints))
+            .into_any_element()
     }
 
     fn render_explorer(profile: &Profile, cx: &mut Context<Self>) -> impl IntoElement {
