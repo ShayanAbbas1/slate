@@ -876,29 +876,33 @@ impl Workspace {
                 .into_any_element(),
         };
 
+        // The grid and the message are alternatives, not layers. A `div` lays its
+        // children out in a row, so a full-size message beside a full-size table
+        // was pushed off the pane entirely -- every query error was invisible.
         let bottom = match &profile.session.content {
             Content::Preview(preview) if preview.showing_structure => {
                 Self::render_structure(&preview.structure, cx)
             }
+            _ if !result_lines.is_empty() => div()
+                .size_full()
+                .p(px(layout::SPACE_LG))
+                .font_family(gpui_component::Theme::global(cx).mono_font_family.clone())
+                .flex()
+                .flex_col()
+                .text_color(if matches!(profile.session.query, QueryState::Failed(_)) {
+                    t.danger
+                } else {
+                    t.text_muted
+                })
+                .children(
+                    result_lines
+                        .into_iter()
+                        .map(|line| div().w_full().py(px(layout::SPACE_XS)).child(line)),
+                )
+                .into_any_element(),
             _ => div()
                 .size_full()
                 .child(Table::new(&profile.session.results).bordered(false))
-                .children((!result_lines.is_empty()).then(|| {
-                    div()
-                        .size_full()
-                        .p(px(layout::SPACE_LG))
-                        .font_family(gpui_component::Theme::global(cx).mono_font_family.clone())
-                        .text_color(if matches!(profile.session.query, QueryState::Failed(_)) {
-                            t.danger
-                        } else {
-                            t.text
-                        })
-                        .children(
-                            result_lines
-                                .into_iter()
-                                .map(|line| div().w_full().py(px(layout::SPACE_XS)).child(line)),
-                        )
-                }))
                 .into_any_element(),
         };
 
@@ -1076,9 +1080,6 @@ impl Workspace {
             .w(px(layout::SIDEBAR_DEFAULT_WIDTH))
             .min_w(px(layout::SIDEBAR_MIN_WIDTH))
             .h_full()
-            .bg(t.chrome())
-            .border_r_1()
-            .border_color(t.border)
             .flex()
             .flex_col()
             .child(
@@ -1167,9 +1168,11 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::run_query))
             .on_action(cx.listener(Self::show_editor))
             .size_full()
-            // No fill on the root: an opaque one here would sit between the
-            // frosted chrome and the blurred desktop, and the frost would have
-            // nothing to show through it.
+            // The shell carries the frost, and the titlebar, sidebar and status
+            // bar paint nothing of their own — they are that glass. The content
+            // card below is the only opaque plane, so it is the only thing text
+            // sits on that Slate fully controls.
+            .bg(t.chrome())
             .text_color(t.text)
             .flex()
             .flex_col()
@@ -1177,9 +1180,6 @@ impl Render for Workspace {
                 div()
                     .h(px(layout::TITLEBAR_HEIGHT))
                     .w_full()
-                    .bg(t.chrome())
-                    .border_b_1()
-                    .border_color(t.border)
                     .flex()
                     .items_center()
                     .px(px(layout::SPACE_MD))
@@ -1196,17 +1196,23 @@ impl Render for Workspace {
                             .flex_1()
                             .min_w_0()
                             .h_full()
-                            .bg(t.bg)
-                            .child(Self::render_main_content(profile, result_lines, cx)),
+                            .p(px(layout::SPACE_SM))
+                            .child(
+                                div()
+                                    .size_full()
+                                    .overflow_hidden()
+                                    .bg(t.bg)
+                                    .border_1()
+                                    .border_color(t.border)
+                                    .rounded(px(layout::RADIUS_PANEL))
+                                    .child(Self::render_main_content(profile, result_lines, cx)),
+                            ),
                     ),
             )
             .child(
                 div()
                     .h(px(layout::STATUS_HEIGHT))
                     .w_full()
-                    .bg(t.chrome())
-                    .border_t_1()
-                    .border_color(t.border)
                     .flex()
                     .items_center()
                     .px(px(layout::SPACE_MD))

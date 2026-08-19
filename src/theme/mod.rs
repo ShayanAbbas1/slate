@@ -307,7 +307,10 @@ impl Theme {
             border: WHITE.alpha(HAIRLINE_DARK),
             border_strong: WHITE.alpha(0.16),
 
-            text: neutral(0.96),
+            // Not a pure white. On a near-black plane the last few percent of
+            // lightness reads as glare rather than crispness, and a dense result
+            // grid is where that gets tiring.
+            text: neutral(0.93),
             text_muted: neutral(0.74),
             text_faint: neutral(0.58),
 
