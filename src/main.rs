@@ -84,7 +84,29 @@ impl Profile {
         }
     }
 
-    fn stored(&self) -> store::StoredProfile {
+    fn stored(&self, cx: &App) -> store::StoredProfile {
+        // Tabs read back from disk that the catalog has not named yet are still
+        // the truth about this profile: writing the live list instead would
+        // drop every restored object the first time anything else is saved.
+        //
+        // A transient tab is deliberately not written: it was opened for a look,
+        // and coming back to a window full of things nobody chose to keep is
+        // the whole reason preview tabs exist.
+        let open_objects = if self.session.pending_objects.is_empty() {
+            let active = self.session.active;
+            self.session
+                .objects
+                .iter()
+                .filter(|tab| !tab.transient)
+                .map(|tab| store::StoredObject {
+                    active: active == Tab::Object(tab.id),
+                    ..tab.stored(cx)
+                })
+                .collect()
+        } else {
+            self.session.pending_objects.clone()
+        };
+
         store::StoredProfile {
             id: self.id.clone(),
             name: self.name.clone(),
@@ -93,6 +115,7 @@ impl Profile {
             database: self.config.database.clone(),
             user: self.config.user.clone(),
             open_query: self.session.open_query.clone(),
+            open_objects,
         }
     }
 }
@@ -111,15 +134,24 @@ enum ProfileState {
 /// built before the spawn and moved in once the connection opens.
 struct Session {
     editor: Entity<InputState>,
+    /// The editor's own grid. Every object tab owns another, so switching tabs
+    /// cannot leave one surface's rows sitting under another's heading.
     results: Entity<TableState<ResultGrid>>,
     query: QueryState,
-    content: Content,
+    objects: Vec<ObjectTab>,
+    active: Tab,
+    next_object_id: u64,
+    /// Object tabs read back from disk, held until the catalog can name them.
+    pending_objects: Vec<store::StoredObject>,
     explorer_filter: Entity<InputState>,
     explorer_tree: Entity<TreeState>,
     explorer_leaves: Arc<HashMap<String, ExplorerLeaf>>,
     /// `cmd+enter` reaches the workspace only through the focused element's
     /// dispatch path, so an unfocused editor makes the primary keystroke dead.
     editor_needs_focus: bool,
+    /// The same hazard for the name field: an unfocused input asks for a name
+    /// nobody can type into.
+    save_name_needs_focus: bool,
     open_query: Option<String>,
     saved_queries: Vec<String>,
     save_name: Entity<InputState>,
@@ -133,6 +165,7 @@ impl Session {
     fn new(
         id: String,
         open_query: Option<String>,
+        pending_objects: Vec<store::StoredObject>,
         window: &mut Window,
         cx: &mut Context<Workspace>,
     ) -> Self {
@@ -149,11 +182,17 @@ impl Session {
         .detach();
 
         let save_name = cx.new(|cx| InputState::new(window, cx).placeholder("Query name"));
-        cx.subscribe(&save_name, |workspace, _, event: &InputEvent, cx| {
-            if matches!(event, InputEvent::PressEnter { .. }) {
-                workspace.confirm_save(cx);
-            }
-        })
+        // Subscribed with the window, because confirming a save can swap the
+        // editor's buffer and that cannot be done without one.
+        cx.subscribe_in(
+            &save_name,
+            window,
+            |workspace, _, event: &InputEvent, window, cx| {
+                if matches!(event, InputEvent::PressEnter { .. }) {
+                    workspace.confirm_save(window, cx);
+                }
+            },
+        )
         .detach();
 
         let saved_queries = store::saved_queries(&id);
@@ -172,20 +211,17 @@ impl Session {
                     .placeholder("Write SQL…")
                     .default_value(sql)
             }),
-            results: cx.new(|cx| {
-                TableState::new(ResultGrid::empty(), window, cx)
-                    .sortable(false)
-                    .col_movable(false)
-                    .col_resizable(true)
-                    .row_selectable(true)
-                    .col_selectable(true)
-            }),
+            results: result_grid(window, cx),
             query: QueryState::Idle,
-            content: Content::Query,
+            objects: Vec::new(),
+            active: Tab::Query,
+            next_object_id: 0,
+            pending_objects,
             explorer_filter,
             explorer_tree: cx.new(|cx| TreeState::new(cx)),
             explorer_leaves: Arc::new(HashMap::new()),
             editor_needs_focus: true,
+            save_name_needs_focus: false,
             open_query,
             saved_queries,
             save_name,
@@ -195,6 +231,84 @@ impl Session {
             editor_font_size: EDITOR_FONT_SIZE_DEFAULT,
         }
     }
+
+    fn active_object(&self) -> Option<&ObjectTab> {
+        match self.active {
+            Tab::Object(id) => self.objects.iter().find(|tab| tab.id == id),
+            Tab::Query => None,
+        }
+    }
+
+    /// The query state behind the visible surface, or `None` for a surface that
+    /// runs nothing — a routine is read, never executed by being opened.
+    fn active_query(&self) -> Option<&QueryState> {
+        match self.active_object() {
+            None => Some(&self.query),
+            Some(tab) => match &tab.body {
+                ObjectBody::Relation { query, .. } => Some(query),
+                ObjectBody::Routine(_) => None,
+            },
+        }
+    }
+
+    /// The buffer a run reads from. A relation's tab has one of its own, so
+    /// `cmd+enter` runs what is in front of the user rather than whatever the
+    /// query tab happens to hold.
+    fn editor(&self, tab: Tab) -> Option<Entity<InputState>> {
+        match tab {
+            Tab::Query => Some(self.editor.clone()),
+            Tab::Object(id) => match &self.objects.iter().find(|tab| tab.id == id)?.body {
+                ObjectBody::Relation { editor, .. } => Some(editor.clone()),
+                ObjectBody::Routine(_) => None,
+            },
+        }
+    }
+
+    /// Where a run's state and rows belong. Returning both together is what
+    /// keeps a result from landing in one tab's grid with another tab's status.
+    fn slot(&mut self, tab: Tab) -> Option<(&mut QueryState, Entity<TableState<ResultGrid>>)> {
+        match tab {
+            Tab::Query => Some((&mut self.query, self.results.clone())),
+            Tab::Object(id) => {
+                match &mut self.objects.iter_mut().find(|tab| tab.id == id)?.body {
+                    ObjectBody::Relation {
+                        query, results, ..
+                    } => Some((query, results.clone())),
+                    ObjectBody::Routine(_) => None,
+                }
+            }
+        }
+    }
+
+    fn promote(&mut self, id: u64) -> bool {
+        match self.objects.iter_mut().find(|tab| tab.id == id) {
+            Some(tab) if tab.transient => {
+                tab.transient = false;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// The buffer of an object's tab was typed into: the tab has earned its
+    /// place, and it has stopped being a view of the object.
+    fn mark_edited(&mut self, id: u64) -> bool {
+        let Some(tab) = self.objects.iter_mut().find(|tab| tab.id == id) else {
+            return false;
+        };
+        let changed = tab.transient || !tab.edited;
+        tab.transient = false;
+        tab.edited = true;
+        // Structure is about to disappear, and leaving it on screen would
+        // strand the reader on a view with no way back to their own rows.
+        if let ObjectBody::Relation {
+            showing_structure, ..
+        } = &mut tab.body
+        {
+            *showing_structure = false;
+        }
+        changed
+    }
 }
 
 enum CatalogState {
@@ -203,34 +317,163 @@ enum CatalogState {
     Failed(String),
 }
 
-struct RoutineDetails {
-    schema: String,
-    routine: Routine,
-}
-
-/// What the main pane is showing. One field rather than a set of mode flags:
-/// the editor must never be hidden while `cmd+enter` still runs its contents,
-/// and a generated preview must never be written over the user's buffer.
-enum Content {
+/// Which surface the main pane is showing, and what a run targets. Object tabs
+/// are addressed by id rather than by index, so closing one cannot land an
+/// in-flight result in its neighbour's grid.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Tab {
     Query,
-    Preview(Preview),
-    Routine(RoutineDetails),
+    Object(u64),
 }
 
-/// An opened relation: the generated `SELECT` above the grid, plus the
-/// relation's definition behind the Structure tab (spec §3.2).
-struct Preview {
+/// An opened database object. It stays in the tab strip until it is closed, so
+/// coming back to a table does not mean finding it in the explorer again.
+struct ObjectTab {
+    id: u64,
     schema: String,
-    relation: String,
-    sql: String,
-    showing_structure: bool,
-    structure: StructureState,
+    /// A relation's name, or a routine's name with its argument types — which
+    /// is the only thing that tells two overloads of one function apart.
+    name: String,
+    kind: ObjectKind,
+    /// Opened for a look rather than to be kept. One click gets a transient
+    /// tab, the next one replaces it, and only a deliberate gesture — a double
+    /// click, or typing in its buffer — makes it stay.
+    transient: bool,
+    /// The buffer is no longer the one Slate generated. The tab keeps the
+    /// object's name and icon, but it is a query about the object now rather
+    /// than a view of it, so the object's own Structure goes away with it.
+    edited: bool,
+    body: ObjectBody,
+}
+
+impl ObjectTab {
+    fn stored(&self, cx: &App) -> store::StoredObject {
+        let sql = match &self.body {
+            // Only what the user changed. A buffer still holding the SQL Slate
+            // generated is regenerated instead, so a restored tab follows the
+            // relation rather than a snapshot of it.
+            ObjectBody::Relation { editor, .. } if self.edited => {
+                Some(editor.read(cx).value().to_string())
+            }
+            _ => None,
+        };
+
+        store::StoredObject {
+            schema: self.schema.clone(),
+            name: self.name.clone(),
+            routine: matches!(self.kind, ObjectKind::Routine(_)),
+            active: false,
+            sql,
+        }
+    }
+}
+
+/// What the explorer -- or a session read back from disk -- hands over to open
+/// a tab. A routine arrives whole, because its body is already in the catalog.
+enum OpenedObject {
+    Relation {
+        schema: String,
+        name: String,
+        kind: RelationKind,
+        /// The buffer this tab had when it was last closed, if the user had
+        /// changed it.
+        sql: Option<String>,
+    },
+    Routine {
+        schema: String,
+        routine: Routine,
+    },
+}
+
+impl OpenedObject {
+    fn schema(&self) -> &str {
+        match self {
+            Self::Relation { schema, .. } | Self::Routine { schema, .. } => schema,
+        }
+    }
+
+    fn name(&self) -> String {
+        match self {
+            Self::Relation { name, .. } => name.clone(),
+            Self::Routine { routine, .. } => routine_name(routine),
+        }
+    }
+
+    fn kind(&self) -> ObjectKind {
+        match self {
+            Self::Relation { kind, .. } => ObjectKind::Relation(*kind),
+            Self::Routine { routine, .. } => ObjectKind::Routine(routine.kind),
+        }
+    }
+
+    fn resolve(catalog: &Catalog, stored: &store::StoredObject) -> Option<Self> {
+        let schema = catalog
+            .schemas
+            .iter()
+            .find(|schema| schema.name == stored.schema)?;
+        if stored.routine {
+            let routine = schema
+                .routines
+                .iter()
+                .find(|routine| routine_name(routine) == stored.name)?;
+            Some(Self::Routine {
+                schema: schema.name.clone(),
+                routine: routine.clone(),
+            })
+        } else {
+            let relation = schema
+                .relations
+                .iter()
+                .find(|relation| relation.name == stored.name)?;
+            Some(Self::Relation {
+                schema: schema.name.clone(),
+                name: relation.name.clone(),
+                kind: relation.kind,
+                sql: stored.sql.clone(),
+            })
+        }
+    }
+}
+
+/// A routine's name carries its argument types, because a schema can hold
+/// several routines with the same name and nothing else to tell them apart.
+fn routine_name(routine: &Routine) -> String {
+    format!("{}({})", routine.name, routine.identity_arguments)
+}
+
+enum ObjectBody {
+    /// An opened relation. Its generated `SELECT` is an ordinary editable
+    /// buffer -- the tab is a query tab that happened to be written by Slate --
+    /// over its own grid, with the relation's definition behind the Structure
+    /// toggle (spec §3.2).
+    Relation {
+        editor: Entity<InputState>,
+        showing_structure: bool,
+        structure: StructureState,
+        results: Entity<TableState<ResultGrid>>,
+        query: QueryState,
+    },
+    Routine(Routine),
 }
 
 enum StructureState {
     Loading,
     Loaded(Structure),
     Failed(String),
+}
+
+fn result_grid(
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) -> Entity<TableState<ResultGrid>> {
+    cx.new(|cx| {
+        TableState::new(ResultGrid::empty(), window, cx)
+            .sortable(false)
+            .col_movable(false)
+            .col_resizable(true)
+            .row_selectable(true)
+            .col_selectable(true)
+    })
 }
 
 struct ConnectionForm {
@@ -403,6 +646,20 @@ impl Workspace {
         if workspace.profiles.is_empty() && workspace.form.is_none() {
             workspace.form = Some(ConnectionForm::new(None, window, cx));
         }
+
+        // Buffers are otherwise written only when one is swapped for another,
+        // so without this everything typed since the last swap dies with the
+        // process -- which is the one moment a person expects it to be kept.
+        cx.on_app_quit(|workspace: &mut Self, cx: &mut Context<Self>| {
+            workspace.persist_buffers(cx);
+            async {}
+        })
+        .detach();
+        // Closing the window does not quit the application, so without this the
+        // red button is a way to lose everything typed since the last swap.
+        cx.on_release(|workspace, cx| workspace.persist_buffers(cx))
+            .detach();
+
         workspace.connect_active(cx);
         workspace
     }
@@ -457,7 +714,7 @@ impl Workspace {
         let profiles = self
             .profiles
             .iter()
-            .map(Profile::stored)
+            .map(|profile| profile.stored(cx))
             .collect::<Vec<_>>();
         if let Err(message) = store::save_profiles(&profiles) {
             self.note(message, cx);
@@ -477,7 +734,13 @@ impl Workspace {
             user: stored.user,
             password: String::new(),
         };
-        let session = Session::new(stored.id.clone(), stored.open_query, window, cx);
+        let session = Session::new(
+            stored.id.clone(),
+            stored.open_query,
+            stored.open_objects,
+            window,
+            cx,
+        );
         self.profiles.push(Profile {
             id: stored.id,
             name: stored.name,
@@ -502,7 +765,7 @@ impl Workspace {
             .map(|profile| profile.id.clone())
             .collect::<Vec<_>>();
         let id = store::profile_id(&name, &existing);
-        let session = Session::new(id.clone(), None, window, cx);
+        let session = Session::new(id.clone(), None, Vec::new(), window, cx);
         let password = config.password.clone();
         self.profiles.push(Profile {
             id: id.clone(),
@@ -763,93 +1026,204 @@ impl Workspace {
         cx.notify();
     }
 
-    fn open_explorer_target(&mut self, target: ExplorerTarget, cx: &mut Context<Self>) {
+    fn open_explorer_target(
+        &mut self,
+        target: ExplorerTarget,
+        transient: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(catalog) = self.catalog() else {
             return;
         };
 
-        match target {
+        let opened = match target {
             ExplorerTarget::Relation {
                 schema_index,
                 relation_index,
-            } => {
-                let Some((schema, relation)) =
-                    catalog.schemas.get(schema_index).and_then(|schema| {
-                        let relation = schema.relations.get(relation_index)?;
-                        Some((schema.name.clone(), relation.name.clone()))
-                    })
-                else {
-                    return;
-                };
-
-                // The preview is shown in its own read-only surface rather than
-                // written into the editor: `set_value` is not undoable, so that
-                // would destroy an unsaved buffer on a misclick.
-                let sql = preview_sql(&schema, &relation);
-                if let Some(profile) = self.profile_mut() {
-                    profile.session.content = Content::Preview(Preview {
-                        schema: schema.clone(),
-                        relation: relation.clone(),
-                        sql: sql.clone(),
-                        showing_structure: false,
-                        structure: StructureState::Loading,
-                    });
-                }
-                self.load_structure(schema, relation, cx);
-                self.execute_sql(sql, cx);
-            }
+            } => catalog.schemas.get(schema_index).and_then(|schema| {
+                let relation = schema.relations.get(relation_index)?;
+                Some(OpenedObject::Relation {
+                    schema: schema.name.clone(),
+                    name: relation.name.clone(),
+                    kind: relation.kind,
+                    sql: None,
+                })
+            }),
             ExplorerTarget::Routine {
                 schema_index,
                 routine_index,
-            } => {
-                let Some(details) = catalog.schemas.get(schema_index).and_then(|schema| {
-                    let routine = schema.routines.get(routine_index)?.clone();
-                    Some(RoutineDetails {
-                        schema: schema.name.clone(),
-                        routine,
-                    })
-                }) else {
-                    return;
-                };
+            } => catalog.schemas.get(schema_index).and_then(|schema| {
+                let routine = schema.routines.get(routine_index)?;
+                Some(OpenedObject::Routine {
+                    schema: schema.name.clone(),
+                    routine: routine.clone(),
+                })
+            }),
+        };
 
-                if let Some(profile) = self.profile_mut() {
-                    profile.session.content = Content::Routine(details);
-                }
-                cx.notify();
-            }
+        if let Some(opened) = opened
+            && let Some(id) = self.open_object(opened, transient, window, cx)
+        {
+            self.activate_tab(Tab::Object(id), cx);
+            self.remember_profiles(cx);
         }
     }
 
-    fn load_structure(&mut self, schema: String, relation: String, cx: &mut Context<Self>) {
+    /// Give an object a tab, reusing the one it already has. Opening does not
+    /// show it — the caller decides that, so restoring a session can rebuild
+    /// six tabs without running six queries.
+    ///
+    /// A transient tab takes the place of the last transient one, the way a
+    /// preview tab works in an editor: browsing the tree leaves one tab behind,
+    /// not thirty.
+    fn open_object(
+        &mut self,
+        opened: OpenedObject,
+        transient: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<u64> {
+        let (schema, name, kind) = (opened.schema().to_string(), opened.name(), opened.kind());
+        let profile = self.profile_mut()?;
+        let existing = profile
+            .session
+            .objects
+            .iter()
+            .find(|tab| tab.schema == schema && tab.name == name)
+            .map(|tab| tab.id);
+
+        if let Some(id) = existing {
+            if !transient {
+                profile.session.promote(id);
+            }
+            return Some(id);
+        }
+
+        if transient {
+            let replaced = profile
+                .session
+                .objects
+                .iter()
+                .filter(|tab| tab.transient)
+                .map(|tab| tab.id)
+                .collect::<Vec<_>>();
+            profile
+                .session
+                .objects
+                .retain(|tab| !replaced.contains(&tab.id));
+        }
+
+        let id = profile.session.next_object_id;
+        profile.session.next_object_id += 1;
+        let edited = matches!(opened, OpenedObject::Relation { sql: Some(_), .. });
+        let body = match opened {
+            OpenedObject::Routine { routine, .. } => ObjectBody::Routine(routine),
+            OpenedObject::Relation { sql, .. } => {
+                let sql = sql.unwrap_or_else(|| preview_sql(&schema, &name));
+                let editor = cx.new(|cx| {
+                    InputState::new(window, cx)
+                        .code_editor("sql")
+                        .soft_wrap(false)
+                        .default_value(sql)
+                });
+                // Typing in a buffer is the other way a preview tab earns its
+                // place, the same as it does in an editor.
+                cx.subscribe(&editor, move |workspace, _, event: &InputEvent, cx| {
+                    if matches!(event, InputEvent::Change)
+                        && let Some(profile) = workspace.profile_mut()
+                        && profile.session.mark_edited(id)
+                    {
+                        workspace.remember_profiles(cx);
+                        cx.notify();
+                    }
+                })
+                .detach();
+
+                ObjectBody::Relation {
+                    editor,
+                    showing_structure: false,
+                    structure: StructureState::Loading,
+                    results: result_grid(window, cx),
+                    query: QueryState::Idle,
+                }
+            }
+        };
+        self.profile_mut()?.session.objects.push(ObjectTab {
+            id,
+            schema,
+            name,
+            kind,
+            transient,
+            edited,
+            body,
+        });
+        Some(id)
+    }
+
+    /// Run a relation's `SELECT` and load its structure, once. Reaching a tab
+    /// again must not re-query — the rows it already holds are why the tab is
+    /// worth keeping open — but a failed run is not a result, so that one
+    /// is allowed to be tried again.
+    fn load_relation(&mut self, id: u64, cx: &mut Context<Self>) {
+        let Some(tab) = self
+            .profile()
+            .and_then(|profile| profile.session.objects.iter().find(|tab| tab.id == id))
+        else {
+            return;
+        };
+        let ObjectBody::Relation { editor, query, .. } = &tab.body else {
+            return;
+        };
+        if !matches!(query, QueryState::Idle | QueryState::Failed(_)) {
+            return;
+        }
+
+        let sql = editor.read(cx).value().to_string();
+        let (schema, relation, edited) = (tab.schema.clone(), tab.name.clone(), tab.edited);
+        // An edited tab has no Structure toggle to reach it with, so loading a
+        // definition for it is a round trip nobody can see.
+        if !edited {
+            self.load_structure(id, schema, relation, cx);
+        }
+        self.execute_sql(sql, Tab::Object(id), cx);
+    }
+
+    fn load_structure(
+        &mut self,
+        id: u64,
+        schema: String,
+        relation: String,
+        cx: &mut Context<Self>,
+    ) {
         let Some(profile) = self.profile() else {
             return;
         };
         let Some(connection) = profile.connection() else {
             return;
         };
-        let id = profile.id.clone();
+        let profile_id = profile.id.clone();
         let generation = profile.generation;
-        let structure_task = cx.background_executor().spawn({
-            let (schema, relation) = (schema.clone(), relation.clone());
-            async move { connection.structure(&schema, &relation) }
-        });
+        let structure_task = cx
+            .background_executor()
+            .spawn(async move { connection.structure(&schema, &relation) });
 
         cx.spawn(async move |workspace, cx| {
             let result = structure_task.await;
             workspace
                 .update(cx, |workspace, cx| {
-                    let Some(profile) = workspace.issued_to(&id, generation) else {
+                    let Some(profile) = workspace.issued_to(&profile_id, generation) else {
                         return;
                     };
-                    // A second click while this was in flight has already
-                    // replaced the surface, and one relation's columns under
-                    // another's name is worse than no columns at all.
-                    if let Content::Preview(preview) = &mut profile.session.content
-                        && preview.schema == schema
-                        && preview.relation == relation
-                    {
-                        preview.structure = match result {
-                            Ok(structure) => StructureState::Loaded(structure),
+                    // Addressed by tab, so a second object opened while this was
+                    // in flight cannot end up wearing this one's columns.
+                    let Some(tab) = profile.session.objects.iter_mut().find(|tab| tab.id == id)
+                    else {
+                        return;
+                    };
+                    if let ObjectBody::Relation { structure, .. } = &mut tab.body {
+                        *structure = match result {
+                            Ok(loaded) => StructureState::Loaded(loaded),
                             Err(error) => StructureState::Failed(error.message),
                         };
                         cx.notify();
@@ -861,11 +1235,98 @@ impl Workspace {
     }
 
     fn show_structure(&mut self, showing_structure: bool, cx: &mut Context<Self>) {
-        if let Some(profile) = self.profile_mut()
-            && let Content::Preview(preview) = &mut profile.session.content
+        let Some(profile) = self.profile_mut() else {
+            return;
+        };
+        let Tab::Object(id) = profile.session.active else {
+            return;
+        };
+        if let Some(tab) = profile.session.objects.iter_mut().find(|tab| tab.id == id)
+            && let ObjectBody::Relation { showing_structure: showing, .. } = &mut tab.body
         {
-            preview.showing_structure = showing_structure;
+            *showing = showing_structure;
             cx.notify();
+        }
+    }
+
+    fn activate_tab(&mut self, tab: Tab, cx: &mut Context<Self>) {
+        if let Some(profile) = self.profile_mut() {
+            profile.session.active = tab;
+            profile.session.pending_delete = None;
+            // A half-finished name belongs to the buffer it was opened over.
+            // Left standing it would name a different one, and it holds the
+            // focus the new surface needs.
+            profile.session.naming = false;
+            profile.session.editor_needs_focus = true;
+        }
+        if let Tab::Object(id) = tab {
+            self.load_relation(id, cx);
+        }
+        self.remember_profiles(cx);
+        cx.notify();
+    }
+
+    /// Keep a tab that was opened for a look.
+    fn keep_object(&mut self, id: u64, cx: &mut Context<Self>) {
+        if self
+            .profile_mut()
+            .is_some_and(|profile| profile.session.promote(id))
+        {
+            self.remember_profiles(cx);
+            cx.notify();
+        }
+    }
+
+    fn close_object(&mut self, id: u64, cx: &mut Context<Self>) {
+        if let Some(profile) = self.profile_mut() {
+            profile.session.objects.retain(|tab| tab.id != id);
+            if profile.session.active == Tab::Object(id) {
+                profile.session.active = Tab::Query;
+                profile.session.editor_needs_focus = true;
+            }
+        }
+        self.remember_profiles(cx);
+        cx.notify();
+    }
+
+    /// Turn the object tabs read back from disk into live ones, now that the
+    /// catalog can say what they hold. Anything the database no longer has
+    /// simply does not come back.
+    fn restore_objects(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(profile) = self.profile() else {
+            return;
+        };
+        if profile.session.pending_objects.is_empty() {
+            return;
+        }
+        let CatalogState::Loaded(catalog) = &profile.catalog else {
+            return;
+        };
+
+        let opened = profile
+            .session
+            .pending_objects
+            .iter()
+            .filter_map(|stored| {
+                Some((OpenedObject::resolve(catalog, stored)?, stored.active))
+            })
+            .collect::<Vec<_>>();
+
+        if let Some(profile) = self.profile_mut() {
+            profile.session.pending_objects.clear();
+        }
+        let mut restored_active = None;
+        for (opened, active) in opened {
+            let id = self.open_object(opened, false, window, cx);
+            if active {
+                restored_active = id;
+            }
+        }
+        match restored_active {
+            Some(id) => self.activate_tab(Tab::Object(id), cx),
+            // Nothing to activate, but the pending list was drained, so what is
+            // on disk has to be rewritten from the tabs that actually resolved.
+            None => self.remember_profiles(cx),
         }
     }
 
@@ -892,8 +1353,7 @@ impl Workspace {
         cx.refresh_windows();
     }
 
-    /// Return to the editor. Without this the routine and preview surfaces are
-    /// one-way doors, since they replace the editor entirely.
+    /// Return to the editor, backing out of whatever is in front of it.
     fn show_editor(&mut self, _: &ShowEditor, _: &mut Window, cx: &mut Context<Self>) {
         if self.form.is_some() && !self.profiles.is_empty() {
             self.form = None;
@@ -903,28 +1363,38 @@ impl Workspace {
         let Some(profile) = self.profile_mut() else {
             return;
         };
-        if matches!(profile.session.content, Content::Query) {
+        if profile.session.naming {
+            profile.session.naming = false;
+            profile.session.editor_needs_focus = true;
+            cx.notify();
             return;
         }
-        profile.session.content = Content::Query;
+        if matches!(profile.session.active, Tab::Query) {
+            return;
+        }
+        profile.session.active = Tab::Query;
         profile.session.editor_needs_focus = true;
+        self.remember_profiles(cx);
         cx.notify();
     }
 
     fn run_query(&mut self, _: &RunQuery, window: &mut Window, cx: &mut Context<Self>) {
-        // The editor is hidden behind the routine and preview surfaces, and
-        // running SQL the user cannot see is how an unrelated statement left in
-        // the buffer gets executed by muscle memory.
-        if !matches!(
-            self.profile().map(|profile| &profile.session.content),
-            Some(Content::Query)
-        ) {
+        let Some(profile) = self.profile() else {
             return;
-        }
+        };
+        let tab = profile.session.active;
+        // A routine's tab has no buffer, and running SQL the user cannot see is
+        // how an unrelated statement left in a hidden one gets executed by
+        // muscle memory.
+        let Some(editor) = profile.session.editor(tab) else {
+            return;
+        };
 
-        let Some(sql) = self.sql_to_run(window, cx) else {
-            if let Some(profile) = self.profile_mut() {
-                profile.session.query = QueryState::Failed(DbError {
+        let Some(sql) = self.sql_to_run(&editor, window, cx) else {
+            if let Some(profile) = self.profile_mut()
+                && let Some((state, _)) = profile.session.slot(tab)
+            {
+                *state = QueryState::Failed(DbError {
                     message: "There is no statement to run.".into(),
                     position: None,
                 });
@@ -933,37 +1403,72 @@ impl Workspace {
             return;
         };
 
-        self.execute_sql(sql, cx);
+        self.execute_sql(sql, tab, cx);
     }
 
     fn persist_buffer(&self, cx: &App) -> Result<(), String> {
-        let Some(profile) = self.profile() else {
-            return Ok(());
-        };
-        let sql = profile.session.editor.read(cx).value().to_string();
-        match &profile.session.open_query {
-            Some(name) => store::write_query(&profile.id, name, &sql),
-            None => store::write_scratch(&profile.id, &sql),
+        match self.profile() {
+            Some(profile) => write_buffer(profile, cx),
+            None => Ok(()),
         }
     }
 
-    fn save_query(&mut self, _: &SaveQuery, _: &mut Window, cx: &mut Context<Self>) {
+    /// Every profile's buffer, for the one moment there is nowhere to report a
+    /// failure to: the application is closing.
+    fn persist_buffers(&self, cx: &App) {
+        for profile in &self.profiles {
+            let _ = write_buffer(profile, cx);
+        }
+    }
+
+    fn save_query(&mut self, _: &SaveQuery, window: &mut Window, cx: &mut Context<Self>) {
+        // A named query is written on every swap and on quit, so `cmd+s` on one
+        // is a confirmation rather than a decision. Only a buffer with nowhere
+        // to go has to ask for a name.
+        if self.named() {
+            match self.persist_buffer(cx) {
+                Ok(()) => self.note("Saved query.".into(), cx),
+                Err(message) => self.note(message, cx),
+            }
+            return;
+        }
+        self.ask_for_name(String::new(), window, cx);
+    }
+
+    /// Whether the visible buffer already has a name — which is what makes the
+    /// difference between saving it and renaming it. A relation's tab never
+    /// does: it holds SQL Slate wrote, not a file the user opened.
+    fn named(&self) -> bool {
+        self.profile().is_some_and(|profile| {
+            matches!(profile.session.active, Tab::Query) && profile.session.open_query.is_some()
+        })
+    }
+
+    fn rename_query(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(name) = self
+            .profile()
+            .and_then(|profile| profile.session.open_query.clone())
+        else {
+            return;
+        };
+        // Prefilled with its own name, unlike a save: the point of a rename is
+        // to edit the name that is already there.
+        self.ask_for_name(name, window, cx);
+    }
+
+    fn ask_for_name(&mut self, prefill: String, window: &mut Window, cx: &mut Context<Self>) {
         let Some(profile) = self.profile_mut() else {
             return;
         };
-        if profile.session.open_query.is_none() {
-            profile.session.naming = true;
-            profile.session.notice = None;
-            cx.notify();
-            return;
-        }
-        match self.persist_buffer(cx) {
-            Ok(()) => self.note("Saved query.".into(), cx),
-            Err(message) => self.note(message, cx),
-        }
+        profile.session.naming = true;
+        profile.session.save_name_needs_focus = true;
+        profile.session.notice = None;
+        let save_name = profile.session.save_name.clone();
+        save_name.update(cx, |input, cx| input.set_value(prefill, window, cx));
+        cx.notify();
     }
 
-    fn confirm_save(&mut self, cx: &mut Context<Self>) {
+    fn confirm_save(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(profile) = self.profile() else {
             return;
         };
@@ -973,15 +1478,56 @@ impl Workspace {
             return;
         }
         let id = profile.id.clone();
-        let sql = profile.session.editor.read(cx).value().to_string();
+        let tab = profile.session.active;
+        let Some(editor) = profile.session.editor(tab) else {
+            return;
+        };
+        // The name the buffer is leaving behind, if it had one. Present only
+        // for a rename, since `cmd+s` on a named query never asks.
+        let previous = match tab {
+            Tab::Query => profile.session.open_query.clone(),
+            Tab::Object(_) => None,
+        };
+        if previous.as_deref() != Some(name.as_str())
+            && profile.session.saved_queries.contains(&name)
+        {
+            self.note(format!("A query named {name} already exists."), cx);
+            return;
+        }
+
+        let sql = editor.read(cx).value().to_string();
         if let Err(message) = store::write_query(&id, &name, &sql) {
             self.note(message, cx);
             return;
         }
+        // Written first, then the old name dropped: a failed delete leaves two
+        // copies, which is recoverable, and the other order loses the query.
+        if let Some(previous) = previous.filter(|previous| previous != &name)
+            && let Err(message) = store::delete_query(&id, &previous)
+        {
+            self.note(message, cx);
+        }
+
         if let Some(profile) = self.profile_mut() {
-            profile.session.open_query = Some(name.clone());
             profile.session.saved_queries = store::saved_queries(&id);
             profile.session.naming = false;
+        }
+        // Naming a relation's buffer is how it stops being a relation's buffer:
+        // it leaves the object world entirely and becomes a saved query, which
+        // is the only place a name means anything.
+        match tab {
+            Tab::Object(object) => {
+                self.close_object(object, cx);
+                self.open_saved_query(name.clone(), window, cx);
+            }
+            Tab::Query => {
+                if let Some(profile) = self.profile_mut() {
+                    profile.session.open_query = Some(name.clone());
+                    profile.session.editor_needs_focus = true;
+                }
+            }
+        }
+        if let Some(profile) = self.profile_mut() {
             profile.session.notice = Some(format!("Saved {name}."));
         }
         self.remember_profiles(cx);
@@ -997,7 +1543,6 @@ impl Workspace {
             return;
         };
         profile.session.open_query = None;
-        profile.session.content = Content::Query;
         profile.session.query = QueryState::Idle;
         profile.session.naming = false;
         profile.session.notice = None;
@@ -1005,17 +1550,17 @@ impl Workspace {
             .session
             .editor
             .update(cx, |editor, cx| editor.set_value("", window, cx));
-        profile.session.editor_needs_focus = true;
-        self.remember_profiles(cx);
-        cx.notify();
+        self.activate_tab(Tab::Query, cx);
     }
 
-    fn open_saved_query(
-        &mut self,
-        name: String,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn open_saved_query(&mut self, name: String, window: &mut Window, cx: &mut Context<Self>) {
+        if self
+            .profile()
+            .is_some_and(|profile| profile.session.open_query.as_deref() == Some(&name))
+        {
+            self.activate_tab(Tab::Query, cx);
+            return;
+        }
         if let Err(message) = self.persist_buffer(cx) {
             self.note(message, cx);
             return;
@@ -1034,12 +1579,9 @@ impl Workspace {
             .editor
             .update(cx, |editor, cx| editor.set_value(sql, window, cx));
         profile.session.open_query = Some(name);
-        profile.session.content = Content::Query;
         profile.session.query = QueryState::Idle;
-        profile.session.editor_needs_focus = true;
         profile.session.notice = None;
-        self.remember_profiles(cx);
-        cx.notify();
+        self.activate_tab(Tab::Query, cx);
     }
 
     fn open_scratch_query(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1047,6 +1589,7 @@ impl Workspace {
             .profile()
             .is_some_and(|profile| profile.session.open_query.is_none())
         {
+            self.activate_tab(Tab::Query, cx);
             return;
         }
         if let Err(message) = self.persist_buffer(cx) {
@@ -1062,12 +1605,9 @@ impl Workspace {
             .editor
             .update(cx, |editor, cx| editor.set_value(sql, window, cx));
         profile.session.open_query = None;
-        profile.session.content = Content::Query;
         profile.session.query = QueryState::Idle;
-        profile.session.editor_needs_focus = true;
         profile.session.notice = None;
-        self.remember_profiles(cx);
-        cx.notify();
+        self.activate_tab(Tab::Query, cx);
     }
 
     fn delete_saved_query(&mut self, name: String, cx: &mut Context<Self>) {
@@ -1101,29 +1641,32 @@ impl Workspace {
     /// There is deliberately no "not connected" branch: SQL is only reachable
     /// through a profile's own editor or explorer, so the absence of one is not
     /// a state the user can be shown an error about.
-    fn execute_sql(&mut self, sql: String, cx: &mut Context<Self>) {
+    fn execute_sql(&mut self, sql: String, tab: Tab, cx: &mut Context<Self>) {
         let Some(profile) = self.profile_mut() else {
+            return;
+        };
+        let connection = profile.connection();
+        let id = profile.id.clone();
+        let generation = profile.generation;
+        let Some((state, results)) = profile.session.slot(tab) else {
             return;
         };
         // Guarded here rather than in each caller: every path that runs SQL
         // routes through this one, and a caller that forgets would let two
         // results race into the grid with the older one landing last.
-        if matches!(profile.session.query, QueryState::Running) {
+        if matches!(state, QueryState::Running) {
             return;
         }
 
-        let Some(connection) = profile.connection() else {
-            profile.session.query = QueryState::Failed(DbError {
+        let Some(connection) = connection else {
+            *state = QueryState::Failed(DbError {
                 message: "The connection is not open.".into(),
                 position: None,
             });
             cx.notify();
             return;
         };
-        let id = profile.id.clone();
-        let generation = profile.generation;
-        let results = profile.session.results.clone();
-        profile.session.query = QueryState::Running;
+        *state = QueryState::Running;
 
         // Rows from the previous statement must not sit under the one now on
         // screen -- a reader cannot tell stale rows from fresh ones.
@@ -1144,22 +1687,24 @@ impl Workspace {
                     let Some(profile) = workspace.issued_to(&id, generation) else {
                         return;
                     };
+                    let Some((state, results)) = profile.session.slot(tab) else {
+                        return;
+                    };
 
                     match result {
                         Ok(result) => {
-                            profile.session.query = QueryState::Complete {
+                            *state = QueryState::Complete {
                                 rows: result.rows.len(),
                                 bytes: result.bytes,
                                 elapsed: result.elapsed,
                                 rows_affected: result.rows_affected,
                             };
-                            let results = profile.session.results.clone();
                             results.update(cx, |table, cx| {
                                 *table.delegate_mut() = ResultGrid::new(result);
                                 table.refresh(cx);
                             });
                         }
-                        Err(error) => profile.session.query = QueryState::Failed(error),
+                        Err(error) => *state = QueryState::Failed(error),
                     }
                     cx.notify();
                 })
@@ -1168,8 +1713,12 @@ impl Workspace {
         .detach();
     }
 
-    fn sql_to_run(&self, window: &mut Window, cx: &mut Context<Self>) -> Option<String> {
-        let editor = self.profile()?.session.editor.clone();
+    fn sql_to_run(
+        &self,
+        editor: &Entity<InputState>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<String> {
         let selection = editor.update(cx, |editor, cx| {
             let selection = editor.selected_text_range(false, window, cx)?;
             if selection.range.is_empty() {
@@ -1348,186 +1897,202 @@ impl Workspace {
 
     fn render_main_content(profile: &Profile, cx: &mut Context<Self>) -> AnyElement {
         let t = *theme(cx);
-        let mono = gpui_component::Theme::global(cx).mono_font_family.clone();
-
-        if let Content::Routine(details) = &profile.session.content {
-            let kind = match details.routine.kind {
-                RoutineKind::Function => "Function",
-                RoutineKind::Procedure => "Procedure",
-            };
-            return div()
-                .size_full()
-                .flex()
-                .flex_col()
-                .bg(t.panel)
-                .child(
-                    div()
-                        .p(px(layout::SPACE_LG))
-                        .flex()
-                        .flex_col()
-                        .gap(px(layout::SPACE_SM))
-                        .child(
-                            div()
-                                .text_size(px(layout::TEXT_LG))
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .child(format!(
-                                    "{}.{}({})",
-                                    details.schema,
-                                    details.routine.name,
-                                    details.routine.identity_arguments
-                                )),
-                        )
-                        .child(
-                            div()
-                                .flex()
-                                .gap(px(layout::SPACE_LG))
-                                .text_size(px(layout::TEXT_SM))
-                                .text_color(t.text_muted)
-                                .child(kind)
-                                .child(format!("Language: {}", details.routine.language))
-                                .children((!details.routine.result_type.is_empty()).then(|| {
-                                    div().child(format!("Returns: {}", details.routine.result_type))
-                                }))
-                                .child(
-                                    div()
-                                        .ml_auto()
-                                        .child(key_hint(t, "escape", "returns to the editor")),
-                                ),
-                        ),
-                )
-                .child(
-                    div()
-                        .id("routine-definition")
-                        .flex_1()
-                        .min_h_0()
-                        .overflow_y_scroll()
-                        .p(px(layout::SPACE_LG))
-                        .font_family(mono)
-                        .child(details.routine.definition.clone()),
-                )
-                .into_any_element();
-        }
-
-        // The generated preview is shown as its own read-only surface, so it is
-        // always distinguishable from SQL the user wrote.
-        let top = match &profile.session.content {
-            // Sized by its contents, unlike the editor: a generated `SELECT` is
-            // three lines of chrome, and giving it half the pane leaves the rows
-            // it was run to show squeezed into the bottom half.
-            Content::Preview(preview) => div()
-                .flex_shrink_0()
-                .bg(t.panel)
-                .p(px(layout::SPACE_LG))
-                .flex()
-                .flex_col()
-                .gap(px(layout::SPACE_SM))
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .child(section_label(t, "Generated preview"))
-                        .child(
-                            div()
-                                .ml_auto()
-                                .child(key_hint(t, "escape", "returns to the editor")),
-                        ),
-                )
-                // Only the SQL itself is code; the labels around it are UI.
-                .child(div().font_family(mono).child(preview.sql.clone()))
-                .child(
-                    div()
-                        .flex()
-                        .gap(px(layout::SPACE_XS))
-                        .child(Self::preview_tab(
-                            "Data",
-                            icon::TABLE,
-                            !preview.showing_structure,
-                            cx,
-                        ))
-                        .child(Self::preview_tab(
-                            "Structure",
-                            icon::STRUCTURE,
-                            preview.showing_structure,
-                            cx,
-                        )),
-                )
-                .into_any_element(),
-            _ => {
-                let zoom = editor_zoom_percent(profile.session.editor_font_size);
-                let query_name = profile
-                    .session
-                    .open_query
-                    .clone()
-                    .unwrap_or_else(|| "New Query".into());
-                div()
-                    .flex_1()
-                    .min_h_0()
-                    .flex()
-                    .flex_col()
-                    // The editor is the prompt, one tone behind the results it
-                    // produces.
-                    .bg(t.panel)
-                    .child(
-                        // A breadcrumb rather than a toolbar: it says where the
-                        // buffer lives, in the quietest voice on the surface.
-                        div()
-                            .h(px(layout::EDITOR_HEADER_HEIGHT))
-                            .flex_shrink_0()
-                            .flex()
-                            .items_center()
-                            .gap(px(layout::SPACE_SM))
-                            .px(px(layout::SPACE_MD))
-                            .text_size(px(layout::TEXT_XS))
-                            .text_color(t.text_faint)
-                            .child(format!("{} › {}", profile.config.database, query_name))
-                            // 100% is not information; the readout appears only
-                            // once the zoom has somewhere to return to.
-                            .children((zoom != 100).then(|| {
-                                div().ml_auto().child(format!("{zoom}% · ⌘0 resets"))
-                            }))
-                            .child(
-                                // Icon only; the name and the binding live in
-                                // the tooltip.
-                                div().when(zoom == 100, |run| run.ml_auto()).child(
-                                    Button::new("run-query-editor")
-                                        .icon(icon(icon::RUN))
-                                        .ghost()
-                                        .xsmall()
-                                        .tooltip_with_action("Run", &RunQuery, None)
-                                        .on_click(cx.listener(
-                                            |workspace, _: &ClickEvent, window, cx| {
-                                                workspace.run_query(&RunQuery, window, cx);
-                                            },
-                                        )),
-                                ),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_h_0()
-                            .p(px(layout::SPACE_LG))
-                            .font_family(mono)
-                            .child(
-                                Input::new(&profile.session.editor)
-                                    .h_full()
-                                    .appearance(false)
-                                    .bordered(false)
-                                    .focus_bordered(false)
-                                    .text_size(px(profile.session.editor_font_size))
-                                    .line_height(px(profile.session.editor_font_size * 1.55)),
-                            ),
-                    )
-                    .into_any_element()
-            }
+        let body = match profile.session.active_object() {
+            Some(tab) => Self::render_object(profile, tab, cx),
+            None => Self::render_query_surface(profile, cx),
         };
 
-        // A short status is centred and set in the app face -- it is a sentence
-        // about the pane, not query output. An error keeps the editor's
-        // monospace and the left edge, because it quotes the server and gets
-        // read against the SQL above it. The grid and every message are
-        // alternatives, not layers: a full-size message beside a full-size
-        // table gets pushed off the pane entirely.
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            // Chrome, so the strip reads as the frame the surfaces sit in.
+            .bg(t.surface)
+            .child(Self::render_tab_strip(profile, cx))
+            .child(div().flex_1().min_h_0().child(body))
+            .into_any_element()
+    }
+
+    /// The editor over the rows it produces. Every runnable surface is this:
+    /// the query buffer and an opened relation differ in where their SQL came
+    /// from, not in what they are.
+    fn render_editor_surface(
+        split: gpui::ElementId,
+        editor: &Entity<InputState>,
+        font_size: f32,
+        query: &QueryState,
+        bottom: AnyElement,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let t = *theme(cx);
+        let mono = gpui_component::Theme::global(cx).mono_font_family.clone();
+
+        // The editor is the prompt, one tone behind its results.
+        let top = div()
+            .size_full()
+            .bg(t.panel)
+            .p(px(layout::SPACE_LG))
+            .font_family(mono)
+            .child(
+                Input::new(editor)
+                    .h_full()
+                    .appearance(false)
+                    .bordered(false)
+                    .focus_bordered(false)
+                    .text_size(px(font_size))
+                    .line_height(px(font_size * 1.55)),
+            );
+
+        let expanded = result_pane_is_expanded(query);
+        let (editor_height, results_height) = if expanded {
+            (layout::EDITOR_DEFAULT_HEIGHT, layout::RESULTS_DEFAULT_HEIGHT)
+        } else {
+            (layout::EDITOR_EMPTY_HEIGHT, layout::RESULTS_EMPTY_HEIGHT)
+        };
+
+        v_resizable((split, if expanded { "expanded" } else { "compact" }))
+            .child(
+                resizable_panel()
+                    .size(px(editor_height))
+                    .size_range(px(layout::EDITOR_MIN_HEIGHT)..px(layout::EDITOR_MAX_HEIGHT))
+                    .child(top),
+            )
+            .child(
+                resizable_panel()
+                    .size(px(results_height))
+                    .size_range(px(layout::RESULTS_MIN_HEIGHT)..gpui::Pixels::MAX)
+                    .child(bottom),
+            )
+            .into_any_element()
+    }
+
+    fn render_query_surface(profile: &Profile, cx: &mut Context<Self>) -> AnyElement {
+        let bottom = Self::render_results(&profile.session.query, &profile.session.results, true, cx);
+        Self::render_editor_surface(
+            gpui::ElementId::from((
+                gpui::ElementId::from("query-result-split"),
+                profile.id.clone(),
+            )),
+            &profile.session.editor,
+            profile.session.editor_font_size,
+            &profile.session.query,
+            bottom,
+            cx,
+        )
+    }
+
+    /// An opened object. A relation's generated `SELECT` is an ordinary buffer
+    /// the user can edit and run; only a routine, which has nothing to run, is
+    /// read-only.
+    fn render_object(profile: &Profile, tab: &ObjectTab, cx: &mut Context<Self>) -> AnyElement {
+        let t = *theme(cx);
+        let ObjectBody::Relation {
+            editor,
+            showing_structure,
+            structure,
+            results,
+            query,
+        } = &tab.body
+        else {
+            return Self::render_routine(tab, cx);
+        };
+
+        let bottom = if *showing_structure {
+            div()
+                .size_full()
+                .min_h_0()
+                .bg(t.bg)
+                .child(Self::render_structure(structure, cx))
+                .into_any_element()
+        } else {
+            Self::render_results(query, results, false, cx)
+        };
+
+        Self::render_editor_surface(
+            gpui::ElementId::from(("object-split", tab.id as usize)),
+            editor,
+            profile.session.editor_font_size,
+            query,
+            bottom,
+            cx,
+        )
+    }
+
+    fn render_routine(tab: &ObjectTab, cx: &mut Context<Self>) -> AnyElement {
+        let t = *theme(cx);
+        let mono = gpui_component::Theme::global(cx).mono_font_family.clone();
+        let ObjectBody::Routine(routine) = &tab.body else {
+            return div().into_any_element();
+        };
+        let kind = match routine.kind {
+            RoutineKind::Function => "Function",
+            RoutineKind::Procedure => "Procedure",
+        };
+
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .bg(t.panel)
+            .child(
+                div()
+                    .p(px(layout::SPACE_LG))
+                    .flex()
+                    .flex_col()
+                    .gap(px(layout::SPACE_SM))
+                    .child(
+                        div()
+                            .text_size(px(layout::TEXT_LG))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(format!("{}.{}", tab.schema, tab.name)),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .gap(px(layout::SPACE_LG))
+                            .text_size(px(layout::TEXT_SM))
+                            .text_color(t.text_muted)
+                            .child(kind)
+                            .child(format!("Language: {}", routine.language))
+                            .children((!routine.result_type.is_empty()).then(|| {
+                                div().child(format!("Returns: {}", routine.result_type))
+                            }))
+                            .child(
+                                div()
+                                    .ml_auto()
+                                    .child(key_hint(t, "escape", "returns to the editor")),
+                            ),
+                    ),
+            )
+            .child(
+                div()
+                    .id("routine-definition")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .p(px(layout::SPACE_LG))
+                    .font_family(mono)
+                    .child(routine.definition.clone()),
+            )
+            .into_any_element()
+    }
+
+    /// The results plane: the brightest tone, because the data is the point.
+    ///
+    /// A short status is centred and set in the app face -- it is a sentence
+    /// about the pane, not query output. An error keeps the editor's monospace
+    /// and the left edge, because it quotes the server and gets read against the
+    /// SQL above it. The grid and every message are alternatives, not layers: a
+    /// full-size message beside a full-size table gets pushed off the pane
+    /// entirely.
+    fn render_results(
+        query: &QueryState,
+        results: &Entity<TableState<ResultGrid>>,
+        is_query: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let t = *theme(cx);
+        let mono = gpui_component::Theme::global(cx).mono_font_family.clone();
         let centered = |child: AnyElement| {
             div()
                 .size_full()
@@ -1545,97 +2110,52 @@ impl Workspace {
                 .child(line)
                 .into_any_element()
         };
-        let is_query = matches!(profile.session.content, Content::Query);
-        let bottom = match &profile.session.content {
-            Content::Preview(preview) if preview.showing_structure => {
-                Self::render_structure(&preview.structure, cx)
-            }
-            _ => match &profile.session.query {
-                QueryState::Idle if is_query => centered(
-                    key_hint(t, "cmd-enter", "runs the selection or statement under the cursor")
-                        .into_any_element(),
-                ),
-                QueryState::Running => centered(quiet_line("Running query…".into())),
-                QueryState::Failed(error) => {
-                    let position = error
-                        .position
-                        .map(|position| format!(" (at byte {position})"))
-                        .unwrap_or_default();
-                    div()
-                        .size_full()
-                        .p(px(layout::SPACE_LG))
-                        .font_family(gpui_component::Theme::global(cx).mono_font_family.clone())
-                        .text_color(t.danger)
-                        .child(format!("{}{position}", error.message))
-                        .into_any_element()
-                }
-                QueryState::Complete {
-                    rows,
-                    rows_affected,
-                    ..
-                } if *rows == 0 => centered(quiet_line(match rows_affected {
-                    Some(rows) => format!("Query completed. Server row count: {rows}."),
-                    None => "Query completed.".into(),
-                })),
-                // Values are read by comparing them down a column, which only
-                // lines up in a monospaced face -- and the header inherits it,
-                // so the heading of a column sits in the same rhythm as its
-                // values.
-                _ => div()
-                    .size_full()
-                    .font_family(gpui_component::Theme::global(cx).mono_font_family.clone())
-                    .child(Table::new(&profile.session.results).bordered(false))
+
+        let content = match query {
+            QueryState::Idle if is_query => centered(
+                key_hint(t, "cmd-enter", "runs the selection or statement under the cursor")
                     .into_any_element(),
-            },
+            ),
+            // A preview runs the moment its tab is shown, so an idle one is a
+            // tab that is about to run rather than one waiting to be asked.
+            QueryState::Idle | QueryState::Running => centered(quiet_line("Running query…".into())),
+            QueryState::Failed(error) => {
+                let position = error
+                    .position
+                    .map(|position| format!(" (at byte {position})"))
+                    .unwrap_or_default();
+                div()
+                    .size_full()
+                    .p(px(layout::SPACE_LG))
+                    .font_family(mono)
+                    .text_color(t.danger)
+                    .child(format!("{}{position}", error.message))
+                    .into_any_element()
+            }
+            QueryState::Complete {
+                rows,
+                rows_affected,
+                ..
+            } if *rows == 0 => centered(quiet_line(match rows_affected {
+                Some(rows) => format!("Query completed. Server row count: {rows}."),
+                None => "Query completed.".into(),
+            })),
+            // Values are read by comparing them down a column, which only lines
+            // up in a monospaced face -- and the header inherits it, so the
+            // heading of a column sits in the same rhythm as its values.
+            _ => div()
+                .size_full()
+                .font_family(mono)
+                .child(Table::new(results).bordered(false))
+                .into_any_element(),
         };
 
-        // The results plane: the brightest tone, because the data is the point.
-        let bottom = div().size_full().min_h_0().bg(t.bg).child(bottom);
-
-        if matches!(profile.session.content, Content::Query) {
-            let expanded = result_pane_is_expanded(&profile.session.query);
-            let split_id = gpui::ElementId::from((
-                gpui::ElementId::from("query-result-split"),
-                profile.id.clone(),
-            ));
-            let split_id = (
-                split_id,
-                if expanded { "expanded" } else { "compact" },
-            );
-            let editor_height = if expanded {
-                layout::EDITOR_DEFAULT_HEIGHT
-            } else {
-                layout::EDITOR_EMPTY_HEIGHT
-            };
-            let results_height = if expanded {
-                layout::RESULTS_DEFAULT_HEIGHT
-            } else {
-                layout::RESULTS_EMPTY_HEIGHT
-            };
-
-            v_resizable(split_id)
-            .child(
-                resizable_panel()
-                    .size(px(editor_height))
-                    .size_range(px(layout::EDITOR_MIN_HEIGHT)..px(layout::EDITOR_MAX_HEIGHT))
-                    .child(top),
-            )
-            .child(
-                resizable_panel()
-                    .size(px(results_height))
-                    .size_range(px(layout::RESULTS_MIN_HEIGHT)..gpui::Pixels::MAX)
-                    .child(bottom),
-            )
+        div()
+            .size_full()
+            .min_h_0()
+            .bg(t.bg)
+            .child(content)
             .into_any_element()
-        } else {
-            div()
-                .size_full()
-                .flex()
-                .flex_col()
-                .child(top)
-                .child(div().flex_1().min_h_0().child(bottom))
-                .into_any_element()
-        }
     }
 
     /// One segment of the Data | Structure pair. A quiet chip rather than a
@@ -1771,16 +2291,21 @@ impl Workspace {
             .into_any_element()
     }
 
-    /// The query tabs, drawn as chips on the titlebar's chrome: the active one
-    /// is lifted to the editor's tone, the rest are names that reveal a wash
-    /// on hover. No boxes, no hairlines — tone carries the state.
-    fn render_query_tabs(profile: &Profile, cx: &mut Context<Self>) -> AnyElement {
+    /// The tab strip. It sits directly above the editor and starts where the
+    /// editor's text does, so a tab labels the surface under it rather than the
+    /// window: the active one is lifted to the editor's tone, the rest are names
+    /// that reveal a wash on hover. No boxes, no hairlines — tone carries the
+    /// state.
+    fn render_tab_strip(profile: &Profile, cx: &mut Context<Self>) -> AnyElement {
         let t = *theme(cx);
         let workspace = cx.entity().downgrade();
+        let session = &profile.session;
+        let on_query_tab = matches!(session.active, Tab::Query);
+        let runnable = session.editor(session.active).is_some();
 
-        let tab_base = |active: bool| {
+        let chip = |active: bool| {
             div()
-                .h(px(layout::TITLEBAR_TAB_HEIGHT))
+                .h(px(layout::TAB_CHIP_HEIGHT))
                 .flex()
                 .flex_shrink_0()
                 .items_center()
@@ -1795,120 +2320,220 @@ impl Workspace {
                     }
                 })
         };
-
-        let scratch_workspace = workspace.clone();
-        let scratch_active = profile.session.open_query.is_none();
-        let scratch = tab_base(scratch_active)
-            .id("scratch-query-tab")
-            .px(px(layout::SPACE_SM))
-            // A pen, not a file: the scratch buffer is a place to write, and
-            // the distinction is what makes the saved tabs read as files.
-            .child(row_icon(t, icon::SCRATCH_QUERY))
-            .child("New Query")
-            .on_click(move |_, window, cx| {
-                _ = scratch_workspace.update(cx, |workspace, cx| {
-                    workspace.open_scratch_query(window, cx);
-                });
-            });
-
-        let mut tabs = vec![scratch.into_any_element()];
-        tabs.extend(
-            profile
-                .session
-                .saved_queries
-                .iter()
-                .enumerate()
-                .map(|(index, name)| {
-                    let open_name = name.clone();
-                    let delete_name = name.clone();
-                    let open_workspace = workspace.clone();
-                    let delete_workspace = workspace.clone();
-                    let pending = profile.session.pending_delete.as_deref() == Some(name);
-                    let active = profile.session.open_query.as_deref() == Some(name);
-                    tab_base(active)
-                        .id(("saved-query", index))
-                        .group(format!("query-tab-{index}"))
-                        .pl(px(layout::SPACE_SM))
-                        .pr(px(layout::SPACE_XS))
-                        .child(row_icon(t, icon::SAVED_QUERY))
-                        .child(
-                            div()
-                                .max_w(px(180.))
-                                .overflow_hidden()
-                                .text_ellipsis()
-                                .whitespace_nowrap()
-                                .child(name.clone()),
-                        )
-                        .child(
-                            // Revealed by its own tab, so the strip reads as
-                            // names rather than a row of delete buttons.
-                            div()
-                                .when(!pending, |delete| {
-                                    delete.opacity(0.).group_hover(
-                                        format!("query-tab-{index}"),
-                                        |style| style.opacity(1.),
-                                    )
-                                })
-                                .child(
-                                    Button::new(("delete-query", index))
-                                        .label(if pending { "Delete?" } else { "" })
-                                        .icon(icon(icon::DELETE))
-                                        .ghost()
-                                        .xsmall()
-                                        .tooltip("Delete query")
-                                        .on_click(move |_, _, cx| {
-                                            _ = delete_workspace.update(cx, |workspace, cx| {
-                                                workspace
-                                                    .delete_saved_query(delete_name.clone(), cx);
-                                            });
-                                        }),
-                                ),
-                        )
-                        .on_click(move |_, window, cx| {
-                            _ = open_workspace.update(cx, |workspace, cx| {
-                                workspace.open_saved_query(open_name.clone(), window, cx);
-                            });
-                        })
-                        .into_any_element()
-                }),
-        );
-
-        let naming = if profile.session.naming {
-            let workspace = workspace.clone();
-            Some(
-                div()
-                    .w(px(240.))
-                    .flex_shrink_0()
-                    .flex()
-                    .items_center()
-                    .gap(px(layout::SPACE_XS))
-                    // The input and the button share one size so the pair sits
-                    // on a single centreline instead of jostling.
-                    .child(Input::new(&profile.session.save_name).small().flex_1())
-                    .child(
-                        Button::new("confirm-save-query")
-                            .icon(icon(icon::CHECK))
-                            .small()
-                            .tooltip("Save query")
-                            .on_click(move |_, _, cx| {
-                                _ = workspace.update(cx, |workspace, cx| {
-                                    workspace.confirm_save(cx);
-                                });
-                            }),
-                    )
-                    .into_any_element(),
-            )
-        } else {
-            None
+        let name_label = |name: String, transient: bool| {
+            div()
+                .max_w(px(180.))
+                .overflow_hidden()
+                .text_ellipsis()
+                .whitespace_nowrap()
+                // Italic for a tab nobody has asked to keep, the way every
+                // editor marks one.
+                .when(transient, |label| label.italic())
+                .child(name)
         };
 
+        let scratch_workspace = workspace.clone();
+        let mut tabs = vec![
+            chip(on_query_tab && session.open_query.is_none())
+                .id("scratch-query-tab")
+                .px(px(layout::SPACE_SM))
+                // A pen, not a file: the scratch buffer is a place to write, and
+                // the distinction is what makes the saved tabs read as files.
+                .child(row_icon(t, icon::SCRATCH_QUERY))
+                .child("New Query")
+                .on_click(move |_, window, cx| {
+                    _ = scratch_workspace.update(cx, |workspace, cx| {
+                        workspace.open_scratch_query(window, cx);
+                    });
+                })
+                .into_any_element(),
+        ];
+
+        tabs.extend(session.saved_queries.iter().enumerate().map(|(index, name)| {
+            let open_name = name.clone();
+            let delete_name = name.clone();
+            let open_workspace = workspace.clone();
+            let delete_workspace = workspace.clone();
+            let pending = session.pending_delete.as_deref() == Some(name);
+            let active = on_query_tab && session.open_query.as_deref() == Some(name);
+            chip(active)
+                .id(("saved-query", index))
+                .group(format!("query-tab-{index}"))
+                .pl(px(layout::SPACE_SM))
+                .pr(px(layout::SPACE_XS))
+                .child(row_icon(t, icon::SAVED_QUERY))
+                .child(name_label(name.clone(), false))
+                .child(
+                    // Revealed by its own tab, so the strip reads as names
+                    // rather than a row of delete buttons.
+                    div()
+                        .when(!pending, |delete| {
+                            delete
+                                .opacity(0.)
+                                .group_hover(format!("query-tab-{index}"), |style| style.opacity(1.))
+                        })
+                        .child(
+                            Button::new(("delete-query", index))
+                                .label(if pending { "Delete?" } else { "" })
+                                .icon(icon(icon::DELETE))
+                                .ghost()
+                                .xsmall()
+                                .tooltip("Delete query")
+                                .on_click(move |_, _, cx| {
+                                    // Or the chip underneath opens the query in
+                                    // the same click, and the confirmation this
+                                    // arms is cleared before it can be seen.
+                                    cx.stop_propagation();
+                                    _ = delete_workspace.update(cx, |workspace, cx| {
+                                        workspace.delete_saved_query(delete_name.clone(), cx);
+                                    });
+                                }),
+                        ),
+                )
+                .on_click(move |_, window, cx| {
+                    _ = open_workspace.update(cx, |workspace, cx| {
+                        workspace.open_saved_query(open_name.clone(), window, cx);
+                    });
+                })
+                .into_any_element()
+        }));
+
+        // Opened objects sit after the queries, in the order they were opened.
+        // Closing one is not destructive, so it gets a plain × rather than the
+        // saved queries' confirmed delete.
+        tabs.extend(session.objects.iter().map(|object| {
+            let id = object.id;
+            let group = format!("object-tab-{id}");
+            let open_workspace = workspace.clone();
+            let keep_workspace = workspace.clone();
+            let close_workspace = workspace.clone();
+            chip(session.active == Tab::Object(id))
+                .id(("object-tab", id as usize))
+                .group(group.clone())
+                .pl(px(layout::SPACE_SM))
+                .pr(px(layout::SPACE_XS))
+                .child(row_icon(t, object_icon(object.kind)))
+                .child(name_label(object.name.clone(), object.transient))
+                .child(
+                    div()
+                        .opacity(0.)
+                        .group_hover(group, |style| style.opacity(1.))
+                        .child(
+                            Button::new(("close-object", id as usize))
+                                .icon(icon(icon::CLOSE))
+                                .ghost()
+                                .xsmall()
+                                .tooltip("Close tab")
+                                .on_click(move |_, _, cx| {
+                                    // Or the chip underneath activates the tab
+                                    // this just closed, in the same click.
+                                    cx.stop_propagation();
+                                    _ = close_workspace.update(cx, |workspace, cx| {
+                                        workspace.close_object(id, cx);
+                                    });
+                                }),
+                        ),
+                )
+                .on_click(move |_, _, cx| {
+                    _ = open_workspace.update(cx, |workspace, cx| {
+                        workspace.activate_tab(Tab::Object(id), cx);
+                    });
+                })
+                // The other half of the preview gesture: a double click on the
+                // tab keeps it, exactly as it does in the tree.
+                .on_double_click(move |_, _, cx| {
+                    _ = keep_workspace.update(cx, |workspace, cx| {
+                        workspace.keep_object(id, cx);
+                    });
+                })
+                .into_any_element()
+        }));
+
+        let confirm_workspace = workspace.clone();
+        let naming_a_rename = on_query_tab && session.open_query.is_some();
+        let naming = session.naming.then(|| {
+            div()
+                .w(px(240.))
+                .flex_shrink_0()
+                .flex()
+                .items_center()
+                .gap(px(layout::SPACE_XS))
+                // The input and the button share one size so the pair sits on a
+                // single centreline instead of jostling.
+                .child(Input::new(&session.save_name).small().flex_1())
+                .child(
+                    Button::new("confirm-save-query")
+                        .icon(icon(if naming_a_rename {
+                            icon::RENAME
+                        } else {
+                            icon::SAVE
+                        }))
+                        .small()
+                        .tooltip(if naming_a_rename {
+                            "Rename query"
+                        } else {
+                            "Save query"
+                        })
+                        .on_click(move |_, window, cx| {
+                            _ = confirm_workspace.update(cx, |workspace, cx| {
+                                workspace.confirm_save(window, cx);
+                            });
+                        }),
+                )
+        });
+
+        // A relation's tab shows the same two views the preview surface used
+        // to, but from the strip: its editor is a query tab now, and a header
+        // of its own would be a second bar saying what this one already says.
+        //
+        // Once the buffer has been changed the pair goes away: whatever the
+        // editor holds is no longer a view of that relation, and a Structure
+        // beside it would describe something the rows no longer come from.
+        let structure_toggle = session
+            .active_object()
+            .filter(|tab| !tab.edited)
+            .and_then(|tab| match &tab.body {
+                ObjectBody::Relation {
+                    showing_structure, ..
+                } => Some(
+                    div()
+                        .flex_shrink_0()
+                        .flex()
+                        .gap(px(layout::SPACE_XS))
+                        .child(Self::preview_tab(
+                            "Data",
+                            icon::TABLE,
+                            !showing_structure,
+                            cx,
+                        ))
+                        .child(Self::preview_tab(
+                            "Structure",
+                            icon::STRUCTURE,
+                            *showing_structure,
+                            cx,
+                        )),
+                ),
+                ObjectBody::Routine(_) => None,
+            });
+
+        let zoom = editor_zoom_percent(session.editor_font_size);
+        let named = on_query_tab && session.open_query.is_some();
         let new_workspace = workspace.clone();
+        let save_workspace = workspace.clone();
+        let rename_workspace = workspace.clone();
+        let run_workspace = workspace.clone();
+
         div()
-            .h_full()
+            .h(px(layout::TAB_HEIGHT))
             .w_full()
+            .flex_shrink_0()
             .flex()
             .items_center()
             .gap(px(layout::SPACE_SM))
+            // Starts where the editor's text does, so a tab lines up with the
+            // buffer it names.
+            .pl(px(layout::SPACE_LG))
+            .pr(px(layout::SPACE_SM))
             .text_size(px(layout::TEXT_SM))
             .child(
                 div()
@@ -1935,7 +2560,55 @@ impl Workspace {
                             }),
                     ),
             )
+            .children(structure_toggle)
+            // 100% is not information; the readout appears only once the zoom
+            // has somewhere to return to.
+            .children((runnable && zoom != 100).then(|| {
+                div()
+                    .flex_shrink_0()
+                    .text_color(t.text_faint)
+                    .child(format!("{zoom}% · ⌘0 resets"))
+            }))
             .children(naming)
+            // A named query is already written to disk on every swap, so there
+            // is nothing for a save button to do that has not been done. What
+            // it can still do is change the name.
+            .children((runnable && !session.naming && named).then(|| {
+                Button::new("rename-query")
+                    .icon(icon(icon::RENAME))
+                    .ghost()
+                    .xsmall()
+                    .tooltip("Rename query")
+                    .on_click(move |_, window, cx| {
+                        _ = rename_workspace.update(cx, |workspace, cx| {
+                            workspace.rename_query(window, cx);
+                        });
+                    })
+            }))
+            .children((runnable && !session.naming && !named).then(|| {
+                Button::new("save-query")
+                    .icon(icon(icon::SAVE))
+                    .ghost()
+                    .xsmall()
+                    .tooltip_with_action("Save query", &SaveQuery, None)
+                    .on_click(move |_, window, cx| {
+                        _ = save_workspace.update(cx, |workspace, cx| {
+                            workspace.save_query(&SaveQuery, window, cx);
+                        });
+                    })
+            }))
+            .children(runnable.then(|| {
+                Button::new("run-query")
+                    .icon(icon(icon::RUN))
+                    .ghost()
+                    .xsmall()
+                    .tooltip_with_action("Run", &RunQuery, None)
+                    .on_click(move |_, window, cx| {
+                        _ = run_workspace.update(cx, |workspace, cx| {
+                            workspace.run_query(&RunQuery, window, cx);
+                        });
+                    })
+            }))
             .into_any_element()
     }
 
@@ -2188,9 +2861,13 @@ impl Workspace {
                             return row;
                         };
                         let workspace = workspace.clone();
-                        row.on_click(move |_, _, cx| {
+                        // One click opens a tab to look at; the second keeps
+                        // it. Both events arrive, so the double click promotes
+                        // the tab its own first click opened.
+                        row.on_click(move |event: &ClickEvent, window, cx| {
+                            let transient = event.click_count() < 2;
                             _ = workspace.update(cx, |workspace, cx| {
-                                workspace.open_explorer_target(leaf.target, cx);
+                                workspace.open_explorer_target(leaf.target, transient, window, cx);
                             });
                         })
                     },
@@ -2241,18 +2918,31 @@ impl Workspace {
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = *theme(cx);
-        // Deferred to render because the editor has to be mounted before it can
-        // take focus, and the connection that reveals it resolves off-thread.
+        // Deferred to render for the `&mut Window` a background task does not
+        // have: the catalog that names these tabs resolves off-thread, and a
+        // grid cannot be built without a window.
+        self.restore_objects(window, cx);
+
+        // Deferred for the same reason plus one: an element has to be mounted
+        // before it can take focus.
         let take_focus = self.profile_mut().and_then(|profile| {
-            let wanted = profile.session.editor_needs_focus
-                && matches!(profile.session.content, Content::Query);
-            wanted.then(|| {
-                profile.session.editor_needs_focus = false;
-                profile.session.editor.clone()
-            })
+            if profile.session.naming {
+                let wanted = profile.session.save_name_needs_focus;
+                return wanted.then(|| {
+                    profile.session.save_name_needs_focus = false;
+                    profile.session.save_name.clone()
+                });
+            }
+            if !profile.session.editor_needs_focus {
+                return None;
+            }
+            // Whichever buffer is in front: a relation's tab has one of its own.
+            let editor = profile.session.editor(profile.session.active)?;
+            profile.session.editor_needs_focus = false;
+            Some(editor)
         });
-        if let Some(editor) = take_focus {
-            editor.focus_handle(cx).focus(window);
+        if let Some(input) = take_focus {
+            input.focus_handle(cx).focus(window);
         }
 
         if self.form.is_some() {
@@ -2271,7 +2961,7 @@ impl Render for Workspace {
                 .on_action(cx.listener(Self::previous_profile))
                 // Without a titlebar of its own the form has no drag handle at
                 // all, since the platform's is transparent.
-                .child(titlebar(t, None, None))
+                .child(titlebar(t, None))
                 .child(
                     div()
                         .flex_1()
@@ -2296,13 +2986,13 @@ impl Render for Workspace {
             ProfileState::Failed(message) => (message.clone(), t.danger),
         };
 
-        let query_status = match &profile.session.query {
-            QueryState::Complete {
+        let query_status = match profile.session.active_query() {
+            Some(QueryState::Complete {
                 rows,
                 bytes,
                 elapsed,
                 ..
-            } => Some(format!(
+            }) => Some(format!(
                 "{} {} · {} · {elapsed:.1?}",
                 group_thousands(*rows as u64),
                 if *rows == 1 { "row" } else { "rows" },
@@ -2334,11 +3024,7 @@ impl Render for Workspace {
             .text_size(px(layout::TEXT_MD))
             .flex()
             .flex_col()
-            .child(titlebar(
-                t,
-                Some(profile.name.clone()),
-                Some(Self::render_query_tabs(profile, cx)),
-            ))
+            .child(titlebar(t, Some(profile.name.clone())))
             .child(
                 div().flex_1().min_h_0().child(
                     h_resizable("workspace-shell-split")
@@ -2413,6 +3099,15 @@ fn object_icon(kind: ObjectKind) -> &'static str {
     }
 }
 
+/// Write a profile's editor back to whichever file it came from.
+fn write_buffer(profile: &Profile, cx: &App) -> Result<(), String> {
+    let sql = profile.session.editor.read(cx).value().to_string();
+    match &profile.session.open_query {
+        Some(name) => store::write_query(&profile.id, name, &sql),
+        None => store::write_scratch(&profile.id, &sql),
+    }
+}
+
 /// One column of icons down the sidebar, so every label starts at the same x
 /// whether its row is a folder or an object.
 fn row_icon(t: Theme, path: &'static str) -> impl IntoElement {
@@ -2423,10 +3118,10 @@ fn row_icon(t: Theme, path: &'static str) -> impl IntoElement {
 ///
 /// The system titlebar is transparent (see `main`), so this row is what runs to
 /// the top of the window and the window buttons are drawn over its leading
-/// inset. It is also the drag handle the platform no longer provides. The
-/// query tabs live here, the way a browser keeps its tabs in the window frame,
-/// so the strip costs no height inside the content column.
-fn titlebar(t: Theme, subtitle: Option<String>, tabs: Option<AnyElement>) -> impl IntoElement {
+/// inset. It is also the drag handle the platform no longer provides — which is
+/// why nothing interactive lives here: a drag region swallows the clicks a
+/// field or a button needs.
+fn titlebar(t: Theme, subtitle: Option<String>) -> impl IntoElement {
     div()
         .id("titlebar")
         .window_control_area(gpui::WindowControlArea::Drag)
@@ -2457,7 +3152,6 @@ fn titlebar(t: Theme, subtitle: Option<String>, tabs: Option<AnyElement>) -> imp
                         .child(subtitle)
                 })),
         )
-        .children(tabs.map(|tabs| div().h_full().flex_1().min_w_0().child(tabs)))
 }
 
 /// The quietest thing on screen: small, uppercase, and dim enough that the

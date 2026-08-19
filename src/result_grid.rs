@@ -1,8 +1,11 @@
 use gpui::{
-    App, Context, IntoElement, ParentElement, SharedString, Styled, Window, div,
-    prelude::FluentBuilder, px,
+    App, ClipboardItem, Context, InteractiveElement, IntoElement, ParentElement, SharedString,
+    Styled, Window, div, prelude::FluentBuilder, px,
 };
-use gpui_component::table::{Column, TableDelegate, TableState};
+use gpui_component::{
+    InteractiveElementExt,
+    table::{Column, TableDelegate, TableState},
+};
 
 use crate::{
     db::QueryResult,
@@ -23,6 +26,9 @@ pub struct ResultGrid {
     /// Clipped, ref-counted copies built once per result set. `render_td` runs
     /// for every visible cell on every frame, so it must not allocate.
     display: Vec<Vec<Option<SharedString>>>,
+    /// The last cell copied, marked so a copy is visible. A double click that
+    /// leaves the screen unchanged reads as a click that did nothing.
+    copied: Option<(usize, usize)>,
 }
 
 impl ResultGrid {
@@ -56,7 +62,19 @@ impl ResultGrid {
             columns,
             result,
             display,
+            copied: None,
         }
+    }
+
+    /// The whole value behind a cell, not the clipped one the grid paints: a
+    /// column is 180 pixels wide and a JSONB document is not, and copying what
+    /// happens to fit would be the same bug as reading it through the column.
+    fn value(&self, row_ix: usize, col_ix: usize) -> Option<&str> {
+        self.result
+            .rows
+            .get(row_ix)?
+            .get(col_ix)?
+            .as_deref()
     }
 }
 
@@ -115,12 +133,14 @@ impl TableDelegate for ResultGrid {
             .get(row_ix)
             .and_then(|row| row.get(col_ix))
             .and_then(Option::as_ref);
-        let (text, faint) = {
+        let (text, faint, copied_bg) = {
             let t = theme(cx);
-            (t.text, t.text_faint)
+            (t.text, t.text_faint, t.element_active)
         };
+        let copied = self.copied == Some((row_ix, col_ix));
 
         div()
+            .id(("cell", row_ix * self.columns.len() + col_ix))
             .size_full()
             .px(px(layout::SPACE_SM))
             .flex()
@@ -131,7 +151,20 @@ impl TableDelegate for ResultGrid {
             .text_color(if cell.is_some() { text } else { faint })
             // Italic so a NULL cannot be mistaken for the four-letter string.
             .when(cell.is_none(), |cell| cell.italic())
+            // Held until the next copy rather than timed out: this is a mark of
+            // what is on the clipboard, and that does not expire either.
+            .when(copied, |cell| cell.bg(copied_bg))
             .child(cell.cloned().unwrap_or(NULL_LABEL))
+            // The whole value, which is the only way to get at one that is
+            // wider than its column until the value inspector exists.
+            .on_double_click(cx.listener(move |table, _, _, cx| {
+                let Some(value) = table.delegate().value(row_ix, col_ix) else {
+                    return;
+                };
+                cx.write_to_clipboard(ClipboardItem::new_string(value.to_string()));
+                table.delegate_mut().copied = Some((row_ix, col_ix));
+                cx.notify();
+            }))
     }
 }
 
@@ -154,6 +187,25 @@ mod tests {
         assert_eq!(clipped.chars().count(), CELL_DISPLAY_LIMIT + 1);
         assert!(clipped.ends_with('…'));
         assert!(clipped.chars().take(CELL_DISPLAY_LIMIT).all(|c| c == '🌍'));
+    }
+
+    #[test]
+    fn a_copy_takes_the_whole_value_the_column_could_not_show() {
+        let value = "x".repeat(CELL_DISPLAY_LIMIT * 3);
+        let grid = ResultGrid::new(QueryResult {
+            columns: vec![DbColumn { name: "a".into() }],
+            rows: vec![vec![Some(value.clone())], vec![None]],
+            ..QueryResult::default()
+        });
+
+        assert_eq!(grid.value(0, 0), Some(value.as_str()));
+        assert_ne!(
+            grid.display[0][0].as_ref().map(SharedString::as_ref),
+            Some(value.as_str())
+        );
+        // A NULL is an absent value, not the string the cell paints for one.
+        assert_eq!(grid.value(1, 0), None);
+        assert_eq!(grid.value(9, 9), None);
     }
 
     #[test]

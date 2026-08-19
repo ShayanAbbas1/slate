@@ -8,6 +8,8 @@ const PROFILES_FILE: &str = "profiles.toml";
 const KEYCHAIN_SERVICE: &str = "Slate";
 const SCRATCH_FILE: &str = ".scratch.sql";
 
+/// Field order is load-bearing: TOML cannot emit a scalar after a table, so
+/// every scalar has to precede `open_objects`.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct StoredProfile {
     pub id: String,
@@ -18,9 +20,32 @@ pub struct StoredProfile {
     pub user: String,
     #[serde(default)]
     pub open_query: Option<String>,
+    #[serde(default)]
+    pub open_objects: Vec<StoredObject>,
 }
 
-#[derive(Default, Serialize, Deserialize)]
+/// An opened table, view or routine, stored by name rather than by content: the
+/// catalog is the source of truth for what it holds, so a restored tab shows
+/// today's definition and one that has been dropped simply does not come back.
+///
+/// A buffer the user edited is the exception, because that is theirs and the
+/// catalog cannot regenerate it.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct StoredObject {
+    pub schema: String,
+    pub name: String,
+    #[serde(default)]
+    pub routine: bool,
+    /// Which tab was in front. A flag on the object rather than a pointer to
+    /// it: a name can contain anything, including whatever would separate a
+    /// schema from a relation in a key.
+    #[serde(default)]
+    pub active: bool,
+    #[serde(default)]
+    pub sql: Option<String>,
+}
+
+#[derive(Default, Debug, PartialEq, Serialize, Deserialize)]
 struct ProfileFile {
     #[serde(default)]
     profiles: Vec<StoredProfile>,
@@ -191,6 +216,45 @@ mod tests {
 
     fn ids(names: &[&str]) -> Vec<String> {
         names.iter().map(|name| (*name).to_string()).collect()
+    }
+
+    #[test]
+    fn a_profile_survives_the_round_trip_through_toml() {
+        // TOML refuses a scalar written after a table, so the open-object list
+        // has to stay the last field -- and that is invisible until it fails.
+        let profile = StoredProfile {
+            id: "dev".into(),
+            name: "Dev".into(),
+            host: "127.0.0.1".into(),
+            port: Some(5432),
+            database: "slate_dev".into(),
+            user: "slate".into(),
+            open_query: Some("daily".into()),
+            open_objects: vec![
+                StoredObject {
+                    schema: "public".into(),
+                    name: "accounts".into(),
+                    routine: false,
+                    active: true,
+                    sql: Some("select 1".into()),
+                },
+                StoredObject {
+                    schema: "public".into(),
+                    name: "total(integer)".into(),
+                    routine: true,
+                    active: false,
+                    sql: None,
+                },
+            ],
+        };
+        let file = ProfileFile {
+            profiles: vec![profile.clone()],
+        };
+
+        let text = toml::to_string_pretty(&file).expect("profiles must encode");
+        let decoded: ProfileFile = toml::from_str(&text).expect("profiles must decode");
+
+        assert_eq!(decoded.profiles, vec![profile]);
     }
 
     #[test]

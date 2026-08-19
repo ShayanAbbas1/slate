@@ -22,7 +22,7 @@ use icondata_core::IconData;
 /// The gpui-component widgets ask for their own paths — those are Lucide names
 /// too, so they resolve here as well. Add a row when something asks for one;
 /// an unlisted path simply draws nothing.
-const ICONS: [(&str, &IconData); 27] = [
+const ICONS: [(&str, &IconData); 29] = [
     ("icons/chevron-down.svg", icondata_lu::LuChevronDown),
     ("icons/chevron-right.svg", icondata_lu::LuChevronRight),
     ("icons/chevron-left.svg", icondata_lu::LuChevronLeft),
@@ -31,6 +31,8 @@ const ICONS: [(&str, &IconData); 27] = [
     ("icons/file-code.svg", icondata_lu::LuFileCode),
     ("icons/trash.svg", icondata_lu::LuTrash2),
     ("icons/check.svg", icondata_lu::LuCheck),
+    ("icons/save.svg", icondata_lu::LuSave),
+    ("icons/pencil.svg", icondata_lu::LuPencil),
     ("icons/close.svg", icondata_lu::LuX),
     ("icons/ellipsis.svg", icondata_lu::LuEllipsis),
     ("icons/loader-circle.svg", icondata_lu::LuLoaderCircle),
@@ -72,6 +74,10 @@ pub mod icon {
     pub const STRUCTURE: &str = "icons/list-tree.svg";
     pub const PLUS: &str = "icons/plus.svg";
     pub const CHECK: &str = "icons/check.svg";
+    pub const CLOSE: &str = "icons/close.svg";
+    /// A floppy disk, which is what "save" looks like everywhere else.
+    pub const SAVE: &str = "icons/save.svg";
+    pub const RENAME: &str = "icons/pencil.svg";
     pub const RUN: &str = "icons/play.svg";
     pub const SCRATCH_QUERY: &str = "icons/square-pen.svg";
     /// The connection form's "fill the fields from this URL" action: the URL
@@ -145,6 +151,9 @@ mod tests {
             icon::STRUCTURE,
             icon::PLUS,
             icon::CHECK,
+            icon::CLOSE,
+            icon::SAVE,
+            icon::RENAME,
             icon::RUN,
             icon::SCRATCH_QUERY,
             icon::FILL_DOWN,

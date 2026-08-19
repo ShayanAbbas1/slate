@@ -58,11 +58,10 @@ pub mod layout {
     pub const TITLEBAR_LEADING_INSET: f32 = 78.0;
     pub const STATUS_HEIGHT: f32 = 24.0;
     pub const TAB_HEIGHT: f32 = 34.0;
-    /// Query tabs are chips inside the titlebar, so they get a chip height
-    /// rather than the full bar.
-    pub const TITLEBAR_TAB_HEIGHT: f32 = 26.0;
+    /// A tab is a chip inside the strip, so it gets a chip height rather than
+    /// the full bar.
+    pub const TAB_CHIP_HEIGHT: f32 = 26.0;
     pub const SWITCHER_HEIGHT: f32 = 40.0;
-    pub const EDITOR_HEADER_HEIGHT: f32 = 30.0;
     pub const EDITOR_EMPTY_HEIGHT: f32 = 680.0;
     pub const EDITOR_DEFAULT_HEIGHT: f32 = 420.0;
     pub const EDITOR_MIN_HEIGHT: f32 = 120.0;
