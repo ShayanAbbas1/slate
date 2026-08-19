@@ -2,11 +2,12 @@ mod db;
 mod explorer;
 mod result_grid;
 mod sql;
+mod store;
 
 mod icons;
 mod theme;
 
-use std::{collections::HashMap, sync::Arc};
+use std::{borrow::Cow, collections::HashMap, sync::Arc};
 
 use gpui::{
     AnyElement, App, AppContext, Application, ClickEvent, Context, Entity, EntityInputHandler,
@@ -15,7 +16,7 @@ use gpui::{
     point, px,
 };
 use gpui_component::{
-    Disableable, InteractiveElementExt, Root, Sizable,
+    InteractiveElementExt, Root, Sizable,
     button::{Button, ButtonVariants},
     input::{Input, InputEvent, InputState},
     list::ListItem,
@@ -32,19 +33,24 @@ use result_grid::ResultGrid;
 use sql::Buffer;
 use theme::{Theme, layout, theme};
 
-actions!(slate, [RunQuery, ShowEditor, CycleTheme]);
+actions!(
+    slate,
+    [
+        RunQuery,
+        ShowEditor,
+        CycleTheme,
+        SaveQuery,
+        NewQuery,
+        NextProfile,
+        PreviousProfile,
+        NewConnection,
+    ]
+);
 
 const RETURN_HINT: &str = "esc returns to the editor";
 
 /// The platform's window buttons, which Slate positions but does not draw.
 const TRAFFIC_LIGHT_DIAMETER: f32 = 14.0;
-
-enum ConnectionState {
-    NotConfigured,
-    Connecting { endpoint: String },
-    Connected(Profile),
-    Failed(String),
-}
 
 /// A connection and everything it owns.
 ///
@@ -53,11 +59,41 @@ enum ConnectionState {
 /// the connection changes, so a buffer written against one database cannot be
 /// retargeted at another — it does not exist outside its profile.
 struct Profile {
+    id: String,
     name: String,
     config: ConnectionConfig,
-    connection: Connection,
+    generation: u64,
+    state: ProfileState,
     catalog: CatalogState,
     session: Session,
+}
+
+impl Profile {
+    fn connection(&self) -> Option<Connection> {
+        match &self.state {
+            ProfileState::Connected(connection) => Some(connection.clone()),
+            _ => None,
+        }
+    }
+
+    fn stored(&self) -> store::StoredProfile {
+        store::StoredProfile {
+            id: self.id.clone(),
+            name: self.name.clone(),
+            host: self.config.host.clone(),
+            port: self.config.port,
+            database: self.config.database.clone(),
+            user: self.config.user.clone(),
+            open_query: self.session.open_query.clone(),
+        }
+    }
+}
+
+enum ProfileState {
+    Idle,
+    Connecting,
+    Connected(Connection),
+    Failed(String),
 }
 
 /// The per-profile view state.
@@ -76,24 +112,55 @@ struct Session {
     /// `cmd+enter` reaches the workspace only through the focused element's
     /// dispatch path, so an unfocused editor makes the primary keystroke dead.
     editor_needs_focus: bool,
+    open_query: Option<String>,
+    saved_queries: Vec<String>,
+    save_name: Entity<InputState>,
+    naming: bool,
+    pending_delete: Option<String>,
+    notice: Option<String>,
 }
 
 impl Session {
-    fn new(window: &mut Window, cx: &mut Context<Workspace>) -> Self {
+    fn new(
+        id: String,
+        open_query: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) -> Self {
         let explorer_filter =
             cx.new(|cx| InputState::new(window, cx).placeholder("Filter database objects…"));
-        cx.subscribe(&explorer_filter, |workspace, _, event: &InputEvent, cx| {
-            if matches!(event, InputEvent::Change) {
-                workspace.refresh_explorer(cx);
+        cx.subscribe(&explorer_filter, {
+            let id = id.clone();
+            move |workspace, _, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::Change) {
+                    workspace.refresh_explorer(&id, cx);
+                }
             }
         })
         .detach();
+
+        let save_name = cx.new(|cx| InputState::new(window, cx).placeholder("Query name"));
+        cx.subscribe(&save_name, |workspace, _, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::PressEnter { .. }) {
+                workspace.confirm_save(cx);
+            }
+        })
+        .detach();
+
+        let saved_queries = store::saved_queries(&id);
+        let open_query = open_query.filter(|name| saved_queries.contains(name));
+        let sql = match &open_query {
+            Some(name) => store::read_query(&id, name),
+            None => store::read_scratch(&id),
+        }
+        .unwrap_or_default();
 
         Self {
             editor: cx.new(|cx| {
                 InputState::new(window, cx)
                     .code_editor("sql")
                     .placeholder("Write SQL…")
+                    .default_value(sql)
             }),
             results: cx.new(|cx| {
                 TableState::new(ResultGrid::empty(), window, cx)
@@ -108,6 +175,12 @@ impl Session {
             explorer_tree: cx.new(|cx| TreeState::new(cx)),
             explorer_leaves: Arc::new(HashMap::new()),
             editor_needs_focus: true,
+            open_query,
+            saved_queries,
+            save_name,
+            naming: false,
+            pending_delete: None,
+            notice: None,
         }
     }
 }
@@ -270,54 +343,146 @@ enum QueryState {
 }
 
 struct Workspace {
-    /// The only state outside a profile: the connection lifecycle, the form
-    /// that starts one, and the generation counter that invalidates stale work.
-    connection: ConnectionState,
-    connection_form: ConnectionForm,
-    /// Bumped on every connection attempt. A spawned task captures the value it
-    /// was issued under and drops its result if the connection has moved on,
-    /// so one profile's catalog or rows can never land on another's.
-    connection_generation: u64,
+    profiles: Vec<Profile>,
+    active: usize,
+    form: Option<ConnectionForm>,
+    switcher_open: bool,
+    pending_removal: Option<String>,
+    next_generation: u64,
 }
 
 impl Workspace {
     fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let environment_config = connection_config_from_environment();
-        let connection_form = ConnectionForm::new(
-            environment_config.as_ref().ok().and_then(Option::as_ref),
-            window,
-            cx,
-        );
-
         let mut workspace = Self {
-            connection: ConnectionState::NotConfigured,
-            connection_form,
-            connection_generation: 0,
+            profiles: Vec::new(),
+            active: 0,
+            form: None,
+            switcher_open: false,
+            pending_removal: None,
+            next_generation: 0,
         };
 
-        match environment_config {
-            Ok(Some(config)) => {
-                workspace.begin_connect(config.database.clone(), config, window, cx)
-            }
-            Ok(None) => {}
-            Err(message) => workspace.connection = ConnectionState::Failed(message),
+        for stored in store::load_profiles() {
+            workspace.restore_profile(stored, window, cx);
         }
 
+        match connection_config_from_environment() {
+            Ok(Some(config)) => {
+                let existing = workspace.profiles.iter().position(|profile| {
+                    profile.config.endpoint() == config.endpoint()
+                        && profile.config.user == config.user
+                });
+                workspace.active = match existing {
+                    Some(index) => index,
+                    None => {
+                        let name = config.database.clone();
+                        workspace.create_profile(name, config, window, cx)
+                    }
+                };
+            }
+            Ok(None) => {}
+            Err(message) => {
+                let mut form = ConnectionForm::new(None, window, cx);
+                form.error = Some(message);
+                workspace.form = Some(form);
+            }
+        }
+
+        if workspace.profiles.is_empty() && workspace.form.is_none() {
+            workspace.form = Some(ConnectionForm::new(None, window, cx));
+        }
+        workspace.connect_active(cx);
         workspace
     }
 
     fn profile(&self) -> Option<&Profile> {
-        match &self.connection {
-            ConnectionState::Connected(profile) => Some(profile),
-            _ => None,
-        }
+        self.profiles.get(self.active)
     }
 
     fn profile_mut(&mut self) -> Option<&mut Profile> {
-        match &mut self.connection {
-            ConnectionState::Connected(profile) => Some(profile),
-            _ => None,
+        self.profiles.get_mut(self.active)
+    }
+
+    fn issued_to(&mut self, id: &str, generation: u64) -> Option<&mut Profile> {
+        self.profiles
+            .iter_mut()
+            .find(|profile| profile.id == id && profile.generation == generation)
+    }
+
+    fn note(&mut self, message: String, cx: &mut Context<Self>) {
+        if let Some(profile) = self.profile_mut() {
+            profile.session.notice = Some(message);
+        } else if let Some(form) = &mut self.form {
+            form.error = Some(message);
         }
+        cx.notify();
+    }
+
+    fn remember_profiles(&mut self, cx: &mut Context<Self>) {
+        let profiles = self
+            .profiles
+            .iter()
+            .map(Profile::stored)
+            .collect::<Vec<_>>();
+        if let Err(message) = store::save_profiles(&profiles) {
+            self.note(message, cx);
+        }
+    }
+
+    fn restore_profile(
+        &mut self,
+        stored: store::StoredProfile,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let config = ConnectionConfig {
+            host: stored.host,
+            port: stored.port,
+            database: stored.database,
+            user: stored.user,
+            password: String::new(),
+        };
+        let session = Session::new(stored.id.clone(), stored.open_query, window, cx);
+        self.profiles.push(Profile {
+            id: stored.id,
+            name: stored.name,
+            config,
+            generation: 0,
+            state: ProfileState::Idle,
+            catalog: CatalogState::Loading,
+            session,
+        });
+    }
+
+    fn create_profile(
+        &mut self,
+        name: String,
+        config: ConnectionConfig,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> usize {
+        let existing = self
+            .profiles
+            .iter()
+            .map(|profile| profile.id.clone())
+            .collect::<Vec<_>>();
+        let id = store::profile_id(&name, &existing);
+        let session = Session::new(id.clone(), None, window, cx);
+        let password = config.password.clone();
+        self.profiles.push(Profile {
+            id: id.clone(),
+            name,
+            config,
+            generation: 0,
+            state: ProfileState::Idle,
+            catalog: CatalogState::Loading,
+            session,
+        });
+        if let Err(message) = store::set_password(&id, &password) {
+            self.note(message, cx);
+        }
+        self.remember_profiles(cx);
+        self.profiles.len() - 1
     }
 
     fn apply_connection_url(
@@ -326,92 +491,117 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let url = self.connection_form.url.read(cx).value();
+        let Some(form) = &self.form else {
+            return;
+        };
+        let url = form.url.read(cx).value();
         let config = match ConnectionConfig::from_url(url.trim()) {
             Ok(config) => config,
             Err(error) => {
-                self.connection_form.error = Some(error);
+                if let Some(form) = &mut self.form {
+                    form.error = Some(error);
+                }
                 cx.notify();
                 return;
             }
         };
 
         for (input, value) in [
-            (&self.connection_form.name, config.database.clone()),
-            (&self.connection_form.host, config.host),
+            (&form.name, config.database.clone()),
+            (&form.host, config.host),
             (
-                &self.connection_form.port,
+                &form.port,
                 config.port.map(|port| port.to_string()).unwrap_or_default(),
             ),
-            (&self.connection_form.database, config.database),
-            (&self.connection_form.user, config.user),
-            (&self.connection_form.password, config.password),
+            (&form.database, config.database),
+            (&form.user, config.user),
+            (&form.password, config.password),
         ] {
+            let input = input.clone();
             input.update(cx, |input, cx| input.set_value(value, window, cx));
         }
-        self.connection_form.error = None;
+        if let Some(form) = &mut self.form {
+            form.error = None;
+        }
         cx.notify();
     }
 
     fn connect(&mut self, _: &ClickEvent, window: &mut Window, cx: &mut Context<Self>) {
-        if matches!(self.connection, ConnectionState::Connecting { .. }) {
+        let Some(form) = &self.form else {
             return;
-        }
-
-        let (name, config) = match self.connection_form.config(cx) {
+        };
+        let (name, config) = match form.config(cx) {
             Ok(profile) => profile,
             Err(error) => {
-                self.connection_form.error = Some(error);
+                if let Some(form) = &mut self.form {
+                    form.error = Some(error);
+                }
                 cx.notify();
                 return;
             }
         };
 
-        self.connection_form.error = None;
-        self.begin_connect(name, config, window, cx);
+        self.form = None;
+        let index = self.create_profile(name, config, window, cx);
+        self.activate(index, cx);
     }
 
-    fn begin_connect(
+    fn open_connection_form(
         &mut self,
-        name: String,
-        config: ConnectionConfig,
+        _: &NewConnection,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.connection_generation += 1;
-        let generation = self.connection_generation;
-        self.connection = ConnectionState::Connecting {
-            endpoint: config.endpoint(),
+        self.form = Some(ConnectionForm::new(None, window, cx));
+        self.switcher_open = false;
+        cx.notify();
+    }
+
+    fn connect_active(&mut self, cx: &mut Context<Self>) {
+        if matches!(
+            self.profile().map(|profile| &profile.state),
+            Some(ProfileState::Idle | ProfileState::Failed(_))
+        ) {
+            self.begin_connect(self.active, cx);
+        }
+    }
+
+    fn begin_connect(&mut self, index: usize, cx: &mut Context<Self>) {
+        self.next_generation += 1;
+        let generation = self.next_generation;
+        let Some(profile) = self.profiles.get_mut(index) else {
+            return;
         };
+        profile.generation = generation;
+        profile.state = ProfileState::Connecting;
+        profile.catalog = CatalogState::Loading;
+
+        let id = profile.id.clone();
+        let mut config = profile.config.clone();
         cx.notify();
 
-        // Built here, not in the continuation: the profile owns its editor and
-        // grid, and creating those needs a Window the spawned task will not
-        // have. Dropped unused if the connection fails.
-        let session = Session::new(window, cx);
-        let task_config = config.clone();
-        let connection_task = cx
-            .background_executor()
-            .spawn(async move { Connection::open(task_config) });
+        let connection_task = cx.background_executor().spawn({
+            let id = id.clone();
+            async move {
+                if config.password.is_empty() {
+                    config.password = store::password(&id).unwrap_or_default();
+                }
+                Connection::open(config)
+            }
+        });
 
         cx.spawn(async move |workspace, cx| {
             let result = connection_task.await;
             workspace
                 .update(cx, |workspace, cx| {
-                    if workspace.connection_generation != generation {
+                    let Some(profile) = workspace.issued_to(&id, generation) else {
                         return;
-                    }
-                    workspace.connection = match result {
-                        Ok(connection) => ConnectionState::Connected(Profile {
-                            name,
-                            config,
-                            connection,
-                            catalog: CatalogState::Loading,
-                            session,
-                        }),
-                        Err(error) => ConnectionState::Failed(error.message),
                     };
-                    workspace.load_catalog(cx);
+                    profile.state = match result {
+                        Ok(connection) => ProfileState::Connected(connection),
+                        Err(error) => ProfileState::Failed(error.message),
+                    };
+                    workspace.load_catalog(&id, generation, cx);
                     cx.notify();
                 })
                 .ok();
@@ -419,29 +609,30 @@ impl Workspace {
         .detach();
     }
 
-    fn load_catalog(&mut self, cx: &mut Context<Self>) {
-        let Some(connection) = self.profile().map(|profile| profile.connection.clone()) else {
+    fn load_catalog(&mut self, id: &str, generation: u64, cx: &mut Context<Self>) {
+        let Some(connection) = self
+            .issued_to(id, generation)
+            .and_then(|profile| profile.connection())
+        else {
             return;
         };
-        let generation = self.connection_generation;
         let catalog_task = cx
             .background_executor()
             .spawn(async move { connection.catalog() });
 
+        let id = id.to_string();
         cx.spawn(async move |workspace, cx| {
             let result = catalog_task.await;
             workspace
                 .update(cx, |workspace, cx| {
-                    if workspace.connection_generation != generation {
+                    let Some(profile) = workspace.issued_to(&id, generation) else {
                         return;
-                    }
-                    if let Some(profile) = workspace.profile_mut() {
-                        profile.catalog = match result {
-                            Ok(catalog) => CatalogState::Loaded(catalog),
-                            Err(error) => CatalogState::Failed(error.message),
-                        };
-                    }
-                    workspace.refresh_explorer(cx);
+                    };
+                    profile.catalog = match result {
+                        Ok(catalog) => CatalogState::Loaded(catalog),
+                        Err(error) => CatalogState::Failed(error.message),
+                    };
+                    workspace.refresh_explorer(&id, cx);
                     cx.notify();
                 })
                 .ok();
@@ -449,8 +640,8 @@ impl Workspace {
         .detach();
     }
 
-    fn refresh_explorer(&mut self, cx: &mut Context<Self>) {
-        let Some(profile) = self.profile() else {
+    fn refresh_explorer(&mut self, id: &str, cx: &mut Context<Self>) {
+        let Some(profile) = self.profiles.iter().find(|profile| profile.id == id) else {
             return;
         };
         let filter = profile.session.explorer_filter.read(cx).value();
@@ -463,10 +654,78 @@ impl Workspace {
         };
         let tree = profile.session.explorer_tree.clone();
 
-        if let Some(profile) = self.profile_mut() {
+        if let Some(profile) = self.profiles.iter_mut().find(|profile| profile.id == id) {
             profile.session.explorer_leaves = Arc::new(explorer.leaves);
         }
         tree.update(cx, |tree, cx| tree.set_items(explorer.items, cx));
+    }
+
+    fn activate(&mut self, index: usize, cx: &mut Context<Self>) {
+        if index >= self.profiles.len() {
+            return;
+        }
+        if let Err(message) = self.persist_buffer(cx) {
+            self.note(message, cx);
+        }
+        self.active = index;
+        self.form = None;
+        self.switcher_open = false;
+        self.pending_removal = None;
+        if let Some(profile) = self.profile_mut() {
+            profile.session.editor_needs_focus = true;
+            profile.session.pending_delete = None;
+        }
+        self.connect_active(cx);
+        cx.notify();
+    }
+
+    fn cycle_profile(&mut self, step: isize, cx: &mut Context<Self>) {
+        if self.profiles.len() < 2 || self.form.is_some() {
+            return;
+        }
+        let count = self.profiles.len() as isize;
+        let index = (self.active as isize + step).rem_euclid(count) as usize;
+        self.activate(index, cx);
+    }
+
+    fn next_profile(&mut self, _: &NextProfile, _: &mut Window, cx: &mut Context<Self>) {
+        self.cycle_profile(1, cx);
+    }
+
+    fn previous_profile(&mut self, _: &PreviousProfile, _: &mut Window, cx: &mut Context<Self>) {
+        self.cycle_profile(-1, cx);
+    }
+
+    fn remove_profile(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(profile) = self.profiles.get(index) else {
+            return;
+        };
+        let id = profile.id.clone();
+        let name = profile.name.clone();
+        if self.pending_removal.as_deref() != Some(&id) {
+            self.pending_removal = Some(id);
+            cx.notify();
+            return;
+        }
+        if index == self.active
+            && let Err(message) = self.persist_buffer(cx)
+        {
+            self.note(message, cx);
+            return;
+        }
+
+        self.profiles.remove(index);
+        store::delete_password(&id);
+        self.pending_removal = None;
+        self.active = self.active.min(self.profiles.len().saturating_sub(1));
+        self.remember_profiles(cx);
+        if self.profiles.is_empty() {
+            self.form = Some(ConnectionForm::new(None, window, cx));
+        } else {
+            self.connect_active(cx);
+            self.note(format!("Removed {name}."), cx);
+        }
+        cx.notify();
     }
 
     fn open_explorer_target(&mut self, target: ExplorerTarget, cx: &mut Context<Self>) {
@@ -530,8 +789,11 @@ impl Workspace {
         let Some(profile) = self.profile() else {
             return;
         };
-        let connection = profile.connection.clone();
-        let generation = self.connection_generation;
+        let Some(connection) = profile.connection() else {
+            return;
+        };
+        let id = profile.id.clone();
+        let generation = profile.generation;
         let structure_task = cx.background_executor().spawn({
             let (schema, relation) = (schema.clone(), relation.clone());
             async move { connection.structure(&schema, &relation) }
@@ -541,14 +803,13 @@ impl Workspace {
             let result = structure_task.await;
             workspace
                 .update(cx, |workspace, cx| {
-                    if workspace.connection_generation != generation {
+                    let Some(profile) = workspace.issued_to(&id, generation) else {
                         return;
-                    }
+                    };
                     // A second click while this was in flight has already
                     // replaced the surface, and one relation's columns under
                     // another's name is worse than no columns at all.
-                    if let Some(profile) = workspace.profile_mut()
-                        && let Content::Preview(preview) = &mut profile.session.content
+                    if let Content::Preview(preview) = &mut profile.session.content
                         && preview.schema == schema
                         && preview.relation == relation
                     {
@@ -593,6 +854,11 @@ impl Workspace {
     /// Return to the editor. Without this the routine and preview surfaces are
     /// one-way doors, since they replace the editor entirely.
     fn show_editor(&mut self, _: &ShowEditor, _: &mut Window, cx: &mut Context<Self>) {
+        if self.form.is_some() && !self.profiles.is_empty() {
+            self.form = None;
+            cx.notify();
+            return;
+        }
         let Some(profile) = self.profile_mut() else {
             return;
         };
@@ -629,6 +895,138 @@ impl Workspace {
         self.execute_sql(sql, cx);
     }
 
+    fn persist_buffer(&self, cx: &App) -> Result<(), String> {
+        let Some(profile) = self.profile() else {
+            return Ok(());
+        };
+        let sql = profile.session.editor.read(cx).value().to_string();
+        match &profile.session.open_query {
+            Some(name) => store::write_query(&profile.id, name, &sql),
+            None => store::write_scratch(&profile.id, &sql),
+        }
+    }
+
+    fn save_query(&mut self, _: &SaveQuery, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(profile) = self.profile_mut() else {
+            return;
+        };
+        if profile.session.open_query.is_none() {
+            profile.session.naming = true;
+            profile.session.notice = None;
+            cx.notify();
+            return;
+        }
+        match self.persist_buffer(cx) {
+            Ok(()) => self.note("Saved query.".into(), cx),
+            Err(message) => self.note(message, cx),
+        }
+    }
+
+    fn confirm_save(&mut self, cx: &mut Context<Self>) {
+        let Some(profile) = self.profile() else {
+            return;
+        };
+        let name = profile.session.save_name.read(cx).value().trim().to_string();
+        if let Err(message) = store::validate_query_name(&name) {
+            self.note(message, cx);
+            return;
+        }
+        let id = profile.id.clone();
+        let sql = profile.session.editor.read(cx).value().to_string();
+        if let Err(message) = store::write_query(&id, &name, &sql) {
+            self.note(message, cx);
+            return;
+        }
+        if let Some(profile) = self.profile_mut() {
+            profile.session.open_query = Some(name.clone());
+            profile.session.saved_queries = store::saved_queries(&id);
+            profile.session.naming = false;
+            profile.session.notice = Some(format!("Saved {name}."));
+        }
+        self.remember_profiles(cx);
+        cx.notify();
+    }
+
+    fn new_query(&mut self, _: &NewQuery, window: &mut Window, cx: &mut Context<Self>) {
+        if let Err(message) = self.persist_buffer(cx) {
+            self.note(message, cx);
+            return;
+        }
+        let Some(profile) = self.profile_mut() else {
+            return;
+        };
+        profile.session.open_query = None;
+        profile.session.content = Content::Query;
+        profile.session.query = QueryState::Idle;
+        profile.session.naming = false;
+        profile.session.notice = None;
+        profile
+            .session
+            .editor
+            .update(cx, |editor, cx| editor.set_value("", window, cx));
+        profile.session.editor_needs_focus = true;
+        self.remember_profiles(cx);
+        cx.notify();
+    }
+
+    fn open_saved_query(
+        &mut self,
+        name: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Err(message) = self.persist_buffer(cx) {
+            self.note(message, cx);
+            return;
+        }
+        let Some(profile) = self.profile_mut() else {
+            return;
+        };
+        let Some(sql) = store::read_query(&profile.id, &name) else {
+            profile.session.saved_queries = store::saved_queries(&profile.id);
+            profile.session.notice = Some(format!("{name} no longer exists."));
+            cx.notify();
+            return;
+        };
+        profile
+            .session
+            .editor
+            .update(cx, |editor, cx| editor.set_value(sql, window, cx));
+        profile.session.open_query = Some(name);
+        profile.session.content = Content::Query;
+        profile.session.query = QueryState::Idle;
+        profile.session.editor_needs_focus = true;
+        profile.session.notice = None;
+        self.remember_profiles(cx);
+        cx.notify();
+    }
+
+    fn delete_saved_query(&mut self, name: String, cx: &mut Context<Self>) {
+        let Some(profile) = self.profile_mut() else {
+            return;
+        };
+        if profile.session.pending_delete.as_deref() != Some(&name) {
+            profile.session.pending_delete = Some(name);
+            cx.notify();
+            return;
+        }
+        let id = profile.id.clone();
+        if let Err(message) = store::delete_query(&id, &name) {
+            self.note(message, cx);
+            return;
+        }
+        if let Some(profile) = self.profile_mut() {
+            if profile.session.open_query.as_deref() == Some(&name) {
+                profile.session.open_query = None;
+            }
+            profile.session.saved_queries = store::saved_queries(&id);
+            profile.session.pending_delete = None;
+            profile.session.notice = Some(format!("Deleted {name}."));
+        }
+        self.remember_profiles(cx);
+        cx.notify();
+    }
+
     /// Run `sql` against the active profile.
     ///
     /// There is deliberately no "not connected" branch: SQL is only reachable
@@ -645,7 +1043,16 @@ impl Workspace {
             return;
         }
 
-        let connection = profile.connection.clone();
+        let Some(connection) = profile.connection() else {
+            profile.session.query = QueryState::Failed(DbError {
+                message: "The connection is not open.".into(),
+                position: None,
+            });
+            cx.notify();
+            return;
+        };
+        let id = profile.id.clone();
+        let generation = profile.generation;
         let results = profile.session.results.clone();
         profile.session.query = QueryState::Running;
 
@@ -657,7 +1064,6 @@ impl Workspace {
         });
         cx.notify();
 
-        let generation = self.connection_generation;
         let query_task = cx
             .background_executor()
             .spawn(async move { connection.query(&sql) });
@@ -666,10 +1072,7 @@ impl Workspace {
             let result = query_task.await;
             workspace
                 .update(cx, |workspace, cx| {
-                    if workspace.connection_generation != generation {
-                        return;
-                    }
-                    let Some(profile) = workspace.profile_mut() else {
+                    let Some(profile) = workspace.issued_to(&id, generation) else {
                         return;
                     };
 
@@ -720,14 +1123,8 @@ impl Workspace {
 
     fn render_connection_form(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let t = *theme(cx);
-        let connecting = matches!(self.connection, ConnectionState::Connecting { .. });
-        let message = self.connection_form.error.as_ref().cloned().or_else(|| {
-            if let ConnectionState::Failed(message) = &self.connection {
-                Some(message.clone())
-            } else {
-                None
-            }
-        });
+        let form = self.form.as_ref().expect("form is rendered only while open");
+        let message = form.error.clone();
 
         div()
             .size_full()
@@ -757,21 +1154,20 @@ impl Workspace {
                             .text_color(t.text_muted)
                             .child("Paste a connection URL or enter the profile fields."),
                     )
-                    .child(self.form_field("Connection URL", &self.connection_form.url, cx))
+                    .child(self.form_field("Connection URL", &form.url, cx))
                     .child(
                         div().flex().justify_end().child(
                             Button::new("apply-connection-url")
                                 .label("Use URL")
-                                .disabled(connecting)
                                 .on_click(cx.listener(Self::apply_connection_url)),
                         ),
                     )
-                    .child(self.form_field("Display name", &self.connection_form.name, cx))
-                    .child(self.form_field("Host", &self.connection_form.host, cx))
-                    .child(self.form_field("Port", &self.connection_form.port, cx))
-                    .child(self.form_field("Database", &self.connection_form.database, cx))
-                    .child(self.form_field("Username", &self.connection_form.user, cx))
-                    .child(self.form_field("Password", &self.connection_form.password, cx))
+                    .child(self.form_field("Display name", &form.name, cx))
+                    .child(self.form_field("Host", &form.host, cx))
+                    .child(self.form_field("Port", &form.port, cx))
+                    .child(self.form_field("Database", &form.database, cx))
+                    .child(self.form_field("Username", &form.user, cx))
+                    .child(self.form_field("Password", &form.password, cx))
                     .children(message.map(|message| {
                         div()
                             .text_size(px(layout::TEXT_SM))
@@ -780,13 +1176,8 @@ impl Workspace {
                     }))
                     .child(
                         Button::new("connect")
-                            .label(if connecting {
-                                "Connecting…"
-                            } else {
-                                "Connect"
-                            })
+                            .label("Connect")
                             .primary()
-                            .disabled(connecting)
                             .on_click(cx.listener(Self::connect)),
                     ),
             )
@@ -1097,7 +1488,217 @@ impl Workspace {
             .into_any_element()
     }
 
-    fn render_explorer(profile: &Profile, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_saved_queries(profile: &Profile, cx: &mut Context<Self>) -> AnyElement {
+        let t = *theme(cx);
+        let workspace = cx.entity().downgrade();
+        let mut rows = profile
+            .session
+            .saved_queries
+            .iter()
+            .enumerate()
+            .map(|(index, name)| {
+                let open_name = name.clone();
+                let delete_name = name.clone();
+                let open_workspace = workspace.clone();
+                let delete_workspace = workspace.clone();
+                let pending = profile.session.pending_delete.as_deref() == Some(name);
+                div()
+                    .id(("saved-query", index))
+                    .h(px(30.))
+                    .flex()
+                    .items_center()
+                    .gap(px(layout::SPACE_SM))
+                    .px(px(layout::SPACE_SM))
+                    .text_color(t.text_muted)
+                    .hover(|style| style.bg(t.element_hover))
+                    .child(row_icon(t, icon::SAVED_QUERY))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .whitespace_nowrap()
+                            .child(name.clone()),
+                    )
+                    .child(
+                        Button::new(("delete-query", index))
+                            .label(if pending { "Delete?" } else { "" })
+                            .icon(icon(icon::DELETE))
+                            .ghost()
+                            .xsmall()
+                            .on_click(move |_, _, cx| {
+                                _ = delete_workspace.update(cx, |workspace, cx| {
+                                    workspace.delete_saved_query(delete_name.clone(), cx);
+                                });
+                            }),
+                    )
+                    .on_click(move |_, window, cx| {
+                        _ = open_workspace.update(cx, |workspace, cx| {
+                            workspace.open_saved_query(open_name.clone(), window, cx);
+                        });
+                    })
+                    .into_any_element()
+            })
+            .collect::<Vec<_>>();
+
+        if profile.session.naming {
+            let workspace = workspace.clone();
+            rows.push(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(layout::SPACE_XS))
+                    .p(px(layout::SPACE_SM))
+                    .child(Input::new(&profile.session.save_name).flex_1())
+                    .child(
+                        Button::new("confirm-save-query")
+                            .label("Save")
+                            .small()
+                            .on_click(move |_, _, cx| {
+                                _ = workspace.update(cx, |workspace, cx| {
+                                    workspace.confirm_save(cx);
+                                });
+                            }),
+                    )
+                    .into_any_element(),
+            );
+        }
+
+        div()
+            .flex_shrink_0()
+            .border_t_1()
+            .border_color(t.border)
+            .child(
+                div()
+                    .px(px(layout::SPACE_SM))
+                    .pt(px(layout::SPACE_SM))
+                    .child(section_label(t, "Saved queries")),
+            )
+            .child(
+                div()
+                    .id("saved-query-scroll")
+                    .max_h(px(148.))
+                    .overflow_y_scroll()
+                    .children(rows),
+            )
+            .into_any_element()
+    }
+
+    fn render_profile_switcher(&self, cx: &mut Context<Self>) -> AnyElement {
+        let t = *theme(cx);
+        let workspace = cx.entity().downgrade();
+        let profile_rows = self
+            .profiles
+            .iter()
+            .enumerate()
+            .map(|(index, profile)| {
+                let activate_workspace = workspace.clone();
+                let remove_workspace = workspace.clone();
+                let pending = self.pending_removal.as_deref() == Some(&profile.id);
+                div()
+                    .id(("profile", index))
+                    .h(px(34.))
+                    .flex()
+                    .items_center()
+                    .gap(px(layout::SPACE_SM))
+                    .px(px(layout::SPACE_SM))
+                    .hover(|style| style.bg(t.element_hover))
+                    .child(row_icon(t, icon::DATABASE))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .whitespace_nowrap()
+                            .child(profile.name.clone()),
+                    )
+                    .child(
+                        Button::new(("remove-profile", index))
+                            .label(if pending { "Remove?" } else { "" })
+                            .icon(icon(icon::DELETE))
+                            .ghost()
+                            .xsmall()
+                            .on_click(move |_, window, cx| {
+                                _ = remove_workspace.update(cx, |workspace, cx| {
+                                    workspace.remove_profile(index, window, cx);
+                                });
+                            }),
+                    )
+                    .on_click(move |_, _, cx| {
+                        _ = activate_workspace.update(cx, |workspace, cx| {
+                            workspace.activate(index, cx);
+                        });
+                    })
+                    .into_any_element()
+            })
+            .collect::<Vec<_>>();
+        let active_name = self
+            .profile()
+            .map(|profile| profile.name.clone())
+            .unwrap_or_else(|| "Connections".into());
+        let toggle_workspace = workspace.clone();
+        let add_workspace = workspace.clone();
+
+        div()
+            .flex_shrink_0()
+            .border_t_1()
+            .border_color(t.border)
+            .children(self.switcher_open.then(|| {
+                div()
+                    .border_b_1()
+                    .border_color(t.border)
+                    .children(profile_rows)
+                    .child(
+                        Button::new("new-connection")
+                            .label("Add connection")
+                            .icon(icon(icon::DATABASE))
+                            .ghost()
+                            .w_full()
+                            .on_click(move |_, window, cx| {
+                                _ = add_workspace.update(cx, |workspace, cx| {
+                                    workspace.form =
+                                        Some(ConnectionForm::new(None, window, cx));
+                                    workspace.switcher_open = false;
+                                    cx.notify();
+                                });
+                            }),
+                    )
+            }))
+            .child(
+                div()
+                    .id("profile-switcher")
+                    .h(px(40.))
+                    .flex()
+                    .items_center()
+                    .gap(px(layout::SPACE_SM))
+                    .px(px(layout::SPACE_SM))
+                    .hover(|style| style.bg(t.element_hover))
+                    .child(row_icon(t, icon::DATABASE))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .whitespace_nowrap()
+                            .font_weight(FontWeight::MEDIUM)
+                            .child(active_name),
+                    )
+                    .child(row_icon(t, icon::SWITCHER))
+                    .on_click(move |_, _, cx| {
+                        _ = toggle_workspace.update(cx, |workspace, cx| {
+                            workspace.switcher_open = !workspace.switcher_open;
+                            workspace.pending_removal = None;
+                            cx.notify();
+                        });
+                    }),
+            )
+            .into_any_element()
+    }
+
+    fn render_explorer(&self, profile: &Profile, cx: &mut Context<Self>) -> impl IntoElement {
         let t = *theme(cx);
         let workspace = cx.entity().downgrade();
         let leaves = profile.session.explorer_leaves.clone();
@@ -1201,6 +1802,8 @@ impl Workspace {
                 ),
             )
             .child(div().flex_1().min_h_0().child(content))
+            .child(Self::render_saved_queries(profile, cx))
+            .child(self.render_profile_switcher(cx))
     }
 }
 
@@ -1221,20 +1824,7 @@ impl Render for Workspace {
             editor.focus_handle(cx).focus(window);
         }
 
-        let (status, status_color) = match &self.connection {
-            ConnectionState::NotConfigured => {
-                ("No connection configured.".to_string(), t.text_muted)
-            }
-            ConnectionState::Connecting { endpoint } => {
-                (format!("Connecting to {endpoint}…"), t.text_muted)
-            }
-            ConnectionState::Connected(profile) => (
-                format!("{} · {}", profile.name, profile.config.endpoint()),
-                t.success,
-            ),
-            ConnectionState::Failed(message) => (message.clone(), t.danger),
-        };
-        let Some(profile) = self.profile() else {
+        if self.form.is_some() {
             return div()
                 .id("connection-form")
                 .size_full()
@@ -1244,6 +1834,9 @@ impl Render for Workspace {
                 .flex()
                 .flex_col()
                 .on_action(cx.listener(Self::cycle_theme))
+                .on_action(cx.listener(Self::show_editor))
+                .on_action(cx.listener(Self::next_profile))
+                .on_action(cx.listener(Self::previous_profile))
                 // Without a titlebar of its own the form has no drag handle at
                 // all, since the platform's is transparent.
                 .child(titlebar(t, None))
@@ -1253,6 +1846,22 @@ impl Render for Workspace {
                         .min_h_0()
                         .child(self.render_connection_form(cx)),
                 );
+        }
+        let Some(profile) = self.profile() else {
+            unreachable!("the connection form is open when there are no profiles");
+        };
+        let failed = matches!(profile.state, ProfileState::Failed(_));
+        let (status, status_color) = match &profile.state {
+            ProfileState::Idle => ("Connection is idle.".to_string(), t.text_muted),
+            ProfileState::Connecting => (
+                format!("Connecting to {}…", profile.config.endpoint()),
+                t.text_muted,
+            ),
+            ProfileState::Connected(_) => (
+                format!("{} · {}", profile.name, profile.config.endpoint()),
+                t.success,
+            ),
+            ProfileState::Failed(message) => (message.clone(), t.danger),
         };
 
         let result_lines = match &profile.session.query {
@@ -1285,12 +1894,18 @@ impl Render for Workspace {
             } => Some(format!("{rows} row(s) · {bytes} bytes · {elapsed:.1?}")),
             _ => None,
         };
+        let notice = profile.session.notice.clone();
 
         div()
             .id("workspace")
             .on_action(cx.listener(Self::run_query))
             .on_action(cx.listener(Self::show_editor))
             .on_action(cx.listener(Self::cycle_theme))
+            .on_action(cx.listener(Self::save_query))
+            .on_action(cx.listener(Self::new_query))
+            .on_action(cx.listener(Self::next_profile))
+            .on_action(cx.listener(Self::previous_profile))
+            .on_action(cx.listener(Self::open_connection_form))
             .size_full()
             // The shell is the chrome tone: titlebar, sidebar and status bar
             // paint nothing of their own, they are this. The content card below
@@ -1306,7 +1921,7 @@ impl Render for Workspace {
                     .flex_1()
                     .min_h_0()
                     .flex()
-                    .child(Self::render_explorer(profile, cx))
+                    .child(self.render_explorer(profile, cx))
                     .child(
                         div()
                             .flex_1()
@@ -1347,13 +1962,12 @@ impl Render for Workspace {
                     )
                     .child(
                         div()
-                            .text_color(if matches!(self.connection, ConnectionState::Failed(_)) {
-                                t.danger
-                            } else {
-                                t.text_muted
-                            })
+                            .text_color(if failed { t.danger } else { t.text_muted })
                             .child(status),
                     )
+                    .children(notice.map(|notice| {
+                        div().text_color(t.text_muted).child(notice)
+                    }))
                     .children(query_status.map(|query_status| {
                         div().ml_auto().text_color(t.text_faint).child(query_status)
                     })),
@@ -1491,12 +2105,25 @@ fn connection_config_from_environment() -> Result<Option<ConnectionConfig>, Stri
 
 fn main() {
     Application::new().with_assets(Icons).run(|cx: &mut App| {
+        cx.text_system()
+            .add_fonts(
+                guic_gpui_assets::BUNDLED_FONTS
+                    .iter()
+                    .map(|font| Cow::Borrowed(*font))
+                    .collect(),
+            )
+            .expect("bundled fonts must be loadable");
         gpui_component::init(cx);
         let theme = Theme::default();
         theme.apply_to_components(cx);
         cx.set_global(theme);
         cx.bind_keys([
             KeyBinding::new("cmd-enter", RunQuery, None),
+            KeyBinding::new("cmd-s", SaveQuery, None),
+            KeyBinding::new("cmd-n", NewQuery, None),
+            KeyBinding::new("cmd-shift-n", NewConnection, None),
+            KeyBinding::new("ctrl-tab", NextProfile, None),
+            KeyBinding::new("ctrl-shift-tab", PreviousProfile, None),
             KeyBinding::new("escape", ShowEditor, None),
             KeyBinding::new("cmd-shift-t", CycleTheme, None),
         ]);

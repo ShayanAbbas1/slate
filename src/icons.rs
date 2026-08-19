@@ -22,11 +22,14 @@ use icondata_core::IconData;
 /// The gpui-component widgets ask for their own paths — those are Lucide names
 /// too, so they resolve here as well. Add a row when something asks for one;
 /// an unlisted path simply draws nothing.
-const ICONS: [(&str, &IconData); 22] = [
+const ICONS: [(&str, &IconData); 25] = [
     ("icons/chevron-down.svg", icondata_lu::LuChevronDown),
     ("icons/chevron-right.svg", icondata_lu::LuChevronRight),
     ("icons/chevron-left.svg", icondata_lu::LuChevronLeft),
     ("icons/chevron-up.svg", icondata_lu::LuChevronUp),
+    ("icons/chevrons-up-down.svg", icondata_lu::LuChevronsUpDown),
+    ("icons/file-code.svg", icondata_lu::LuFileCode),
+    ("icons/trash.svg", icondata_lu::LuTrash2),
     ("icons/check.svg", icondata_lu::LuCheck),
     ("icons/close.svg", icondata_lu::LuX),
     ("icons/ellipsis.svg", icondata_lu::LuEllipsis),
@@ -52,6 +55,9 @@ const ICONS: [(&str, &IconData); 22] = [
 pub mod icon {
     pub const CHEVRON_DOWN: &str = "icons/chevron-down.svg";
     pub const CHEVRON_RIGHT: &str = "icons/chevron-right.svg";
+    pub const SWITCHER: &str = "icons/chevrons-up-down.svg";
+    pub const SAVED_QUERY: &str = "icons/file-code.svg";
+    pub const DELETE: &str = "icons/trash.svg";
     pub const SEARCH: &str = "icons/search.svg";
     pub const DATABASE: &str = "icons/database.svg";
     pub const TABLE: &str = "icons/table.svg";
@@ -115,6 +121,9 @@ mod tests {
         for path in [
             icon::CHEVRON_DOWN,
             icon::CHEVRON_RIGHT,
+            icon::SWITCHER,
+            icon::SAVED_QUERY,
+            icon::DELETE,
             icon::SEARCH,
             icon::DATABASE,
             icon::TABLE,

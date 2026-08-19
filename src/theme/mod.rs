@@ -205,6 +205,8 @@ impl Theme {
         component.radius_lg = gpui::px(layout::RADIUS_LARGE);
         component.font_size = gpui::px(layout::TEXT_MD);
         component.mono_font_size = gpui::px(layout::TEXT_MD);
+        component.font_family = ".ZedSans".into();
+        component.mono_font_family = ".ZedMono".into();
 
         component.colors.background = self.bg.into();
         component.colors.foreground = self.text.into();
