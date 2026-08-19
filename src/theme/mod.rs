@@ -9,10 +9,13 @@
 //!    against its background in the tests below. A palette edit that breaks
 //!    WCAG AA fails the build.
 //!
-//! Dark and light are designed separately rather than mirrored. In dark, the
-//! content plane is the darkest surface and chrome sits one step lighter; in
-//! light, the content plane is white and chrome sits one step darker. Inverting
-//! lightness would put the elevation the wrong way round.
+//! Dark and light are designed separately rather than mirrored, but they share
+//! one elevation rule: **the closer a surface is to the data, the more light it
+//! gets.** Results are the brightest plane, the editor sits one tone behind
+//! them, and chrome recedes furthest — never near-black anywhere, which reads
+//! as a hole rather than a surface. Tone steps, not hairlines, are what
+//! separate the planes; borders are reserved for floating overlays. The one
+//! structural seam, the sidebar edge, is drawn by its drag handle.
 
 pub mod color;
 
@@ -40,7 +43,6 @@ pub mod layout {
     pub const TEXT_SM: f32 = 12.0;
     pub const TEXT_MD: f32 = 13.0;
     pub const TEXT_LG: f32 = 16.0;
-    pub const TEXT_XL: f32 = 19.0;
 
     /// One icon size everywhere. Icons here label rows and buttons; nothing in
     /// Slate is an illustration, so a second size would only be decoration.
@@ -55,7 +57,12 @@ pub mod layout {
     /// platform's window buttons, which are drawn over it.
     pub const TITLEBAR_LEADING_INSET: f32 = 78.0;
     pub const STATUS_HEIGHT: f32 = 24.0;
-    pub const EDITOR_HEADER_HEIGHT: f32 = 28.0;
+    pub const TAB_HEIGHT: f32 = 34.0;
+    /// Query tabs are chips inside the titlebar, so they get a chip height
+    /// rather than the full bar.
+    pub const TITLEBAR_TAB_HEIGHT: f32 = 26.0;
+    pub const SWITCHER_HEIGHT: f32 = 40.0;
+    pub const EDITOR_HEADER_HEIGHT: f32 = 30.0;
     pub const EDITOR_EMPTY_HEIGHT: f32 = 680.0;
     pub const EDITOR_DEFAULT_HEIGHT: f32 = 420.0;
     pub const EDITOR_MIN_HEIGHT: f32 = 120.0;
@@ -139,6 +146,12 @@ fn neutral(lightness: f32) -> Srgb {
 
 const WHITE: Srgb = Srgb::new(1.0, 1.0, 1.0);
 const BLACK: Srgb = Srgb::new(0.0, 0.0, 0.0);
+const TRANSPARENT: Rgba = Rgba {
+    r: 0.0,
+    g: 0.0,
+    b: 0.0,
+    a: 0.0,
+};
 
 /// Every colour Slate paints. Flat fields, not nested groups — a token you have
 /// to go looking for gets duplicated instead of reused.
@@ -151,17 +164,30 @@ pub struct Theme {
     pub name: &'static str,
     pub appearance: Appearance,
 
-    /// The content plane, and the deepest tone. The editor sits on this.
+    /// The content plane, and the brightest tone: the results. The data is
+    /// what Slate exists to show, so it gets the most light.
     pub bg: Srgb,
-    /// One step from `bg`: results, structure, anything the editor sits above.
-    /// Three planes rather than two because an editor over a grid over a sidebar
-    /// is three surfaces, and two tones make one of the boundaries invisible.
+    /// One step behind `bg`: the editor's page and the active tab — the
+    /// prompt, not the answer. Three planes rather than two because an editor
+    /// over a grid over a sidebar is three surfaces, and two tones make one of
+    /// the boundaries invisible.
     pub panel: Srgb,
-    /// Chrome, furthest from `bg`: sidebar, titlebar, status bar, table headers.
+    /// Chrome, furthest back: sidebar, titlebar, status bar, table headers.
     pub surface: Srgb,
+    /// The floating plane: the connection switcher and anything else that sits
+    /// over chrome. One step past `surface` in dark themes; in light themes it
+    /// stays white and earns its elevation from a border and shadow instead,
+    /// because "lighter than white" does not exist.
+    pub overlay: Srgb,
 
     pub element_hover: Rgba,
     pub element_active: Rgba,
+
+    /// A control that must read as pressable at rest: buttons. A solid tone of
+    /// its own rather than a wash, because a wash only reads as a button once
+    /// the pointer is already on it. Deliberately neutral — a coloured button
+    /// shouts in an interface that is otherwise tone-on-tone.
+    pub control: Srgb,
 
     pub border: Rgba,
     pub border_strong: Rgba,
@@ -191,8 +217,8 @@ pub struct Theme {
 impl Theme {
     /// Every theme Slate ships, in the order the switcher cycles them. The
     /// first is the default.
-    pub fn all() -> [Self; 3] {
-        [Self::dark(), Self::coolnight(), Self::light()]
+    pub fn all() -> [Self; 2] {
+        [Self::dark(), Self::light()]
     }
 
     /// The theme after this one, by name. Falls back to the default, so a theme
@@ -226,15 +252,21 @@ impl Theme {
         component.colors.ring = self.accent.into();
         component.colors.muted = self.surface.into();
         component.colors.muted_foreground = self.text_muted.into();
-        // Without these the primary button paints gpui-component's own blue.
-        component.colors.primary = self.accent.into();
-        component.colors.primary_foreground = self.on_accent.into();
-        component.colors.primary_hover = self.element_hover.flatten(self.accent).into();
-        component.colors.primary_active = self.element_active.flatten(self.accent).into();
-        component.colors.secondary = self.panel.into();
+        component.colors.popover = self.overlay.into();
+        component.colors.popover_foreground = self.text.into();
+        // Both button variants are the same neutral: a Slate button is a grey
+        // that steps visibly brighter under the pointer, never a colour.
+        // Colour is reserved for state (selection, danger), not for controls.
+        let control_hover = self.element_active.flatten(self.control);
+        let control_active = self.element_active.flatten(control_hover);
+        component.colors.primary = self.control.into();
+        component.colors.primary_foreground = self.text.into();
+        component.colors.primary_hover = control_hover.into();
+        component.colors.primary_active = control_active.into();
+        component.colors.secondary = self.control.into();
         component.colors.secondary_foreground = self.text.into();
-        component.colors.secondary_hover = self.element_hover.flatten(self.panel).into();
-        component.colors.secondary_active = self.element_active.flatten(self.panel).into();
+        component.colors.secondary_hover = control_hover.into();
+        component.colors.secondary_active = control_active.into();
         // What a ghost button washes with on hover -- the tab pair lives on it.
         component.colors.accent = self.element_hover.flatten(self.panel).into();
         component.colors.accent_foreground = self.text.into();
@@ -255,14 +287,16 @@ impl Theme {
         component.colors.scrollbar = self.panel.into();
         component.colors.scrollbar_thumb = self.border_strong.into();
         component.colors.scrollbar_thumb_hover = self.element_active.into();
-        component.colors.table = self.panel.into();
+        component.colors.table = self.bg.into();
         component.colors.table_active = self.selection.into();
         component.colors.table_active_border = self.accent.into();
         component.colors.table_even = self.element_hover.into();
-        component.colors.table_head = self.surface.into();
+        component.colors.table_head = self.panel.into();
         component.colors.table_head_foreground = self.text_muted.into();
         component.colors.table_hover = self.element_hover.into();
-        component.colors.table_row_border = self.border.into();
+        // Stripes carry the rows; a hairline under every row as well is the
+        // grid equivalent of ruled paper under print.
+        component.colors.table_row_border = TRANSPARENT.into();
         component.highlight_theme = self.highlight_theme();
     }
 
@@ -324,7 +358,7 @@ impl Theme {
                 Appearance::Light => ThemeMode::Light,
             },
             style: HighlightThemeStyle {
-                editor_background: Some(self.bg.into()),
+                editor_background: Some(self.panel.into()),
                 editor_foreground: Some(self.text.into()),
                 editor_active_line: Some(self.element_hover.into()),
                 editor_line_number: Some(self.text_faint.into()),
@@ -335,98 +369,50 @@ impl Theme {
         })
     }
 
-    /// Coolnight — a deep-navy dark theme, after Josean Martínez's colourscheme
-    /// of that name. Slate's own palette is neutral by design; this one is here
-    /// because a client you stare at all day is allowed to have a colour.
-    ///
-    /// The tones are spread wider than the original's: an editor over a grid
-    /// over a sidebar is three planes, and Coolnight's own steps are close
-    /// enough together to read as one rectangle at Slate's density.
-    pub fn coolnight() -> Self {
-        let hex = Srgb::from_hex;
-        // The pale end of the ramp, used at low alpha for hairlines and washes
-        // so both pick up the palette's blue instead of greying it out.
-        let haze = hex(0x9FD9F6);
-
-        Self {
-            name: "Coolnight",
-            appearance: Appearance::Dark,
-
-            bg: hex(0x00111E),
-            panel: hex(0x021C30),
-            surface: hex(0x032A46),
-
-            element_hover: haze.alpha(0.06),
-            element_active: haze.alpha(0.12),
-
-            border: haze.alpha(0.12),
-            border_strong: haze.alpha(0.22),
-
-            text: hex(0xCBE0F0),
-            text_muted: hex(0x7EA3BF),
-            text_faint: hex(0x4E7CA6),
-
-            accent: hex(0x0FC5ED),
-            on_accent: hex(0x00111E),
-            selection: hex(0x0FC5ED).alpha(0.28),
-            cursor: hex(0x24EAF7),
-
-            // Lifted off Coolnight's own #E52E2E, which clears WCAG only at
-            // heading size. Slate writes query errors in it at body size.
-            danger: hex(0xFF6363),
-            success: hex(0x44FFB1),
-
-            // Coolnight's comment is #4E7CA6; at body size on this background it
-            // lands just under AA, so comments take its lighter doc-comment tone.
-            syntax_comment: hex(0x5E8CB6),
-            syntax_keyword: hex(0xA277FF),
-            syntax_string: hex(0x44FFB1),
-            syntax_number: hex(0xFFE073),
-            syntax_function: hex(0x0FC5ED),
-            syntax_type: hex(0x24EAF7),
-            syntax_variable: hex(0xCBE0F0),
-            syntax_operator: hex(0x8FB6CF),
-        }
-    }
-
+    /// The tones run chrome → editor → results, dark grey to lighter grey:
+    /// the answer gets the light, the prompt sits a step behind it. Near-black
+    /// is deliberately absent: a plane at 4% lightness reads as a void.
     pub fn dark() -> Self {
         Self {
             name: "Slate Dark",
             appearance: Appearance::Dark,
 
-            bg: neutral(0.145),
-            panel: neutral(0.200),
-            surface: neutral(0.250),
+            bg: neutral(0.300),
+            panel: neutral(0.260),
+            surface: neutral(0.220),
+            overlay: neutral(0.350),
 
             element_hover: WHITE.alpha(0.05),
             element_active: WHITE.alpha(0.09),
 
+            control: neutral(0.380),
+
             border: WHITE.alpha(HAIRLINE_DARK),
             border_strong: WHITE.alpha(0.16),
 
-            // Not a pure white. On a near-black plane the last few percent of
-            // lightness reads as glare rather than crispness, and a dense result
-            // grid is where that gets tiring.
+            // Not a pure white. The last few percent of lightness reads as
+            // glare rather than crispness, and a dense result grid is where
+            // that gets tiring.
             text: neutral(0.93),
-            text_muted: neutral(0.74),
-            text_faint: neutral(0.58),
+            text_muted: neutral(0.76),
+            text_faint: neutral(0.62),
 
             accent: Oklch::new(0.68, 0.15, 250.0).to_srgb(),
             on_accent: neutral(0.14),
             selection: Oklch::new(0.68, 0.15, 250.0).to_srgb().alpha(0.28),
             cursor: Oklch::new(0.72, 0.14, 250.0).to_srgb(),
 
-            danger: Oklch::new(0.68, 0.19, 25.0).to_srgb(),
+            danger: Oklch::new(0.70, 0.19, 25.0).to_srgb(),
             success: Oklch::new(0.72, 0.15, 150.0).to_srgb(),
 
-            syntax_comment: neutral(0.64),
-            syntax_keyword: Oklch::new(0.76, 0.13, 300.0).to_srgb(),
-            syntax_string: Oklch::new(0.76, 0.13, 150.0).to_srgb(),
-            syntax_number: Oklch::new(0.80, 0.12, 75.0).to_srgb(),
-            syntax_function: Oklch::new(0.76, 0.12, 250.0).to_srgb(),
-            syntax_type: Oklch::new(0.78, 0.10, 205.0).to_srgb(),
+            syntax_comment: neutral(0.68),
+            syntax_keyword: Oklch::new(0.78, 0.13, 300.0).to_srgb(),
+            syntax_string: Oklch::new(0.78, 0.13, 150.0).to_srgb(),
+            syntax_number: Oklch::new(0.82, 0.12, 75.0).to_srgb(),
+            syntax_function: Oklch::new(0.78, 0.12, 250.0).to_srgb(),
+            syntax_type: Oklch::new(0.80, 0.10, 205.0).to_srgb(),
             syntax_variable: neutral(0.90),
-            syntax_operator: neutral(0.72),
+            syntax_operator: neutral(0.74),
         }
     }
 
@@ -438,14 +424,19 @@ impl Theme {
             bg: WHITE,
             panel: neutral(0.972),
             surface: neutral(0.940),
+            overlay: WHITE,
 
             element_hover: BLACK.alpha(0.04),
             element_active: BLACK.alpha(0.08),
 
+            control: neutral(0.920),
+
             border: BLACK.alpha(HAIRLINE_LIGHT),
             border_strong: BLACK.alpha(0.20),
 
-            text: neutral(0.22),
+            // Soft ink, not near-black: it keeps the two appearances in the
+            // same contrast neighbourhood now that the dark page is grey.
+            text: neutral(0.26),
             text_muted: neutral(0.45),
             text_faint: neutral(0.58),
 
@@ -502,7 +493,8 @@ mod tests {
                 ("variable", theme.syntax_variable),
                 ("operator", theme.syntax_operator),
             ] {
-                check(theme, name, token, theme.bg, AA_TEXT);
+                // Against the editor's page, which is where SQL is read.
+                check(theme, name, token, theme.panel, AA_TEXT);
             }
         }
     }
@@ -533,6 +525,8 @@ mod tests {
             check(t, "muted on bg", t.text_muted, t.bg, AA_TEXT);
             check(t, "muted on panel", t.text_muted, t.panel, AA_TEXT);
             check(t, "muted on surface", t.text_muted, t.surface, AA_TEXT);
+            check(t, "text on overlay", t.text, t.overlay, AAA_TEXT);
+            check(t, "muted on overlay", t.text_muted, t.overlay, AA_TEXT);
             check(t, "faint on bg", t.text_faint, t.bg, AA_LARGE);
             check(t, "accent on bg", t.accent, t.bg, AA_LARGE);
             // Query errors are written in `danger` at body size, not as a badge.
@@ -540,6 +534,8 @@ mod tests {
             check(t, "danger on panel", t.danger, t.panel, AA_TEXT);
             check(t, "success on surface", t.success, t.surface, AA_LARGE);
             check(t, "on_accent over accent", t.on_accent, t.accent, AA_LARGE);
+            // Button labels are body-size UI text on the control tone.
+            check(t, "text on control", t.text, t.control, AA_TEXT);
         }
     }
 
@@ -555,20 +551,19 @@ mod tests {
 
     #[test]
     fn elevation_runs_the_right_way_in_every_theme() {
+        // One rule for both appearances: the closer to the data, the brighter.
+        // Results over the editor's page over chrome — never a hole.
         for theme in Theme::all() {
-            let lighter = theme.surface.relative_luminance() > theme.bg.relative_luminance();
-            match theme.appearance {
-                Appearance::Dark => assert!(
-                    lighter,
-                    "{}: dark chrome must sit lighter than the content plane",
-                    theme.name
-                ),
-                Appearance::Light => assert!(
-                    !lighter,
-                    "{}: light chrome must sit darker than the content plane",
-                    theme.name
-                ),
-            }
+            assert!(
+                theme.bg.relative_luminance() > theme.panel.relative_luminance(),
+                "{}: results must sit brighter than the editor's page",
+                theme.name
+            );
+            assert!(
+                theme.panel.relative_luminance() > theme.surface.relative_luminance(),
+                "{}: the editor's page must sit brighter than chrome",
+                theme.name
+            );
         }
     }
 

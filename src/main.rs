@@ -11,14 +11,15 @@ use std::{borrow::Cow, collections::HashMap, sync::Arc};
 
 use gpui::{
     AnyElement, App, AppContext, Application, ClickEvent, Context, Entity, EntityInputHandler,
-    Focusable, FontWeight, InteractiveElement, IntoElement, KeyBinding, ParentElement, Render,
-    StatefulInteractiveElement, Styled, TitlebarOptions, Window, WindowOptions, actions, div,
-    point, px,
+    Focusable, FontWeight, InteractiveElement, IntoElement, KeyBinding, Keystroke, ParentElement,
+    Render, StatefulInteractiveElement, Styled, TitlebarOptions, Window, WindowOptions, actions,
+    div, point, prelude::FluentBuilder, px,
 };
 use gpui_component::{
     InteractiveElementExt, Root, Sizable,
     button::{Button, ButtonVariants},
     input::{Input, InputEvent, InputState},
+    kbd::Kbd,
     list::ListItem,
     resizable::{h_resizable, resizable_panel, v_resizable},
     table::{Table, TableState},
@@ -51,7 +52,6 @@ actions!(
     ]
 );
 
-const RETURN_HINT: &str = "esc returns to the editor";
 const EDITOR_FONT_SIZE_DEFAULT: f32 = 14.0;
 const EDITOR_FONT_SIZE_MIN: f32 = 11.0;
 const EDITOR_FONT_SIZE_MAX: f32 = 24.0;
@@ -883,6 +883,12 @@ impl Workspace {
         let next = theme(cx).next();
         next.apply_to_components(cx);
         cx.set_global(next);
+        // The titlebar deliberately no longer names the theme -- permanent
+        // chrome should not narrate a setting -- so the switch itself says
+        // where it landed.
+        if self.profile().is_some() {
+            self.note(format!("Theme: {}", next.name), cx);
+        }
         cx.refresh_windows();
     }
 
@@ -1188,6 +1194,7 @@ impl Workspace {
         let t = *theme(cx);
         let form = self.form.as_ref().expect("form is rendered only while open");
         let message = form.error.clone();
+        let hairline = || div().h(px(1.)).flex_1().bg(t.border);
 
         div()
             .size_full()
@@ -1198,36 +1205,108 @@ impl Workspace {
                 div()
                     .w(px(layout::DIALOG_WIDTH))
                     .p(px(layout::SPACE_LG))
-                    .bg(t.surface)
+                    .bg(t.panel)
                     .border_1()
                     .border_color(t.border)
                     .rounded(px(layout::RADIUS_PANEL))
+                    .shadow_lg()
                     .flex()
                     .flex_col()
                     .gap(px(layout::SPACE_MD))
                     .child(
                         div()
-                            .text_size(px(layout::TEXT_XL))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child("Connect to Postgres"),
+                            .flex()
+                            .items_center()
+                            .gap(px(layout::SPACE_MD))
+                            .child(
+                                div()
+                                    .size(px(28.))
+                                    .flex_shrink_0()
+                                    .rounded(px(layout::RADIUS_CONTROL))
+                                    .bg(t.element_active)
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .child(
+                                        icon(icon::DATABASE)
+                                            .size(px(layout::ICON_SIZE))
+                                            .text_color(t.accent),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .child(
+                                        div()
+                                            .text_size(px(layout::TEXT_LG))
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .child("Connect to Postgres"),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(layout::TEXT_SM))
+                                            .text_color(t.text_muted)
+                                            .child("Paste a URL, or fill in the fields."),
+                                    ),
+                            ),
                     )
                     .child(
                         div()
-                            .text_size(px(layout::TEXT_SM))
-                            .text_color(t.text_muted)
-                            .child("Paste a connection URL or enter the profile fields."),
+                            .flex()
+                            .flex_col()
+                            .gap(px(layout::SPACE_XS))
+                            .child(
+                                div()
+                                    .text_size(px(layout::TEXT_SM))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(t.text_muted)
+                                    .child("Connection URL"),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .gap(px(layout::SPACE_SM))
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .child(Input::new(&form.url).w_full()),
+                                    )
+                                    .child(
+                                        Button::new("apply-connection-url")
+                                            .icon(icon(icon::FILL_DOWN))
+                                            .tooltip("Fill the fields from this URL")
+                                            .on_click(cx.listener(Self::apply_connection_url)),
+                                    ),
+                            ),
                     )
-                    .child(self.form_field("Connection URL", &form.url, cx))
                     .child(
-                        div().flex().justify_end().child(
-                            Button::new("apply-connection-url")
-                                .label("Use URL")
-                                .on_click(cx.listener(Self::apply_connection_url)),
-                        ),
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(layout::SPACE_SM))
+                            .child(hairline())
+                            .child(
+                                div()
+                                    .text_size(px(layout::TEXT_XS))
+                                    .text_color(t.text_faint)
+                                    .child("OR"),
+                            )
+                            .child(hairline()),
                     )
                     .child(self.form_field("Display name", &form.name, cx))
-                    .child(self.form_field("Host", &form.host, cx))
-                    .child(self.form_field("Port", &form.port, cx))
+                    .child(
+                        div()
+                            .flex()
+                            .gap(px(layout::SPACE_SM))
+                            .child(div().flex_1().child(self.form_field("Host", &form.host, cx)))
+                            .child(div().w(px(96.)).child(self.form_field(
+                                "Port",
+                                &form.port,
+                                cx,
+                            ))),
+                    )
                     .child(self.form_field("Database", &form.database, cx))
                     .child(self.form_field("Username", &form.user, cx))
                     .child(self.form_field("Password", &form.password, cx))
@@ -1241,6 +1320,7 @@ impl Workspace {
                         Button::new("connect")
                             .label("Connect")
                             .primary()
+                            .w_full()
                             .on_click(cx.listener(Self::connect)),
                     ),
             )
@@ -1266,11 +1346,7 @@ impl Workspace {
             .child(Input::new(input).w_full())
     }
 
-    fn render_main_content(
-        profile: &Profile,
-        result_lines: Vec<String>,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
+    fn render_main_content(profile: &Profile, cx: &mut Context<Self>) -> AnyElement {
         let t = *theme(cx);
         let mono = gpui_component::Theme::global(cx).mono_font_family.clone();
 
@@ -1283,11 +1359,10 @@ impl Workspace {
                 .size_full()
                 .flex()
                 .flex_col()
+                .bg(t.panel)
                 .child(
                     div()
                         .p(px(layout::SPACE_LG))
-                        .border_b_1()
-                        .border_color(t.border)
                         .flex()
                         .flex_col()
                         .gap(px(layout::SPACE_SM))
@@ -1313,7 +1388,11 @@ impl Workspace {
                                 .children((!details.routine.result_type.is_empty()).then(|| {
                                     div().child(format!("Returns: {}", details.routine.result_type))
                                 }))
-                                .child(RETURN_HINT),
+                                .child(
+                                    div()
+                                        .ml_auto()
+                                        .child(key_hint(t, "escape", "returns to the editor")),
+                                ),
                         ),
                 )
                 .child(
@@ -1321,7 +1400,6 @@ impl Workspace {
                         .id("routine-definition")
                         .flex_1()
                         .min_h_0()
-                        .bg(t.panel)
                         .overflow_y_scroll()
                         .p(px(layout::SPACE_LG))
                         .font_family(mono)
@@ -1338,24 +1416,24 @@ impl Workspace {
             // it was run to show squeezed into the bottom half.
             Content::Preview(preview) => div()
                 .flex_shrink_0()
+                .bg(t.panel)
                 .p(px(layout::SPACE_LG))
-                .font_family(mono)
                 .flex()
                 .flex_col()
                 .gap(px(layout::SPACE_SM))
                 .child(
                     div()
                         .flex()
-                        .gap(px(layout::SPACE_SM))
+                        .items_center()
                         .child(section_label(t, "Generated preview"))
                         .child(
                             div()
-                                .text_size(px(layout::TEXT_XS))
-                                .text_color(t.text_faint)
-                                .child(RETURN_HINT),
+                                .ml_auto()
+                                .child(key_hint(t, "escape", "returns to the editor")),
                         ),
                 )
-                .child(preview.sql.clone())
+                // Only the SQL itself is code; the labels around it are UI.
+                .child(div().font_family(mono).child(preview.sql.clone()))
                 .child(
                     div()
                         .flex()
@@ -1374,97 +1452,145 @@ impl Workspace {
                         )),
                 )
                 .into_any_element(),
-            _ => div()
-                .flex_1()
-                .min_h_0()
-                .flex()
-                .flex_col()
-                .child(
-                    div()
-                        .h(px(layout::EDITOR_HEADER_HEIGHT))
-                        .flex_shrink_0()
-                        .flex()
-                        .items_center()
-                        .px(px(layout::SPACE_MD))
-                        .border_b_1()
-                        .border_color(t.border)
-                        .child(section_label(t, "SQL"))
-                        .child(
-                            div()
-                                .ml_auto()
-                                .text_size(px(layout::TEXT_XS))
-                                .text_color(t.text_faint)
-                                .child(format!(
-                                    "{}%",
-                                    editor_zoom_percent(profile.session.editor_font_size)
-                                )),
-                        )
-                        .child(
-                            Button::new("run-query-editor")
-                                .label("Run  ⌘↵")
-                                .ghost()
-                                .xsmall()
-                                .on_click(cx.listener(
-                                    |workspace, _: &ClickEvent, window, cx| {
-                                        workspace.run_query(&RunQuery, window, cx);
-                                    },
-                                )),
-                        ),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .min_h_0()
-                        .p(px(layout::SPACE_LG))
-                        .font_family(mono)
-                        .child(
-                            Input::new(&profile.session.editor)
-                                .h_full()
-                                .appearance(false)
-                                .bordered(false)
-                                .focus_bordered(false)
-                                .text_size(px(profile.session.editor_font_size))
-                                .line_height(px(profile.session.editor_font_size * 1.55)),
-                        ),
-                )
-                .into_any_element(),
+            _ => {
+                let zoom = editor_zoom_percent(profile.session.editor_font_size);
+                let query_name = profile
+                    .session
+                    .open_query
+                    .clone()
+                    .unwrap_or_else(|| "New Query".into());
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .flex()
+                    .flex_col()
+                    // The editor is the prompt, one tone behind the results it
+                    // produces.
+                    .bg(t.panel)
+                    .child(
+                        // A breadcrumb rather than a toolbar: it says where the
+                        // buffer lives, in the quietest voice on the surface.
+                        div()
+                            .h(px(layout::EDITOR_HEADER_HEIGHT))
+                            .flex_shrink_0()
+                            .flex()
+                            .items_center()
+                            .gap(px(layout::SPACE_SM))
+                            .px(px(layout::SPACE_MD))
+                            .text_size(px(layout::TEXT_XS))
+                            .text_color(t.text_faint)
+                            .child(format!("{} › {}", profile.config.database, query_name))
+                            // 100% is not information; the readout appears only
+                            // once the zoom has somewhere to return to.
+                            .children((zoom != 100).then(|| {
+                                div().ml_auto().child(format!("{zoom}% · ⌘0 resets"))
+                            }))
+                            .child(
+                                // Icon only; the name and the binding live in
+                                // the tooltip.
+                                div().when(zoom == 100, |run| run.ml_auto()).child(
+                                    Button::new("run-query-editor")
+                                        .icon(icon(icon::RUN))
+                                        .ghost()
+                                        .xsmall()
+                                        .tooltip_with_action("Run", &RunQuery, None)
+                                        .on_click(cx.listener(
+                                            |workspace, _: &ClickEvent, window, cx| {
+                                                workspace.run_query(&RunQuery, window, cx);
+                                            },
+                                        )),
+                                ),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_h_0()
+                            .p(px(layout::SPACE_LG))
+                            .font_family(mono)
+                            .child(
+                                Input::new(&profile.session.editor)
+                                    .h_full()
+                                    .appearance(false)
+                                    .bordered(false)
+                                    .focus_bordered(false)
+                                    .text_size(px(profile.session.editor_font_size))
+                                    .line_height(px(profile.session.editor_font_size * 1.55)),
+                            ),
+                    )
+                    .into_any_element()
+            }
         };
 
-        // The grid and the message are alternatives, not layers. A `div` lays its
-        // children out in a row, so a full-size message beside a full-size table
-        // was pushed off the pane entirely -- every query error was invisible.
+        // A short status is centred and set in the app face -- it is a sentence
+        // about the pane, not query output. An error keeps the editor's
+        // monospace and the left edge, because it quotes the server and gets
+        // read against the SQL above it. The grid and every message are
+        // alternatives, not layers: a full-size message beside a full-size
+        // table gets pushed off the pane entirely.
+        let centered = |child: AnyElement| {
+            div()
+                .size_full()
+                .p(px(layout::SPACE_LG))
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(child)
+                .into_any_element()
+        };
+        let quiet_line = |line: String| {
+            div()
+                .text_size(px(layout::TEXT_SM))
+                .text_color(t.text_muted)
+                .child(line)
+                .into_any_element()
+        };
+        let is_query = matches!(profile.session.content, Content::Query);
         let bottom = match &profile.session.content {
             Content::Preview(preview) if preview.showing_structure => {
                 Self::render_structure(&preview.structure, cx)
             }
-            _ if !result_lines.is_empty() => div()
-                .size_full()
-                .p(px(layout::SPACE_LG))
-                .font_family(gpui_component::Theme::global(cx).mono_font_family.clone())
-                .flex()
-                .flex_col()
-                .text_color(if matches!(profile.session.query, QueryState::Failed(_)) {
-                    t.danger
-                } else {
-                    t.text_muted
-                })
-                .children(
-                    result_lines
-                        .into_iter()
-                        .map(|line| div().w_full().py(px(layout::SPACE_XS)).child(line)),
-                )
-                .into_any_element(),
-            // Values are read by comparing them down a column, which only lines
-            // up in a monospaced face -- and the header inherits it, so the
-            // heading of a column sits in the same rhythm as its values.
-            _ => div()
-                .size_full()
-                .font_family(gpui_component::Theme::global(cx).mono_font_family.clone())
-                .child(Table::new(&profile.session.results).bordered(false))
-                .into_any_element(),
+            _ => match &profile.session.query {
+                QueryState::Idle if is_query => centered(
+                    key_hint(t, "cmd-enter", "runs the selection or statement under the cursor")
+                        .into_any_element(),
+                ),
+                QueryState::Running => centered(quiet_line("Running query…".into())),
+                QueryState::Failed(error) => {
+                    let position = error
+                        .position
+                        .map(|position| format!(" (at byte {position})"))
+                        .unwrap_or_default();
+                    div()
+                        .size_full()
+                        .p(px(layout::SPACE_LG))
+                        .font_family(gpui_component::Theme::global(cx).mono_font_family.clone())
+                        .text_color(t.danger)
+                        .child(format!("{}{position}", error.message))
+                        .into_any_element()
+                }
+                QueryState::Complete {
+                    rows,
+                    rows_affected,
+                    ..
+                } if *rows == 0 => centered(quiet_line(match rows_affected {
+                    Some(rows) => format!("Query completed. Server row count: {rows}."),
+                    None => "Query completed.".into(),
+                })),
+                // Values are read by comparing them down a column, which only
+                // lines up in a monospaced face -- and the header inherits it,
+                // so the heading of a column sits in the same rhythm as its
+                // values.
+                _ => div()
+                    .size_full()
+                    .font_family(gpui_component::Theme::global(cx).mono_font_family.clone())
+                    .child(Table::new(&profile.session.results).bordered(false))
+                    .into_any_element(),
+            },
         };
 
-        let bottom = div().size_full().min_h_0().bg(t.panel).child(bottom);
+        // The results plane: the brightest tone, because the data is the point.
+        let bottom = div().size_full().min_h_0().bg(t.bg).child(bottom);
 
         if matches!(profile.session.content, Content::Query) {
             let expanded = result_pane_is_expanded(&profile.session.query);
@@ -1507,33 +1633,46 @@ impl Workspace {
                 .flex()
                 .flex_col()
                 .child(top)
-                .child(
-                    div()
-                        .flex_1()
-                        .min_h_0()
-                        .border_t_1()
-                        .border_color(t.border)
-                        .child(bottom),
-                )
+                .child(div().flex_1().min_h_0().child(bottom))
                 .into_any_element()
         }
     }
 
+    /// One segment of the Data | Structure pair. A quiet chip rather than a
+    /// filled button: it selects a view of the same object, it does not act.
     fn preview_tab(
         label: &'static str,
         path: &'static str,
         selected: bool,
         cx: &mut Context<Self>,
-    ) -> Button {
-        let button = Button::new(label).icon(icon(path)).label(label).small();
-        let button = if selected {
-            button.primary()
-        } else {
-            button.ghost()
-        };
-        button.on_click(cx.listener(move |workspace, _: &ClickEvent, _, cx| {
-            workspace.show_structure(label == "Structure", cx);
-        }))
+    ) -> impl IntoElement {
+        let t = *theme(cx);
+        div()
+            .id(label)
+            .flex()
+            .items_center()
+            .gap(px(layout::SPACE_XS))
+            .h(px(24.))
+            .px(px(layout::SPACE_SM))
+            .rounded(px(layout::RADIUS_CONTROL))
+            .text_size(px(layout::TEXT_SM))
+            .map(|tab| {
+                if selected {
+                    tab.bg(t.element_active).text_color(t.text)
+                } else {
+                    tab.text_color(t.text_muted)
+                        .hover(|style| style.bg(t.element_hover))
+                }
+            })
+            .child(icon(path).size(px(12.)).text_color(if selected {
+                t.text
+            } else {
+                t.text_faint
+            }))
+            .child(label)
+            .on_click(cx.listener(move |workspace, _: &ClickEvent, _, cx| {
+                workspace.show_structure(label == "Structure", cx);
+            }))
     }
 
     fn render_structure(state: &StructureState, cx: &mut Context<Self>) -> AnyElement {
@@ -1632,35 +1771,45 @@ impl Workspace {
             .into_any_element()
     }
 
+    /// The query tabs, drawn as chips on the titlebar's chrome: the active one
+    /// is lifted to the editor's tone, the rest are names that reveal a wash
+    /// on hover. No boxes, no hairlines — tone carries the state.
     fn render_query_tabs(profile: &Profile, cx: &mut Context<Self>) -> AnyElement {
         let t = *theme(cx);
         let workspace = cx.entity().downgrade();
+
+        let tab_base = |active: bool| {
+            div()
+                .h(px(layout::TITLEBAR_TAB_HEIGHT))
+                .flex()
+                .flex_shrink_0()
+                .items_center()
+                .gap(px(layout::SPACE_XS))
+                .rounded(px(layout::RADIUS_CONTROL))
+                .map(|tab| {
+                    if active {
+                        tab.bg(t.panel).text_color(t.text)
+                    } else {
+                        tab.text_color(t.text_muted)
+                            .hover(|style| style.bg(t.element_hover))
+                    }
+                })
+        };
+
         let scratch_workspace = workspace.clone();
         let scratch_active = profile.session.open_query.is_none();
-        let scratch = div()
+        let scratch = tab_base(scratch_active)
             .id("scratch-query-tab")
-            .h_full()
-            .flex()
-            .flex_shrink_0()
-            .items_center()
-            .gap(px(layout::SPACE_SM))
-            .px(px(layout::SPACE_MD))
-            .border_r_1()
-            .border_color(t.border)
-            .text_color(if scratch_active { t.text } else { t.text_muted })
-            .child(row_icon(t, icon::SAVED_QUERY))
+            .px(px(layout::SPACE_SM))
+            // A pen, not a file: the scratch buffer is a place to write, and
+            // the distinction is what makes the saved tabs read as files.
+            .child(row_icon(t, icon::SCRATCH_QUERY))
             .child("New Query")
-            .hover(|style| style.bg(t.element_hover))
             .on_click(move |_, window, cx| {
                 _ = scratch_workspace.update(cx, |workspace, cx| {
                     workspace.open_scratch_query(window, cx);
                 });
             });
-        let scratch = if scratch_active {
-            scratch.bg(t.bg).font_weight(FontWeight::MEDIUM)
-        } else {
-            scratch
-        };
 
         let mut tabs = vec![scratch.into_any_element()];
         tabs.extend(
@@ -1676,19 +1825,11 @@ impl Workspace {
                     let delete_workspace = workspace.clone();
                     let pending = profile.session.pending_delete.as_deref() == Some(name);
                     let active = profile.session.open_query.as_deref() == Some(name);
-                    let tab = div()
+                    tab_base(active)
                         .id(("saved-query", index))
-                        .h_full()
-                        .flex()
-                        .flex_shrink_0()
-                        .items_center()
-                        .gap(px(layout::SPACE_SM))
-                        .pl(px(layout::SPACE_MD))
+                        .group(format!("query-tab-{index}"))
+                        .pl(px(layout::SPACE_SM))
                         .pr(px(layout::SPACE_XS))
-                        .border_r_1()
-                        .border_color(t.border)
-                        .text_color(if active { t.text } else { t.text_muted })
-                        .hover(|style| style.bg(t.element_hover))
                         .child(row_icon(t, icon::SAVED_QUERY))
                         .child(
                             div()
@@ -1699,29 +1840,36 @@ impl Workspace {
                                 .child(name.clone()),
                         )
                         .child(
-                            Button::new(("delete-query", index))
-                                .label(if pending { "Delete?" } else { "" })
-                                .icon(icon(icon::DELETE))
-                                .ghost()
-                                .xsmall()
-                                .on_click(move |_, _, cx| {
-                                    _ = delete_workspace.update(cx, |workspace, cx| {
-                                        workspace.delete_saved_query(delete_name.clone(), cx);
-                                    });
-                                }),
+                            // Revealed by its own tab, so the strip reads as
+                            // names rather than a row of delete buttons.
+                            div()
+                                .when(!pending, |delete| {
+                                    delete.opacity(0.).group_hover(
+                                        format!("query-tab-{index}"),
+                                        |style| style.opacity(1.),
+                                    )
+                                })
+                                .child(
+                                    Button::new(("delete-query", index))
+                                        .label(if pending { "Delete?" } else { "" })
+                                        .icon(icon(icon::DELETE))
+                                        .ghost()
+                                        .xsmall()
+                                        .tooltip("Delete query")
+                                        .on_click(move |_, _, cx| {
+                                            _ = delete_workspace.update(cx, |workspace, cx| {
+                                                workspace
+                                                    .delete_saved_query(delete_name.clone(), cx);
+                                            });
+                                        }),
+                                ),
                         )
                         .on_click(move |_, window, cx| {
                             _ = open_workspace.update(cx, |workspace, cx| {
                                 workspace.open_saved_query(open_name.clone(), window, cx);
                             });
-                        });
-                    if active {
-                        tab.bg(t.bg)
-                            .font_weight(FontWeight::MEDIUM)
-                            .into_any_element()
-                    } else {
-                        tab.into_any_element()
-                    }
+                        })
+                        .into_any_element()
                 }),
         );
 
@@ -1729,17 +1877,19 @@ impl Workspace {
             let workspace = workspace.clone();
             Some(
                 div()
-                    .w(px(260.))
+                    .w(px(240.))
                     .flex_shrink_0()
                     .flex()
                     .items_center()
                     .gap(px(layout::SPACE_XS))
-                    .px(px(layout::SPACE_SM))
-                    .child(Input::new(&profile.session.save_name).flex_1())
+                    // The input and the button share one size so the pair sits
+                    // on a single centreline instead of jostling.
+                    .child(Input::new(&profile.session.save_name).small().flex_1())
                     .child(
                         Button::new("confirm-save-query")
-                            .label("Save")
+                            .icon(icon(icon::CHECK))
                             .small()
+                            .tooltip("Save query")
                             .on_click(move |_, _, cx| {
                                 _ = workspace.update(cx, |workspace, cx| {
                                     workspace.confirm_save(cx);
@@ -1754,128 +1904,184 @@ impl Workspace {
 
         let new_workspace = workspace.clone();
         div()
-            .h(px(38.))
+            .h_full()
             .w_full()
-            .flex_shrink_0()
             .flex()
             .items_center()
-            .bg(t.surface)
-            .border_b_1()
-            .border_color(t.border)
+            .gap(px(layout::SPACE_SM))
+            .text_size(px(layout::TEXT_SM))
             .child(
                 div()
                     .id("query-tabs-scroll")
-                    .h_full()
                     .flex_1()
                     .min_w_0()
                     .flex()
+                    .items_center()
+                    .gap(px(layout::SPACE_XS))
                     .overflow_x_scroll()
-                    .children(tabs),
-            )
-            .child(
-                Button::new("new-query-tab")
-                    .label("+")
-                    .ghost()
-                    .small()
-                    .on_click(move |_, window, cx| {
-                        _ = new_workspace.update(cx, |workspace, cx| {
-                            workspace.new_query(&NewQuery, window, cx);
-                        });
-                    }),
+                    .children(tabs)
+                    .child(
+                        // Beside the last tab, where a browser puts it, rather
+                        // than orphaned at the far edge of the window.
+                        Button::new("new-query-tab")
+                            .icon(icon(icon::PLUS))
+                            .ghost()
+                            .xsmall()
+                            .tooltip_with_action("New query", &NewQuery, None)
+                            .on_click(move |_, window, cx| {
+                                _ = new_workspace.update(cx, |workspace, cx| {
+                                    workspace.new_query(&NewQuery, window, cx);
+                                });
+                            }),
+                    ),
             )
             .children(naming)
             .into_any_element()
     }
 
+    /// The connection switcher: a bottom-anchored row that opens a floating
+    /// panel above itself, the way an account switcher floats over a sidebar,
+    /// rather than an accordion that shoves the tree around.
     fn render_profile_switcher(&self, cx: &mut Context<Self>) -> AnyElement {
         let t = *theme(cx);
         let workspace = cx.entity().downgrade();
-        let profile_rows = self
-            .profiles
-            .iter()
-            .enumerate()
-            .map(|(index, profile)| {
-                let activate_workspace = workspace.clone();
-                let remove_workspace = workspace.clone();
-                let pending = self.pending_removal.as_deref() == Some(&profile.id);
-                div()
-                    .id(("profile", index))
-                    .h(px(34.))
-                    .flex()
-                    .items_center()
-                    .gap(px(layout::SPACE_SM))
-                    .px(px(layout::SPACE_SM))
-                    .hover(|style| style.bg(t.element_hover))
-                    .child(row_icon(t, icon::DATABASE))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .overflow_hidden()
-                            .text_ellipsis()
-                            .whitespace_nowrap()
-                            .child(profile.name.clone()),
-                    )
-                    .child(
-                        Button::new(("remove-profile", index))
-                            .label(if pending { "Remove?" } else { "" })
-                            .icon(icon(icon::DELETE))
-                            .ghost()
-                            .xsmall()
-                            .on_click(move |_, window, cx| {
-                                _ = remove_workspace.update(cx, |workspace, cx| {
-                                    workspace.remove_profile(index, window, cx);
-                                });
-                            }),
-                    )
-                    .on_click(move |_, _, cx| {
-                        _ = activate_workspace.update(cx, |workspace, cx| {
-                            workspace.activate(index, cx);
-                        });
-                    })
-                    .into_any_element()
-            })
-            .collect::<Vec<_>>();
+        let panel = self.switcher_open.then(|| {
+            let add_workspace = workspace.clone();
+            let profile_rows = self
+                .profiles
+                .iter()
+                .enumerate()
+                .map(|(index, profile)| {
+                    let activate_workspace = workspace.clone();
+                    let remove_workspace = workspace.clone();
+                    let pending = self.pending_removal.as_deref() == Some(&profile.id);
+                    let active = index == self.active;
+                    div()
+                        .id(("profile", index))
+                        .group(format!("profile-row-{index}"))
+                        .h(px(30.))
+                        .flex_shrink_0()
+                        .flex()
+                        .items_center()
+                        .gap(px(layout::SPACE_SM))
+                        .px(px(layout::SPACE_SM))
+                        .rounded(px(layout::RADIUS_CONTROL))
+                        .hover(|style| style.bg(t.element_hover))
+                        .child(row_icon(t, icon::DATABASE))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .overflow_hidden()
+                                .text_ellipsis()
+                                .whitespace_nowrap()
+                                .child(profile.name.clone()),
+                        )
+                        .child(
+                            div()
+                                .when(!pending, |remove| {
+                                    remove.opacity(0.).group_hover(
+                                        format!("profile-row-{index}"),
+                                        |style| style.opacity(1.),
+                                    )
+                                })
+                                .child(
+                                    Button::new(("remove-profile", index))
+                                        .label(if pending { "Remove?" } else { "" })
+                                        .icon(icon(icon::DELETE))
+                                        .ghost()
+                                        .xsmall()
+                                        .tooltip("Remove connection")
+                                        .on_click(move |_, window, cx| {
+                                            _ = remove_workspace.update(cx, |workspace, cx| {
+                                                workspace.remove_profile(index, window, cx);
+                                            });
+                                        }),
+                                ),
+                        )
+                        // The mark sits at the trailing edge like a menu's
+                        // checkmark, after the affordances, where the eye ends.
+                        .children(active.then(|| {
+                            icon(icon::CHECK)
+                                .size(px(layout::ICON_SIZE))
+                                .text_color(t.text_muted)
+                        }))
+                        .on_click(move |_, _, cx| {
+                            _ = activate_workspace.update(cx, |workspace, cx| {
+                                workspace.activate(index, cx);
+                            });
+                        })
+                        .into_any_element()
+                })
+                .collect::<Vec<_>>();
+
+            div()
+                .absolute()
+                .bottom(px(layout::SWITCHER_HEIGHT + layout::SPACE_XS))
+                .left(px(layout::SPACE_SM))
+                .right(px(layout::SPACE_SM))
+                .p(px(layout::SPACE_XS))
+                .bg(t.overlay)
+                .border_1()
+                .border_color(t.border_strong)
+                .rounded(px(layout::RADIUS_PANEL))
+                .shadow_lg()
+                .flex()
+                .flex_col()
+                .child(
+                    div()
+                        .px(px(layout::SPACE_SM))
+                        .py(px(layout::SPACE_XS))
+                        .child(section_label(t, "Connections")),
+                )
+                .children(profile_rows)
+                .child(
+                    div()
+                        .my(px(layout::SPACE_XS))
+                        .h(px(1.))
+                        .bg(t.border),
+                )
+                .child(
+                    div()
+                        .id("new-connection")
+                        .h(px(30.))
+                        .flex_shrink_0()
+                        .flex()
+                        .items_center()
+                        .gap(px(layout::SPACE_SM))
+                        .px(px(layout::SPACE_SM))
+                        .rounded(px(layout::RADIUS_CONTROL))
+                        .text_color(t.text_muted)
+                        .hover(|style| style.bg(t.element_hover).text_color(t.text))
+                        .child(row_icon(t, icon::PLUS))
+                        .child("Add connection")
+                        .on_click(move |_, window, cx| {
+                            _ = add_workspace.update(cx, |workspace, cx| {
+                                workspace.form = Some(ConnectionForm::new(None, window, cx));
+                                workspace.switcher_open = false;
+                                cx.notify();
+                            });
+                        }),
+                )
+        });
         let active_name = self
             .profile()
             .map(|profile| profile.name.clone())
             .unwrap_or_else(|| "Connections".into());
         let toggle_workspace = workspace.clone();
-        let add_workspace = workspace.clone();
 
         div()
+            .relative()
             .flex_shrink_0()
-            .border_t_1()
-            .border_color(t.border)
-            .children(self.switcher_open.then(|| {
-                div()
-                    .border_b_1()
-                    .border_color(t.border)
-                    .children(profile_rows)
-                    .child(
-                        Button::new("new-connection")
-                            .label("Add connection")
-                            .icon(icon(icon::DATABASE))
-                            .ghost()
-                            .w_full()
-                            .on_click(move |_, window, cx| {
-                                _ = add_workspace.update(cx, |workspace, cx| {
-                                    workspace.form =
-                                        Some(ConnectionForm::new(None, window, cx));
-                                    workspace.switcher_open = false;
-                                    cx.notify();
-                                });
-                            }),
-                    )
-            }))
+            .children(panel)
             .child(
                 div()
                     .id("profile-switcher")
-                    .h(px(40.))
+                    .h(px(layout::SWITCHER_HEIGHT))
                     .flex()
                     .items_center()
                     .gap(px(layout::SPACE_SM))
-                    .px(px(layout::SPACE_SM))
+                    .px(px(layout::SPACE_MD))
                     .hover(|style| style.bg(t.element_hover))
                     .child(row_icon(t, icon::DATABASE))
                     .child(
@@ -1955,6 +2161,8 @@ impl Workspace {
                             None => icon::CHEVRON_RIGHT,
                         };
                         let row = row
+                            .mx(px(layout::SPACE_XS))
+                            .rounded(px(layout::RADIUS_CONTROL))
                             .pl(px(
                                 layout::SPACE_SM + entry.depth() as f32 * layout::SPACE_MD
                             ))
@@ -1996,17 +2204,36 @@ impl Workspace {
             .h_full()
             .flex()
             .flex_col()
-            .border_r_1()
-            .border_color(t.border)
+            // No border of its own: the resizable split's handle already
+            // paints the one hairline this edge gets.
             .child(
-                div().w_full().flex().p(px(layout::SPACE_SM)).child(
-                    Input::new(&profile.session.explorer_filter)
-                        .min_w_0()
-                        .flex_1()
-                        .prefix(row_icon(t, icon::SEARCH)),
-                ),
+                // A quiet filter row rather than a boxed field: on chrome, an
+                // outlined input is the loudest thing in the column, and the
+                // filter is the least interesting thing in it.
+                div()
+                    .w_full()
+                    .h(px(layout::TAB_HEIGHT))
+                    .flex_shrink_0()
+                    .flex()
+                    .items_center()
+                    .gap(px(layout::SPACE_XS))
+                    .pl(px(layout::SPACE_MD))
+                    .pr(px(layout::SPACE_SM))
+                    .child(row_icon(t, icon::SEARCH))
+                    .child(
+                        Input::new(&profile.session.explorer_filter)
+                            .min_w_0()
+                            .flex_1()
+                            .appearance(false),
+                    ),
             )
-            .child(div().flex_1().min_h_0().child(content))
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .py(px(layout::SPACE_XS))
+                    .child(content),
+            )
             .child(self.render_profile_switcher(cx))
     }
 }
@@ -2032,7 +2259,8 @@ impl Render for Workspace {
             return div()
                 .id("connection-form")
                 .size_full()
-                .bg(t.bg)
+                // Chrome, so the form's card is the raised plane on it.
+                .bg(t.surface)
                 .text_color(t.text)
                 .text_size(px(layout::TEXT_MD))
                 .flex()
@@ -2043,7 +2271,7 @@ impl Render for Workspace {
                 .on_action(cx.listener(Self::previous_profile))
                 // Without a titlebar of its own the form has no drag handle at
                 // all, since the platform's is transparent.
-                .child(titlebar(t, None))
+                .child(titlebar(t, None, None))
                 .child(
                     div()
                         .flex_1()
@@ -2068,34 +2296,18 @@ impl Render for Workspace {
             ProfileState::Failed(message) => (message.clone(), t.danger),
         };
 
-        let result_lines = match &profile.session.query {
-            QueryState::Idle => vec!["⌘↵ runs the selection or statement under the cursor.".into()],
-            QueryState::Running => vec!["Running query…".into()],
-            QueryState::Failed(error) => {
-                let position = error
-                    .position
-                    .map(|position| format!(" (at byte {position})"))
-                    .unwrap_or_default();
-                vec![format!("{}{position}", error.message)]
-            }
-            QueryState::Complete {
-                rows,
-                bytes,
-                elapsed,
-                rows_affected,
-            } if *rows == 0 => vec![match rows_affected {
-                Some(rows) => format!("Query completed. Server row count: {rows}."),
-                None => "Query completed.".into(),
-            }],
-            QueryState::Complete { .. } => Vec::new(),
-        };
         let query_status = match &profile.session.query {
             QueryState::Complete {
                 rows,
                 bytes,
                 elapsed,
                 ..
-            } => Some(format!("{rows} row(s) · {bytes} bytes · {elapsed:.1?}")),
+            } => Some(format!(
+                "{} {} · {} · {elapsed:.1?}",
+                group_thousands(*rows as u64),
+                if *rows == 1 { "row" } else { "rows" },
+                human_bytes(*bytes as u64),
+            )),
             _ => None,
         };
         let notice = profile.session.notice.clone();
@@ -2115,14 +2327,18 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::reset_editor_zoom))
             .size_full()
             // The shell is the chrome tone: titlebar, sidebar and status bar
-            // paint nothing of their own, they are this. The content card below
-            // is the plane that steps away from it.
+            // paint nothing of their own, they are this. The editor and the
+            // results step forward from it by tone.
             .bg(t.surface)
             .text_color(t.text)
             .text_size(px(layout::TEXT_MD))
             .flex()
             .flex_col()
-            .child(titlebar(t, Some(profile.name.clone())))
+            .child(titlebar(
+                t,
+                Some(profile.name.clone()),
+                Some(Self::render_query_tabs(profile, cx)),
+            ))
             .child(
                 div().flex_1().min_h_0().child(
                     h_resizable("workspace-shell-split")
@@ -2135,30 +2351,15 @@ impl Render for Workspace {
                                 .child(self.render_explorer(profile, cx)),
                         )
                         .child(
+                            // Flush, not a floating card: the split handle
+                            // already draws the one seam, and the planes
+                            // inside separate by tone.
                             resizable_panel().child(
                                 div()
                                     .size_full()
                                     .min_w_0()
-                                    .p(px(layout::SPACE_SM))
-                                    .flex()
-                                    .flex_col()
-                                    .child(Self::render_query_tabs(profile, cx))
-                                    .child(
-                                        div()
-                                            .flex_1()
-                                            .min_h_0()
-                                            .w_full()
-                                            .overflow_hidden()
-                                            .bg(t.bg)
-                                            .border_1()
-                                            .border_color(t.border)
-                                            .rounded(px(layout::RADIUS_PANEL))
-                                            .child(Self::render_main_content(
-                                                profile,
-                                                result_lines,
-                                                cx,
-                                            )),
-                                    ),
+                                    .bg(t.bg)
+                                    .child(Self::render_main_content(profile, cx)),
                             ),
                         ),
                 ),
@@ -2171,8 +2372,6 @@ impl Render for Workspace {
                     .items_center()
                     .gap(px(layout::SPACE_SM))
                     .px(px(layout::SPACE_MD))
-                    .border_t_1()
-                    .border_color(t.border)
                     .text_size(px(layout::TEXT_SM))
                     // The dot carries the state and the text carries the words.
                     // A whole status line in green shouts about being connected,
@@ -2224,8 +2423,10 @@ fn row_icon(t: Theme, path: &'static str) -> impl IntoElement {
 ///
 /// The system titlebar is transparent (see `main`), so this row is what runs to
 /// the top of the window and the window buttons are drawn over its leading
-/// inset. It is also the drag handle the platform no longer provides.
-fn titlebar(t: Theme, subtitle: Option<String>) -> impl IntoElement {
+/// inset. It is also the drag handle the platform no longer provides. The
+/// query tabs live here, the way a browser keeps its tabs in the window frame,
+/// so the strip costs no height inside the content column.
+fn titlebar(t: Theme, subtitle: Option<String>, tabs: Option<AnyElement>) -> impl IntoElement {
     div()
         .id("titlebar")
         .window_control_area(gpui::WindowControlArea::Drag)
@@ -2235,13 +2436,13 @@ fn titlebar(t: Theme, subtitle: Option<String>) -> impl IntoElement {
         .flex()
         .flex_shrink_0()
         .items_center()
+        .gap(px(layout::SPACE_MD))
         .pl(px(layout::TITLEBAR_LEADING_INSET))
         .pr(px(layout::SPACE_MD))
-        .border_b_1()
-        .border_color(t.border)
         .child(
             div()
                 .flex()
+                .flex_shrink_0()
                 .items_center()
                 .gap(px(layout::SPACE_SM))
                 .child(div().font_weight(FontWeight::SEMIBOLD).child("Slate"))
@@ -2256,13 +2457,7 @@ fn titlebar(t: Theme, subtitle: Option<String>) -> impl IntoElement {
                         .child(subtitle)
                 })),
         )
-        .child(
-            div()
-                .ml_auto()
-                .text_size(px(layout::TEXT_XS))
-                .text_color(t.text_faint)
-                .child(format!("{} · ⌘⇧T", t.name)),
-        )
+        .children(tabs.map(|tabs| div().h_full().flex_1().min_w_0().child(tabs)))
 }
 
 /// The quietest thing on screen: small, uppercase, and dim enough that the
@@ -2273,6 +2468,55 @@ fn section_label(t: Theme, label: &str) -> impl IntoElement {
         .font_weight(FontWeight::MEDIUM)
         .text_color(t.text_faint)
         .child(label.to_uppercase())
+}
+
+/// A keycap, drawn the way the platform draws one in a menu. Reads a stroke in
+/// GPUI's binding syntax so the hint and the binding cannot drift apart.
+fn keycap(stroke: &'static str) -> Kbd {
+    Kbd::new(Keystroke::parse(stroke).expect("keycap strokes are compile-time constants"))
+}
+
+/// A shortcut hint and what it does, in the app face rather than the editor's
+/// monospace -- these are sentences about the UI, not query output.
+fn key_hint(t: Theme, stroke: &'static str, explanation: &'static str) -> impl IntoElement {
+    div()
+        .flex()
+        .items_center()
+        .gap(px(layout::SPACE_SM))
+        .text_size(px(layout::TEXT_SM))
+        .text_color(t.text_faint)
+        .child(keycap(stroke))
+        .child(explanation)
+}
+
+/// `1234567` → `1,234,567`. Row counts are read at a glance, and groups are
+/// what keeps six digits legible.
+fn group_thousands(value: u64) -> String {
+    let digits = value.to_string();
+    let mut grouped = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, digit) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
+            grouped.push(',');
+        }
+        grouped.push(digit);
+    }
+    grouped
+}
+
+/// Bytes at the precision a person reads them, not the count the server sent.
+fn human_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1000.0 && unit < UNITS.len() - 1 {
+        value /= 1000.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
 }
 
 fn adjusted_editor_font_size(current: f32, delta: f32) -> f32 {
@@ -2423,5 +2667,21 @@ mod tests {
     fn result_pane_expands_as_soon_as_a_query_starts() {
         assert!(!result_pane_is_expanded(&QueryState::Idle));
         assert!(result_pane_is_expanded(&QueryState::Running));
+    }
+
+    #[test]
+    fn row_counts_are_grouped_for_reading() {
+        assert_eq!(group_thousands(0), "0");
+        assert_eq!(group_thousands(999), "999");
+        assert_eq!(group_thousands(5000), "5,000");
+        assert_eq!(group_thousands(1234567), "1,234,567");
+    }
+
+    #[test]
+    fn byte_counts_read_at_human_precision() {
+        assert_eq!(human_bytes(0), "0 B");
+        assert_eq!(human_bytes(999), "999 B");
+        assert_eq!(human_bytes(578_923), "578.9 KB");
+        assert_eq!(human_bytes(1_500_000), "1.5 MB");
     }
 }

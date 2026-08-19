@@ -22,7 +22,7 @@ use icondata_core::IconData;
 /// The gpui-component widgets ask for their own paths — those are Lucide names
 /// too, so they resolve here as well. Add a row when something asks for one;
 /// an unlisted path simply draws nothing.
-const ICONS: [(&str, &IconData); 25] = [
+const ICONS: [(&str, &IconData); 27] = [
     ("icons/chevron-down.svg", icondata_lu::LuChevronDown),
     ("icons/chevron-right.svg", icondata_lu::LuChevronRight),
     ("icons/chevron-left.svg", icondata_lu::LuChevronLeft),
@@ -48,6 +48,8 @@ const ICONS: [(&str, &IconData); 25] = [
     ("icons/list-tree.svg", icondata_lu::LuListTree),
     ("icons/square-function.svg", icondata_lu::LuSquareFunction),
     ("icons/square-play.svg", icondata_lu::LuSquarePlay),
+    ("icons/play.svg", icondata_lu::LuPlay),
+    ("icons/square-pen.svg", icondata_lu::LuSquarePen),
 ];
 
 /// Slate's own names for the icons it draws, so a call site names a thing
@@ -68,6 +70,13 @@ pub mod icon {
     pub const FUNCTION: &str = "icons/square-function.svg";
     pub const PROCEDURE: &str = "icons/square-play.svg";
     pub const STRUCTURE: &str = "icons/list-tree.svg";
+    pub const PLUS: &str = "icons/plus.svg";
+    pub const CHECK: &str = "icons/check.svg";
+    pub const RUN: &str = "icons/play.svg";
+    pub const SCRATCH_QUERY: &str = "icons/square-pen.svg";
+    /// The connection form's "fill the fields from this URL" action: the URL
+    /// flows down into the fields below it.
+    pub const FILL_DOWN: &str = "icons/arrow-down.svg";
 }
 
 pub fn icon(path: &'static str) -> Icon {
@@ -134,12 +143,27 @@ mod tests {
             icon::FUNCTION,
             icon::PROCEDURE,
             icon::STRUCTURE,
+            icon::PLUS,
+            icon::CHECK,
+            icon::RUN,
+            icon::SCRATCH_QUERY,
+            icon::FILL_DOWN,
         ] {
             let loaded = Icons.load(path).unwrap();
             let document = loaded.unwrap_or_else(|| panic!("{path} has no icon"));
             let document = String::from_utf8(document.to_vec()).unwrap();
             assert!(document.starts_with("<svg"), "{path}: {document}");
-            assert!(document.contains("<path"), "{path} drew nothing");
+            // Any child element counts: Lucide draws with <path>, <polygon>,
+            // <circle> and friends, and an icon that names none of them is
+            // an invisible icon.
+            let content = document
+                .split_once('>')
+                .map(|(_, rest)| rest)
+                .unwrap_or("");
+            assert!(
+                content.trim_end().trim_end_matches("</svg>").contains('<'),
+                "{path} drew nothing"
+            );
         }
     }
 }

@@ -290,11 +290,14 @@ license, for an appearance Slate can define itself.
 
 The design principles are standard practice and are what the module implements:
 
-- **Two appearances designed separately, not inverted.** Dark's darkest plane is
-  the content panel with chrome one step lighter; light's content plane is white
-  with chrome one step darker. Elevation direction differs per appearance rather
-  than mirroring lightness. Accents shift weight between appearances at the same
-  hue to hold contrast.
+- **Two appearances designed separately, not inverted.** Both follow one
+  elevation rule — the closer a surface sits to the data, the more light it
+  gets: results brightest, the editor's page one tone behind, chrome furthest
+  back. Near-black is absent in dark; it reads as a hole, not a plane. Tone
+  steps, not hairlines, separate the planes; borders are reserved for floating
+  overlays and the seams that drag handles already own. Accents shift weight
+  between appearances at the same hue to hold contrast, and colour is reserved
+  for state — controls are neutral greys that brighten under the pointer.
 - **An oklch-derived neutral scale**, so lightness steps are perceptually even
   rather than evenly spaced in sRGB.
 - **A contrast-ratio function in the theme module itself**, with tests asserting
