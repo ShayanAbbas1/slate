@@ -253,9 +253,16 @@ pub fn reject_unsupported_sslmode(mode: &str) -> Result<(), String> {
 }
 
 /// One column of a result set.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Column {
     pub name: String,
+    /// The server's own name for the column's type — `int4`, `jsonb`,
+    /// `timestamptz` — as a Slate-owned string, never a driver type.
+    ///
+    /// Absent rather than guessed. The simple query protocol carries no type
+    /// information at all, so this is learned by describing the statement, and
+    /// Postgres will not describe everything (see [`column_types`]).
+    pub data_type: Option<String>,
 }
 
 /// A cell value, already formatted by the server. `None` is SQL NULL, which is
@@ -389,10 +396,25 @@ impl Connection {
     /// limits belong to the caller that *generated* a query, never to one the
     /// user typed.
     pub fn query(&self, sql: &str) -> Result<QueryResult, DbError> {
+        self.run(sql, true)
+    }
+
+    /// Slate's own SQL. Its column types are never shown, so it does not pay
+    /// for the extra round trip that learns them.
+    fn internal_query(&self, sql: &str) -> Result<QueryResult, DbError> {
+        self.run(sql, false)
+    }
+
+    fn run(&self, sql: &str, typed: bool) -> Result<QueryResult, DbError> {
         let mut client = self.client.lock().map_err(|_| DbError {
             message: "The connection is unavailable after an earlier internal failure.".into(),
             position: None,
         })?;
+
+        let types = match typed {
+            true => column_types(&mut client, sql),
+            false => Vec::new(),
+        };
 
         // Timed from here, not from the call: one client serialises a profile's
         // queries, and time spent waiting behind the catalog load is not time
@@ -402,21 +424,46 @@ impl Connection {
             .simple_query(sql)
             .map_err(|error| query_error(&error, sql))?;
 
-        assemble(messages, started.elapsed())
+        assemble(messages, types, started.elapsed())
     }
 
     pub fn catalog(&self) -> Result<Catalog, DbError> {
-        let relations = self.query(RELATIONS_SQL)?;
-        let routines = self.query(ROUTINES_SQL)?;
+        let relations = self.internal_query(RELATIONS_SQL)?;
+        let routines = self.internal_query(ROUTINES_SQL)?;
         assemble_catalog(relations, routines)
     }
 
     pub fn structure(&self, schema: &str, relation: &str) -> Result<Structure, DbError> {
-        let columns = self.query(&structure_sql(STRUCTURE_COLUMNS_SQL, schema, relation))?;
-        let indexes = self.query(&structure_sql(STRUCTURE_INDEXES_SQL, schema, relation))?;
-        let constraints = self.query(&structure_sql(STRUCTURE_CONSTRAINTS_SQL, schema, relation))?;
+        let columns =
+            self.internal_query(&structure_sql(STRUCTURE_COLUMNS_SQL, schema, relation))?;
+        let indexes =
+            self.internal_query(&structure_sql(STRUCTURE_INDEXES_SQL, schema, relation))?;
+        let constraints =
+            self.internal_query(&structure_sql(STRUCTURE_CONSTRAINTS_SQL, schema, relation))?;
         assemble_structure(columns, indexes, constraints)
     }
+}
+
+/// The type of each column a statement would return, in order.
+///
+/// The simple query protocol hands back every value as text and describes none
+/// of it, so the only way to know that a column of digits is an `int8` and not
+/// a `numeric` is to ask separately. Preparing the statement asks: the server
+/// parses and plans it and answers with the row description, and it never
+/// executes anything — Postgres refuses to prepare the utility statements that
+/// would have an effect, and refuses more than one statement at a time. Both
+/// refusals arrive here as "no types known", which is the honest answer.
+fn column_types(client: &mut Client, sql: &str) -> Vec<String> {
+    client
+        .prepare(sql)
+        .map(|statement| {
+            statement
+                .columns()
+                .iter()
+                .map(|column| column.type_().name().to_string())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn structure_sql(template: &str, schema: &str, relation: &str) -> String {
@@ -434,11 +481,20 @@ fn quote_literal(value: &str) -> String {
 
 fn assemble(
     messages: Vec<SimpleQueryMessage>,
+    types: Vec<String>,
     elapsed: Duration,
 ) -> Result<QueryResult, DbError> {
     let mut result = QueryResult {
         elapsed,
         ..Default::default()
+    };
+    // Matched by position, and only when the two agree on how many columns
+    // there are: the description came from a separate round trip, and a type
+    // put against the wrong column is worse than no type at all.
+    let type_at = |index: usize, columns: usize| {
+        (types.len() == columns)
+            .then(|| types.get(index).cloned())
+            .flatten()
     };
 
     for message in messages {
@@ -450,8 +506,10 @@ fn assemble(
             SimpleQueryMessage::RowDescription(columns) => {
                 result.columns = columns
                     .iter()
-                    .map(|column| Column {
+                    .enumerate()
+                    .map(|(index, column)| Column {
                         name: column.name().to_string(),
+                        data_type: type_at(index, columns.len()),
                     })
                     .collect();
                 result.rows.clear();
@@ -466,8 +524,10 @@ fn assemble(
                     result.columns = row
                         .columns()
                         .iter()
-                        .map(|column| Column {
+                        .enumerate()
+                        .map(|(index, column)| Column {
                             name: column.name().to_string(),
+                            data_type: type_at(index, row.columns().len()),
                         })
                         .collect();
                 }
@@ -732,6 +792,22 @@ mod tests {
         }
     }
 
+    fn names(result: &QueryResult) -> Vec<&str> {
+        result
+            .columns
+            .iter()
+            .map(|column| column.name.as_str())
+            .collect()
+    }
+
+    fn types(result: &QueryResult) -> Vec<Option<&str>> {
+        result
+            .columns
+            .iter()
+            .map(|column| column.data_type.as_deref())
+            .collect()
+    }
+
     #[test]
     fn connection_string_quotes_values() {
         let config = config();
@@ -849,6 +925,7 @@ mod tests {
                 .iter()
                 .map(|name| Column {
                     name: (*name).to_string(),
+                    ..Default::default()
                 })
                 .collect(),
             rows: rows
@@ -1017,15 +1094,11 @@ mod tests {
             .query("SELECT * FROM (VALUES (1, 'alpha'), (2, NULL)) AS sample(id, label)")
             .expect("query should succeed");
 
-        assert_eq!(
-            result.columns,
-            vec![
-                Column { name: "id".into() },
-                Column {
-                    name: "label".into()
-                }
-            ]
-        );
+        assert_eq!(names(&result), vec!["id", "label"]);
+        // Types come from describing the statement, which the simple protocol
+        // itself cannot answer for. `text` for the second column is the
+        // server's own answer for an unadorned literal.
+        assert_eq!(types(&result), vec![Some("int4"), Some("text")]);
         assert_eq!(
             result.rows,
             vec![
@@ -1050,7 +1123,7 @@ mod tests {
             .query("SELECT 1 AS a, 2 AS b, 3 AS c; SELECT 4 AS d")
             .expect("query should succeed");
 
-        assert_eq!(result.columns, vec![Column { name: "d".into() }]);
+        assert_eq!(names(&result), vec!["d"]);
         assert_eq!(result.rows, vec![vec![Some("4".into())]]);
         assert!(
             result.rows.iter().all(|row| row.len() == result.columns.len()),
@@ -1062,15 +1135,7 @@ mod tests {
             .query("SELECT 1 AS id, 'x' AS label WHERE false")
             .expect("query should succeed");
 
-        assert_eq!(
-            empty.columns,
-            vec![
-                Column { name: "id".into() },
-                Column {
-                    name: "label".into()
-                }
-            ]
-        );
+        assert_eq!(names(&empty), vec!["id", "label"]);
         assert!(empty.rows.is_empty());
     }
 

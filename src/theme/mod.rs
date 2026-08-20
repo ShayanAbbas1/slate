@@ -69,7 +69,10 @@ pub mod layout {
     pub const RESULTS_EMPTY_HEIGHT: f32 = 100.0;
     pub const RESULTS_DEFAULT_HEIGHT: f32 = 360.0;
     pub const RESULTS_MIN_HEIGHT: f32 = 100.0;
-    pub const GRID_COLUMN_WIDTH: f32 = 180.0;
+    /// The row inspector beside the grid. Fixed: it is read, not worked in, and
+    /// a second draggable split inside the results pane is a handle nobody
+    /// asked for.
+    pub const INSPECTOR_WIDTH: f32 = 300.0;
     pub const SIDEBAR_DEFAULT_WIDTH: f32 = 256.0;
     pub const SIDEBAR_MIN_WIDTH: f32 = 180.0;
     pub const SIDEBAR_MAX_WIDTH: f32 = 480.0;

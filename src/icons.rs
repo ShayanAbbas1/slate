@@ -22,12 +22,16 @@ use icondata_core::IconData;
 /// The gpui-component widgets ask for their own paths — those are Lucide names
 /// too, so they resolve here as well. Add a row when something asks for one;
 /// an unlisted path simply draws nothing.
-const ICONS: [(&str, &IconData); 29] = [
+const ICONS: [(&str, &IconData); 31] = [
     ("icons/chevron-down.svg", icondata_lu::LuChevronDown),
     ("icons/chevron-right.svg", icondata_lu::LuChevronRight),
     ("icons/chevron-left.svg", icondata_lu::LuChevronLeft),
     ("icons/chevron-up.svg", icondata_lu::LuChevronUp),
     ("icons/chevrons-up-down.svg", icondata_lu::LuChevronsUpDown),
+    // Asked for by the library's own sorted-column headers, not by name from
+    // anywhere in Slate.
+    ("icons/sort-ascending.svg", icondata_lu::LuArrowUpNarrowWide),
+    ("icons/sort-descending.svg", icondata_lu::LuArrowDownWideNarrow),
     ("icons/file-code.svg", icondata_lu::LuFileCode),
     ("icons/trash.svg", icondata_lu::LuTrash2),
     ("icons/check.svg", icondata_lu::LuCheck),
@@ -158,21 +162,34 @@ mod tests {
             icon::SCRATCH_QUERY,
             icon::FILL_DOWN,
         ] {
-            let loaded = Icons.load(path).unwrap();
-            let document = loaded.unwrap_or_else(|| panic!("{path} has no icon"));
-            let document = String::from_utf8(document.to_vec()).unwrap();
-            assert!(document.starts_with("<svg"), "{path}: {document}");
-            // Any child element counts: Lucide draws with <path>, <polygon>,
-            // <circle> and friends, and an icon that names none of them is
-            // an invisible icon.
-            let content = document
-                .split_once('>')
-                .map(|(_, rest)| rest)
-                .unwrap_or("");
-            assert!(
-                content.trim_end().trim_end_matches("</svg>").contains('<'),
-                "{path} drew nothing"
-            );
+            assert_draws(path);
         }
+    }
+
+    #[test]
+    fn every_listed_icon_draws_something() {
+        // The paths the library's own widgets ask for are never named in
+        // Slate, so nothing above would notice a row here going bad.
+        for (path, _) in ICONS {
+            assert_draws(path);
+        }
+    }
+
+    fn assert_draws(path: &str) {
+        let loaded = Icons.load(path).unwrap();
+        let document = loaded.unwrap_or_else(|| panic!("{path} has no icon"));
+        let document = String::from_utf8(document.to_vec()).unwrap();
+        assert!(document.starts_with("<svg"), "{path}: {document}");
+        // Any child element counts: Lucide draws with <path>, <polygon>,
+        // <circle> and friends, and an icon that names none of them is
+        // an invisible icon.
+        let content = document
+            .split_once('>')
+            .map(|(_, rest)| rest)
+            .unwrap_or("");
+        assert!(
+            content.trim_end().trim_end_matches("</svg>").contains('<'),
+            "{path} drew nothing"
+        );
     }
 }

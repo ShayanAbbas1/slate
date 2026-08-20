@@ -22,7 +22,7 @@ use gpui_component::{
     kbd::Kbd,
     list::ListItem,
     resizable::{h_resizable, resizable_panel, v_resizable},
-    table::{Table, TableState},
+    table::{Table, TableDelegate, TableState},
     tree::{TreeState, tree as render_tree},
 };
 
@@ -468,7 +468,10 @@ fn result_grid(
 ) -> Entity<TableState<ResultGrid>> {
     cx.new(|cx| {
         TableState::new(ResultGrid::empty(), window, cx)
-            .sortable(false)
+            // Sorting is the grid's own, over the rows it already holds. It
+            // never re-runs the statement, so the rows on screen stay the one
+            // snapshot the server sent.
+            .sortable(true)
             .col_movable(false)
             .col_resizable(true)
             .row_selectable(true)
@@ -1672,6 +1675,9 @@ impl Workspace {
         // screen -- a reader cannot tell stale rows from fresh ones.
         results.update(cx, |table, cx| {
             *table.delegate_mut() = ResultGrid::empty();
+            // The inspector reads whatever row is selected, and a row index
+            // means nothing once the rows behind it are gone.
+            table.clear_selection(cx);
             table.refresh(cx);
         });
         cx.notify();
@@ -2145,8 +2151,17 @@ impl Workspace {
             // heading of a column sits in the same rhythm as its values.
             _ => div()
                 .size_full()
-                .font_family(mono)
-                .child(Table::new(results).bordered(false))
+                .flex()
+                .min_h_0()
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .h_full()
+                        .font_family(mono)
+                        .child(Table::new(results).bordered(false).stripe(true)),
+                )
+                .children(Self::render_row_inspector(results, cx))
                 .into_any_element(),
         };
 
@@ -2156,6 +2171,137 @@ impl Workspace {
             .bg(t.bg)
             .child(content)
             .into_any_element()
+    }
+
+    /// The selected row, one field per line, beside the grid.
+    ///
+    /// A row read across a grid is a row read against the column headings
+    /// twenty columns away; read down a list it is just a row. The list also
+    /// has room for a value the column had to clip, which is what makes this
+    /// the value inspector the spec asks for in §4.4.
+    ///
+    /// Nothing here is state of Slate's own: the selected row belongs to the
+    /// grid, so the panel cannot disagree with the highlight in the grid, and
+    /// arrow keys move both.
+    fn render_row_inspector(
+        results: &Entity<TableState<ResultGrid>>,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let t = *theme(cx);
+        let mono = gpui_component::Theme::global(cx).mono_font_family.clone();
+
+        let (row_ix, rows, fields) = {
+            let table = results.read(cx);
+            let row_ix = table.selected_row()?;
+            (
+                row_ix,
+                table.delegate().rows_count(cx),
+                table.delegate().fields(row_ix),
+            )
+        };
+        // A selection can outlive the rows it was made against.
+        if fields.is_empty() {
+            return None;
+        }
+
+        let table = results.clone();
+        Some(
+            div()
+                .w(px(layout::INSPECTOR_WIDTH))
+                .flex_shrink_0()
+                .h_full()
+                .flex()
+                .flex_col()
+                // One tone behind the results: this describes the data rather
+                // than being it.
+                .bg(t.panel)
+                .child(
+                    div()
+                        .h(px(layout::TAB_HEIGHT))
+                        .px(px(layout::SPACE_SM))
+                        .flex()
+                        .items_center()
+                        .gap(px(layout::SPACE_SM))
+                        .child(
+                            div()
+                                .text_size(px(layout::TEXT_SM))
+                                .text_color(t.text_muted)
+                                .child(format!(
+                                    "Row {} of {}",
+                                    group_thousands(row_ix as u64 + 1),
+                                    group_thousands(rows as u64)
+                                )),
+                        )
+                        .child(
+                            div().ml_auto().child(
+                                Button::new("close-row-inspector")
+                                    .icon(icon(icon::CLOSE))
+                                    .ghost()
+                                    .xsmall()
+                                    .tooltip("Close the row panel")
+                                    .on_click(move |_, _, cx| {
+                                        table.update(cx, |table, cx| table.clear_selection(cx));
+                                    }),
+                            ),
+                        ),
+                )
+                .child(
+                    div()
+                        .id("row-inspector")
+                        .flex_1()
+                        .min_h_0()
+                        .overflow_y_scroll()
+                        .px(px(layout::SPACE_SM))
+                        .pb(px(layout::SPACE_SM))
+                        .flex()
+                        .flex_col()
+                        .gap(px(layout::SPACE_MD))
+                        .children(fields.into_iter().map(|field| {
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap(px(layout::SPACE_XS))
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap(px(layout::SPACE_SM))
+                                        .child(
+                                            div()
+                                                .text_size(px(layout::TEXT_SM))
+                                                .text_color(t.text_muted)
+                                                .child(field.name),
+                                        )
+                                        // Absent rather than guessed: a type
+                                        // Slate could not learn is not shown as
+                                        // one it inferred from the text.
+                                        .children(field.data_type.map(|data_type| {
+                                            div()
+                                                .ml_auto()
+                                                .flex_shrink_0()
+                                                .text_size(px(layout::TEXT_XS))
+                                                .text_color(t.text_faint)
+                                                .child(data_type)
+                                        })),
+                                )
+                                .child(
+                                    div()
+                                        .font_family(mono.clone())
+                                        .text_size(px(layout::TEXT_SM))
+                                        .map(|value| match field.value {
+                                            Some(text) => value.text_color(t.text).child(text),
+                                            // Italic so a NULL cannot be read
+                                            // as the four-letter string.
+                                            None => value
+                                                .text_color(t.text_faint)
+                                                .italic()
+                                                .child(result_grid::NULL_LABEL),
+                                        }),
+                                )
+                        })),
+                )
+                .into_any_element(),
+        )
     }
 
     /// One segment of the Data | Structure pair. A quiet chip rather than a
