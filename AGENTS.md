@@ -14,12 +14,30 @@ This file is the operational summary; the spec is the source of truth.
 Violating one of these is a bug regardless of the benefit. If a task seems to
 require it, stop and raise it instead.
 
-1. **Never rewrite SQL.** Not what the user typed, not what Slate generated. No
-   silent `LIMIT` injection into a user's statement, no column projection, no
-   reformatting on execute. Row limits apply to Slate-generated preview queries
-   only, and they are visible in the UI.
-2. **The result grid is read-only.** No code path leads from the grid to a
-   mutating statement.
+1. **Never rewrite SQL behind the user's back.** No silent `LIMIT` injection, no
+   column projection, no reformatting on execute, and nothing at all on a
+   statement the user did not ask Slate to change. Row limits apply to
+   Slate-generated preview queries only, and they are visible in the UI.
+
+   Slate *does* write SQL when the user asks it to, and only then. A header
+   click asking for a sort is such an ask: the `ORDER BY` is spliced into the
+   statement in the buffer, where the user can read it, edit it and undo it,
+   and the statement that runs is the statement on screen. The same will hold
+   for in-place row editing.
+
+   Two limits on what Slate may write. It never writes a **destructive**
+   statement — no `DROP`, no `TRUNCATE`, no `DELETE` — whatever the user asked
+   for. And it never writes into a statement it cannot parse whole:
+   `sql::with_order_by` refuses rather than guessing at a clause boundary,
+   because a corrupted statement is worse than an unsorted grid.
+
+   This replaces the earlier absolute rule, and supersedes invariant 1 of the
+   spec's §5 on this point. The reasoning there — that a client which silently
+   alters statements cannot be trusted with the statements that matter — is
+   why "silently" is still the word that carries the rule.
+2. **The result grid is read-only until row editing exists.** No code path leads
+   from the grid to a mutating statement, and none may lead to a destructive
+   one afterwards either.
 3. **No environment-specific behaviour.** No vendor binary names in error
    strings, no assumption that a loopback host means plaintext, no hardcoded
    ports or hostnames. Slate is a generic client.

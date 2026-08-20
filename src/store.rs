@@ -28,8 +28,6 @@ pub struct StoredProfile {
 /// catalog is the source of truth for what it holds, so a restored tab shows
 /// today's definition and one that has been dropped simply does not come back.
 ///
-/// A buffer the user edited is the exception, because that is theirs and the
-/// catalog cannot regenerate it.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct StoredObject {
     pub schema: String,
@@ -41,8 +39,6 @@ pub struct StoredObject {
     /// schema from a relation in a key.
     #[serde(default)]
     pub active: bool,
-    #[serde(default)]
-    pub sql: Option<String>,
 }
 
 #[derive(Default, Debug, PartialEq, Serialize, Deserialize)]
@@ -236,14 +232,12 @@ mod tests {
                     name: "accounts".into(),
                     routine: false,
                     active: true,
-                    sql: Some("select 1".into()),
                 },
                 StoredObject {
                     schema: "public".into(),
                     name: "total(integer)".into(),
                     routine: true,
                     active: false,
-                    sql: None,
                 },
             ],
         };

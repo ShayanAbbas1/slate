@@ -28,8 +28,6 @@ const ICONS: [(&str, &IconData); 31] = [
     ("icons/chevron-left.svg", icondata_lu::LuChevronLeft),
     ("icons/chevron-up.svg", icondata_lu::LuChevronUp),
     ("icons/chevrons-up-down.svg", icondata_lu::LuChevronsUpDown),
-    // Asked for by the library's own sorted-column headers, not by name from
-    // anywhere in Slate.
     ("icons/sort-ascending.svg", icondata_lu::LuArrowUpNarrowWide),
     ("icons/sort-descending.svg", icondata_lu::LuArrowDownWideNarrow),
     ("icons/file-code.svg", icondata_lu::LuFileCode),
@@ -64,6 +62,11 @@ pub mod icon {
     pub const CHEVRON_DOWN: &str = "icons/chevron-down.svg";
     pub const CHEVRON_RIGHT: &str = "icons/chevron-right.svg";
     pub const SWITCHER: &str = "icons/chevrons-up-down.svg";
+    /// A column header's sort state: which way the server ordered the rows, or
+    /// that it could be asked to.
+    pub const SORT_UP: &str = "icons/sort-ascending.svg";
+    pub const SORT_DOWN: &str = "icons/sort-descending.svg";
+    pub const SORTABLE: &str = "icons/chevrons-up-down.svg";
     pub const SAVED_QUERY: &str = "icons/file-code.svg";
     pub const DELETE: &str = "icons/trash.svg";
     pub const SEARCH: &str = "icons/search.svg";
@@ -141,6 +144,9 @@ mod tests {
             icon::CHEVRON_DOWN,
             icon::CHEVRON_RIGHT,
             icon::SWITCHER,
+            icon::SORT_UP,
+            icon::SORT_DOWN,
+            icon::SORTABLE,
             icon::SAVED_QUERY,
             icon::DELETE,
             icon::SEARCH,

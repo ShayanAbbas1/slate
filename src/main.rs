@@ -10,11 +10,12 @@ mod theme;
 use std::{borrow::Cow, collections::HashMap, sync::Arc};
 
 use gpui::{
-    AnyElement, App, AppContext, Application, ClickEvent, Context, Entity, EntityInputHandler,
-    Focusable, FontWeight, InteractiveElement, IntoElement, KeyBinding, Keystroke, ParentElement,
-    Render, StatefulInteractiveElement, Styled, TitlebarOptions, Window, WindowOptions, actions,
-    div, point, prelude::FluentBuilder, px,
+    Action, AnyElement, App, AppContext, Application, ClickEvent, Context, Entity,
+    EntityInputHandler, Focusable, FontWeight, InteractiveElement, IntoElement, KeyBinding,
+    Keystroke, ParentElement, Render, StatefulInteractiveElement, Styled, TitlebarOptions, Window,
+    WindowOptions, actions, div, point, prelude::FluentBuilder, px,
 };
+use serde::Deserialize;
 use gpui_component::{
     InteractiveElementExt, Root, Sizable,
     button::{Button, ButtonVariants},
@@ -32,8 +33,17 @@ use db::{
 use explorer::{ExplorerLeaf, ExplorerTarget, ObjectKind, preview_sql, tree as build_explorer_tree};
 use icons::{Icons, icon};
 use result_grid::ResultGrid;
-use sql::Buffer;
+use sql::{Buffer, SortKey};
 use theme::{Theme, layout, theme};
+
+/// A header click. The column is the one in the grid; which statement it
+/// belongs to is whatever surface is in front, because that is the grid the
+/// click came from.
+#[derive(Clone, PartialEq, Eq, Deserialize, Action)]
+#[action(namespace = slate, no_json)]
+struct SortColumn {
+    column: usize,
+}
 
 actions!(
     slate,
@@ -84,7 +94,7 @@ impl Profile {
         }
     }
 
-    fn stored(&self, cx: &App) -> store::StoredProfile {
+    fn stored(&self) -> store::StoredProfile {
         // Tabs read back from disk that the catalog has not named yet are still
         // the truth about this profile: writing the live list instead would
         // drop every restored object the first time anything else is saved.
@@ -100,7 +110,7 @@ impl Profile {
                 .filter(|tab| !tab.transient)
                 .map(|tab| store::StoredObject {
                     active: active == Tab::Object(tab.id),
-                    ..tab.stored(cx)
+                    ..tab.stored()
                 })
                 .collect()
         } else {
@@ -251,16 +261,12 @@ impl Session {
         }
     }
 
-    /// The buffer a run reads from. A relation's tab has one of its own, so
-    /// `cmd+enter` runs what is in front of the user rather than whatever the
-    /// query tab happens to hold.
+    /// The buffer a run reads from, which only the query tab has. An object tab
+    /// shows an object: there is no SQL in front of the user to run.
     fn editor(&self, tab: Tab) -> Option<Entity<InputState>> {
         match tab {
             Tab::Query => Some(self.editor.clone()),
-            Tab::Object(id) => match &self.objects.iter().find(|tab| tab.id == id)?.body {
-                ObjectBody::Relation { editor, .. } => Some(editor.clone()),
-                ObjectBody::Routine(_) => None,
-            },
+            Tab::Object(_) => None,
         }
     }
 
@@ -290,25 +296,13 @@ impl Session {
         }
     }
 
-    /// The buffer of an object's tab was typed into: the tab has earned its
-    /// place, and it has stopped being a view of the object.
-    fn mark_edited(&mut self, id: u64) -> bool {
-        let Some(tab) = self.objects.iter_mut().find(|tab| tab.id == id) else {
-            return false;
-        };
-        let changed = tab.transient || !tab.edited;
-        tab.transient = false;
-        tab.edited = true;
-        // Structure is about to disappear, and leaving it on screen would
-        // strand the reader on a view with no way back to their own rows.
-        if let ObjectBody::Relation {
-            showing_structure, ..
-        } = &mut tab.body
-        {
-            *showing_structure = false;
-        }
-        changed
-    }
+}
+
+/// What takes focus when a surface comes to the front. A buffer and a grid are
+/// both focusable and neither is the other's type.
+enum Focus {
+    Buffer(Entity<InputState>),
+    Grid(Entity<TableState<ResultGrid>>),
 }
 
 enum CatalogState {
@@ -339,31 +333,16 @@ struct ObjectTab {
     /// tab, the next one replaces it, and only a deliberate gesture — a double
     /// click, or typing in its buffer — makes it stay.
     transient: bool,
-    /// The buffer is no longer the one Slate generated. The tab keeps the
-    /// object's name and icon, but it is a query about the object now rather
-    /// than a view of it, so the object's own Structure goes away with it.
-    edited: bool,
     body: ObjectBody,
 }
 
 impl ObjectTab {
-    fn stored(&self, cx: &App) -> store::StoredObject {
-        let sql = match &self.body {
-            // Only what the user changed. A buffer still holding the SQL Slate
-            // generated is regenerated instead, so a restored tab follows the
-            // relation rather than a snapshot of it.
-            ObjectBody::Relation { editor, .. } if self.edited => {
-                Some(editor.read(cx).value().to_string())
-            }
-            _ => None,
-        };
-
+    fn stored(&self) -> store::StoredObject {
         store::StoredObject {
             schema: self.schema.clone(),
             name: self.name.clone(),
             routine: matches!(self.kind, ObjectKind::Routine(_)),
             active: false,
-            sql,
         }
     }
 }
@@ -375,9 +354,6 @@ enum OpenedObject {
         schema: String,
         name: String,
         kind: RelationKind,
-        /// The buffer this tab had when it was last closed, if the user had
-        /// changed it.
-        sql: Option<String>,
     },
     Routine {
         schema: String,
@@ -429,7 +405,6 @@ impl OpenedObject {
                 schema: schema.name.clone(),
                 name: relation.name.clone(),
                 kind: relation.kind,
-                sql: stored.sql.clone(),
             })
         }
     }
@@ -442,16 +417,21 @@ fn routine_name(routine: &Routine) -> String {
 }
 
 enum ObjectBody {
-    /// An opened relation. Its generated `SELECT` is an ordinary editable
-    /// buffer -- the tab is a query tab that happened to be written by Slate --
-    /// over its own grid, with the relation's definition behind the Structure
-    /// toggle (spec §3.2).
+    /// An opened relation: its rows, full height, with the relation's
+    /// definition behind the Structure toggle (spec §3.2).
+    ///
+    /// No editor. A generated `SELECT` shown above the grid read as a query the
+    /// user had written and invited edits to a buffer that then stopped being a
+    /// view of the relation at all. The SQL Slate runs here is its own, and the
+    /// only thing the user changes about it is the sort.
     Relation {
-        editor: Entity<InputState>,
         showing_structure: bool,
         structure: StructureState,
         results: Entity<TableState<ResultGrid>>,
         query: QueryState,
+        /// The `ORDER BY` the header clicks have built up. Slate owns this
+        /// statement, so sorting regenerates it rather than editing text.
+        sort: Vec<SortKey>,
     },
     Routine(Routine),
 }
@@ -717,7 +697,7 @@ impl Workspace {
         let profiles = self
             .profiles
             .iter()
-            .map(|profile| profile.stored(cx))
+            .map(Profile::stored)
             .collect::<Vec<_>>();
         if let Err(message) = store::save_profiles(&profiles) {
             self.note(message, cx);
@@ -1050,7 +1030,6 @@ impl Workspace {
                     schema: schema.name.clone(),
                     name: relation.name.clone(),
                     kind: relation.kind,
-                    sql: None,
                 })
             }),
             ExplorerTarget::Routine {
@@ -1119,38 +1098,15 @@ impl Workspace {
 
         let id = profile.session.next_object_id;
         profile.session.next_object_id += 1;
-        let edited = matches!(opened, OpenedObject::Relation { sql: Some(_), .. });
         let body = match opened {
             OpenedObject::Routine { routine, .. } => ObjectBody::Routine(routine),
-            OpenedObject::Relation { sql, .. } => {
-                let sql = sql.unwrap_or_else(|| preview_sql(&schema, &name));
-                let editor = cx.new(|cx| {
-                    InputState::new(window, cx)
-                        .code_editor("sql")
-                        .soft_wrap(false)
-                        .default_value(sql)
-                });
-                // Typing in a buffer is the other way a preview tab earns its
-                // place, the same as it does in an editor.
-                cx.subscribe(&editor, move |workspace, _, event: &InputEvent, cx| {
-                    if matches!(event, InputEvent::Change)
-                        && let Some(profile) = workspace.profile_mut()
-                        && profile.session.mark_edited(id)
-                    {
-                        workspace.remember_profiles(cx);
-                        cx.notify();
-                    }
-                })
-                .detach();
-
-                ObjectBody::Relation {
-                    editor,
-                    showing_structure: false,
-                    structure: StructureState::Loading,
-                    results: result_grid(window, cx),
-                    query: QueryState::Idle,
-                }
-            }
+            OpenedObject::Relation { .. } => ObjectBody::Relation {
+                showing_structure: false,
+                structure: StructureState::Loading,
+                results: result_grid(window, cx),
+                query: QueryState::Idle,
+                sort: Vec::new(),
+            },
         };
         self.profile_mut()?.session.objects.push(ObjectTab {
             id,
@@ -1158,7 +1114,6 @@ impl Workspace {
             name,
             kind,
             transient,
-            edited,
             body,
         });
         Some(id)
@@ -1175,20 +1130,47 @@ impl Workspace {
         else {
             return;
         };
-        let ObjectBody::Relation { editor, query, .. } = &tab.body else {
+        let ObjectBody::Relation { query, sort, .. } = &tab.body else {
             return;
         };
         if !matches!(query, QueryState::Idle | QueryState::Failed(_)) {
             return;
         }
 
-        let sql = editor.read(cx).value().to_string();
-        let (schema, relation, edited) = (tab.schema.clone(), tab.name.clone(), tab.edited);
-        // An edited tab has no Structure toggle to reach it with, so loading a
-        // definition for it is a round trip nobody can see.
-        if !edited {
-            self.load_structure(id, schema, relation, cx);
-        }
+        let (schema, relation) = (tab.schema.clone(), tab.name.clone());
+        let sql = relation_sql(&schema, &relation, sort);
+        self.load_structure(id, schema, relation, cx);
+        self.execute_sql(sql, Tab::Object(id), cx);
+    }
+
+    /// The statement behind a relation's tab: Slate's own preview, carrying the
+    /// sort the header clicks asked for. Regenerated rather than edited, so the
+    /// row limit and the quoting cannot drift out of one place.
+    fn relation_sort(&mut self, id: u64, column: usize, cx: &mut Context<Self>) {
+        let Some(profile) = self.profile_mut() else {
+            return;
+        };
+        let Some(tab) = profile.session.objects.iter_mut().find(|tab| tab.id == id) else {
+            return;
+        };
+        let (schema, relation) = (tab.schema.clone(), tab.name.clone());
+        let ObjectBody::Relation {
+            sort,
+            results,
+            query,
+            ..
+        } = &mut tab.body
+        else {
+            return;
+        };
+
+        let Some(expression) = sort_expression(results.read(cx).delegate().columns(), column) else {
+            return;
+        };
+        cycle(sort, &expression);
+        let sql = relation_sql(&schema, &relation, sort);
+        // A preview only re-queries when it is asked to, and this is the ask.
+        *query = QueryState::Idle;
         self.execute_sql(sql, Tab::Object(id), cx);
     }
 
@@ -1386,9 +1368,12 @@ impl Workspace {
             return;
         };
         let tab = profile.session.active;
-        // A routine's tab has no buffer, and running SQL the user cannot see is
-        // how an unrelated statement left in a hidden one gets executed by
-        // muscle memory.
+        // An object tab has no buffer of its own: running it again is a refresh
+        // of the rows Slate fetched, which is the only thing there is to run.
+        if let Tab::Object(id) = tab {
+            self.refresh_relation(id, cx);
+            return;
+        }
         let Some(editor) = profile.session.editor(tab) else {
             return;
         };
@@ -1407,6 +1392,88 @@ impl Workspace {
         };
 
         self.execute_sql(sql, tab, cx);
+    }
+
+    /// Run a relation's statement again. The rows are a snapshot, and this is
+    /// the only way to ask for a newer one.
+    fn refresh_relation(&mut self, id: u64, cx: &mut Context<Self>) {
+        let Some(profile) = self.profile_mut() else {
+            return;
+        };
+        let Some(tab) = profile.session.objects.iter_mut().find(|tab| tab.id == id) else {
+            return;
+        };
+        let (schema, relation) = (tab.schema.clone(), tab.name.clone());
+        let ObjectBody::Relation { sort, query, .. } = &mut tab.body else {
+            return;
+        };
+        let sql = relation_sql(&schema, &relation, sort);
+        *query = QueryState::Idle;
+        self.execute_sql(sql, Tab::Object(id), cx);
+    }
+
+    /// A column header was clicked: put that column into the statement's
+    /// `ORDER BY` and run it again.
+    ///
+    /// The sort is the server's, not the grid's. Ordering the rows already
+    /// fetched would sort one page of a table and call it sorted; asking the
+    /// database means the top of the sort is the table's, not the page's.
+    ///
+    /// A click appends: a column that is not in the sort joins the end of it,
+    /// one that is ascending turns around, and one that is descending drops
+    /// out. Several columns therefore build up a compound sort by clicking.
+    fn sort_column(&mut self, action: &SortColumn, window: &mut Window, cx: &mut Context<Self>) {
+        let column = action.column;
+        let Some(profile) = self.profile() else {
+            return;
+        };
+
+        match profile.session.active {
+            Tab::Object(id) => self.relation_sort(id, column, cx),
+            Tab::Query => self.query_sort(column, window, cx),
+        }
+    }
+
+    /// Sorting a query the user wrote: the `ORDER BY` goes into their statement,
+    /// where they can see it, edit it and undo it. Slate changes SQL only when
+    /// asked, and a header click is the ask (`AGENTS.md`, rule 1).
+    fn query_sort(&mut self, column: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(profile) = self.profile() else {
+            return;
+        };
+        let editor = profile.session.editor.clone();
+        let results = profile.session.results.clone();
+
+        let Some(expression) = sort_expression(results.read(cx).delegate().columns(), column) else {
+            return;
+        };
+
+        let (text, cursor) = {
+            let editor = editor.read(cx);
+            (editor.value().to_string(), editor.cursor())
+        };
+        let Some(range) = Buffer::parse(&text).statement_at(cursor) else {
+            return;
+        };
+        let statement = &text[range.clone()];
+
+        let Some(mut keys) = sql::order_by(statement) else {
+            self.note(
+                "Slate cannot add an ORDER BY to this statement without rewriting it.".into(),
+                cx,
+            );
+            return;
+        };
+        cycle(&mut keys, &expression);
+        let Some(sorted) = sql::with_order_by(statement, &keys) else {
+            self.note("This statement cannot carry an ORDER BY.".into(), cx);
+            return;
+        };
+
+        let mut replaced = text.clone();
+        replaced.replace_range(range, &sorted);
+        editor.update(cx, |editor, cx| editor.set_value(replaced, window, cx));
+        self.execute_sql(sorted, Tab::Query, cx);
     }
 
     fn persist_buffer(&self, cx: &App) -> Result<(), String> {
@@ -1682,6 +1749,12 @@ impl Workspace {
         });
         cx.notify();
 
+        // Read from the statement that is about to run, so the headers say what
+        // the rows on screen are actually ordered by rather than what Slate
+        // last intended to ask for.
+        let keys = sql::order_by(&sql);
+        let sortable = keys.is_some();
+        let keys = keys.unwrap_or_default();
         let query_task = cx
             .background_executor()
             .spawn(async move { connection.query(&sql) });
@@ -1706,7 +1779,9 @@ impl Workspace {
                                 rows_affected: result.rows_affected,
                             };
                             results.update(cx, |table, cx| {
-                                *table.delegate_mut() = ResultGrid::new(result);
+                                let sort = sort_columns(&keys, &result.columns);
+                                *table.delegate_mut() =
+                                    ResultGrid::new(result).with_sort(sort, sortable);
                                 table.refresh(cx);
                             });
                         }
@@ -1904,7 +1979,7 @@ impl Workspace {
     fn render_main_content(profile: &Profile, cx: &mut Context<Self>) -> AnyElement {
         let t = *theme(cx);
         let body = match profile.session.active_object() {
-            Some(tab) => Self::render_object(profile, tab, cx),
+            Some(tab) => Self::render_object(tab, cx),
             None => Self::render_query_surface(profile, cx),
         };
 
@@ -1990,38 +2065,29 @@ impl Workspace {
     /// An opened object. A relation's generated `SELECT` is an ordinary buffer
     /// the user can edit and run; only a routine, which has nothing to run, is
     /// read-only.
-    fn render_object(profile: &Profile, tab: &ObjectTab, cx: &mut Context<Self>) -> AnyElement {
+    fn render_object(tab: &ObjectTab, cx: &mut Context<Self>) -> AnyElement {
         let t = *theme(cx);
         let ObjectBody::Relation {
-            editor,
             showing_structure,
             structure,
             results,
             query,
+            ..
         } = &tab.body
         else {
             return Self::render_routine(tab, cx);
         };
 
-        let bottom = if *showing_structure {
-            div()
+        if *showing_structure {
+            return div()
                 .size_full()
                 .min_h_0()
                 .bg(t.bg)
                 .child(Self::render_structure(structure, cx))
-                .into_any_element()
-        } else {
-            Self::render_results(query, results, false, cx)
-        };
+                .into_any_element();
+        }
 
-        Self::render_editor_surface(
-            gpui::ElementId::from(("object-split", tab.id as usize)),
-            editor,
-            profile.session.editor_font_size,
-            query,
-            bottom,
-            cx,
-        )
+        Self::render_results(query, results, false, cx)
     }
 
     fn render_routine(tab: &ObjectTab, cx: &mut Context<Self>) -> AnyElement {
@@ -2628,16 +2694,11 @@ impl Workspace {
                 )
         });
 
-        // A relation's tab shows the same two views the preview surface used
-        // to, but from the strip: its editor is a query tab now, and a header
-        // of its own would be a second bar saying what this one already says.
-        //
-        // Once the buffer has been changed the pair goes away: whatever the
-        // editor holds is no longer a view of that relation, and a Structure
-        // beside it would describe something the rows no longer come from.
+        // A relation's tab shows the two views of an object from the strip: a
+        // header of its own would be a second bar saying what this one already
+        // says.
         let structure_toggle = session
             .active_object()
-            .filter(|tab| !tab.edited)
             .and_then(|tab| match &tab.body {
                 ObjectBody::Relation {
                     showing_structure, ..
@@ -3076,19 +3137,38 @@ impl Render for Workspace {
                 let wanted = profile.session.save_name_needs_focus;
                 return wanted.then(|| {
                     profile.session.save_name_needs_focus = false;
-                    profile.session.save_name.clone()
+                    Focus::Buffer(profile.session.save_name.clone())
                 });
             }
             if !profile.session.editor_needs_focus {
                 return None;
             }
-            // Whichever buffer is in front: a relation's tab has one of its own.
-            let editor = profile.session.editor(profile.session.active)?;
+            // Whatever the surface in front is: a keystroke reaches the
+            // workspace along the focused element's dispatch path, so a
+            // surface with nothing focused makes every keybinding dead.
+            let focus = match profile.session.active {
+                Tab::Query => Focus::Buffer(profile.session.editor.clone()),
+                Tab::Object(id) => {
+                    let tab = profile
+                        .session
+                        .objects
+                        .iter()
+                        .find(|tab| tab.id == id)?;
+                    match &tab.body {
+                        ObjectBody::Relation { results, .. } => Focus::Grid(results.clone()),
+                        // A routine's tab is read. Nothing in it takes a
+                        // keystroke, so nothing in it takes focus either.
+                        ObjectBody::Routine(_) => return None,
+                    }
+                }
+            };
             profile.session.editor_needs_focus = false;
-            Some(editor)
+            Some(focus)
         });
-        if let Some(input) = take_focus {
-            input.focus_handle(cx).focus(window);
+        match take_focus {
+            Some(Focus::Buffer(input)) => input.focus_handle(cx).focus(window),
+            Some(Focus::Grid(grid)) => grid.focus_handle(cx).focus(window),
+            None => {}
         }
 
         if self.form.is_some() {
@@ -3151,6 +3231,7 @@ impl Render for Workspace {
         div()
             .id("workspace")
             .on_action(cx.listener(Self::run_query))
+            .on_action(cx.listener(Self::sort_column))
             .on_action(cx.listener(Self::show_editor))
             .on_action(cx.listener(Self::cycle_theme))
             .on_action(cx.listener(Self::save_query))
@@ -3233,6 +3314,75 @@ impl Render for Workspace {
 /// into partitions, an eye for the kinds that are a saved query over a table, a
 /// disk for the one that stores its answer, and a globe for the one that lives
 /// on another server entirely.
+/// Slate's statement for a relation's tab, carrying the sort the headers asked
+/// for. Regenerated rather than edited, so the row limit and the quoting stay
+/// in one place.
+fn relation_sql(schema: &str, relation: &str, sort: &[SortKey]) -> String {
+    let preview = preview_sql(schema, relation);
+    sql::with_order_by(&preview, sort).unwrap_or(preview)
+}
+
+/// How a column is named in an `ORDER BY`.
+///
+/// By name, so the statement reads as something a person would have written --
+/// except where a name cannot identify one column, and then by position, which
+/// always can. Duplicate names come back from any join written with `*`.
+fn sort_expression(columns: &[db::Column], column: usize) -> Option<String> {
+    let name = &columns.get(column)?.name;
+    let unique = columns
+        .iter()
+        .filter(|other| &other.name == name)
+        .count()
+        == 1;
+
+    Some(match unique && !name.is_empty() {
+        true => format!("\"{}\"", name.replace('"', "\"\"")),
+        false => (column + 1).to_string(),
+    })
+}
+
+/// One header click against a sort: append, turn around, or drop out.
+fn cycle(keys: &mut Vec<SortKey>, expression: &str) {
+    match keys.iter().position(|key| key.expression == expression) {
+        None => keys.push(SortKey::new(expression, true)),
+        Some(index) if keys[index].ascending => keys[index].ascending = false,
+        Some(index) => {
+            keys.remove(index);
+        }
+    }
+}
+
+/// Which of a result's columns the statement ordered by, for the headers to
+/// show. A key naming something other than a column of the result -- an
+/// expression, or a column that is not in the select list -- lights nothing up,
+/// because there is no header for it.
+fn sort_columns(keys: &[SortKey], columns: &[db::Column]) -> Vec<(usize, bool)> {
+    keys.iter()
+        .filter_map(|key| {
+            let expression = key.expression.trim();
+            let named = unquote(expression);
+            let column = columns
+                .iter()
+                .position(|column| column.name == named)
+                .or_else(|| {
+                    expression
+                        .parse::<usize>()
+                        .ok()
+                        .filter(|position| (1..=columns.len()).contains(position))
+                        .map(|position| position - 1)
+                })?;
+            Some((column, key.ascending))
+        })
+        .collect()
+}
+
+fn unquote(expression: &str) -> String {
+    match expression.strip_prefix('"').and_then(|rest| rest.strip_suffix('"')) {
+        Some(inner) => inner.replace("\"\"", "\""),
+        None => expression.to_string(),
+    }
+}
+
 fn object_icon(kind: ObjectKind) -> &'static str {
     match kind {
         ObjectKind::Relation(RelationKind::Table) => icon::TABLE,
@@ -3481,6 +3631,83 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn columns(names: &[&str]) -> Vec<db::Column> {
+        names
+            .iter()
+            .map(|name| db::Column {
+                name: (*name).to_string(),
+                data_type: None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn clicking_a_column_appends_then_turns_around_then_drops_out() {
+        let mut keys = Vec::new();
+
+        cycle(&mut keys, r#""a""#);
+        assert_eq!(keys, vec![SortKey::new(r#""a""#, true)]);
+        // A second column joins the first rather than replacing it: that is
+        // what makes a compound sort reachable by clicking.
+        cycle(&mut keys, r#""b""#);
+        assert_eq!(
+            keys,
+            vec![SortKey::new(r#""a""#, true), SortKey::new(r#""b""#, true)]
+        );
+        cycle(&mut keys, r#""a""#);
+        assert_eq!(keys[0], SortKey::new(r#""a""#, false));
+        cycle(&mut keys, r#""a""#);
+        assert_eq!(keys, vec![SortKey::new(r#""b""#, true)]);
+    }
+
+    #[test]
+    fn a_column_is_named_in_the_order_by_unless_a_name_cannot_identify_it() {
+        let unique = columns(&["id", "name"]);
+        assert_eq!(sort_expression(&unique, 1), Some(r#""name""#.into()));
+
+        // `SELECT *` across a join returns the same name twice, and ordering by
+        // it would be ambiguous -- so the position, which never is.
+        let duplicated = columns(&["id", "id"]);
+        assert_eq!(sort_expression(&duplicated, 1), Some("2".into()));
+        assert_eq!(sort_expression(&unique, 7), None);
+
+        // A quote in a column name would otherwise end the identifier early.
+        let odd = columns(&["we\"ird"]);
+        assert_eq!(sort_expression(&odd, 0), Some("\"we\"\"ird\"".into()));
+    }
+
+    #[test]
+    fn the_headers_read_the_sort_back_off_the_statement() {
+        let result = columns(&["id", "name"]);
+        let keys = vec![
+            SortKey::new(r#""name""#, false),
+            SortKey::new("1", true),
+            // Neither of these has a header to light up.
+            SortKey::new("lower(name)", true),
+            SortKey::new("9", true),
+        ];
+
+        assert_eq!(sort_columns(&keys, &result), vec![(1, false), (0, true)]);
+    }
+
+    #[test]
+    fn a_relations_statement_carries_its_sort_before_the_limit() {
+        let sorted = relation_sql("public", "accounts", &[SortKey::new(r#""id""#, false)]);
+
+        assert_eq!(
+            sorted,
+            r#"SELECT * FROM "public"."accounts" ORDER BY "id" DESC LIMIT 1000"#
+        );
+        // And the sort Slate wrote is the sort its headers show.
+        assert_eq!(
+            sort_columns(
+                &sql::order_by(&sorted).unwrap(),
+                &columns(&["id", "email"])
+            ),
+            vec![(0, false)]
+        );
+    }
 
     #[test]
     fn editor_zoom_stays_inside_its_readable_range() {

@@ -1,16 +1,15 @@
-use std::cmp::Ordering;
-
 use gpui::{
     App, ClipboardItem, Context, InteractiveElement, IntoElement, ParentElement, SharedString,
-    Styled, Window, div, prelude::FluentBuilder, px,
+    StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder, px,
 };
 use gpui_component::{
     InteractiveElementExt,
-    table::{Column, ColumnSort, TableDelegate, TableState},
+    table::{Column, TableDelegate, TableState},
 };
 
 use crate::{
     db::QueryResult,
+    icons::icon,
     theme::{layout, theme},
 };
 
@@ -55,10 +54,13 @@ pub struct ResultGrid {
     /// Clipped, ref-counted copies built once per result set. `render_td` runs
     /// for every visible cell on every frame, so it must not allocate.
     display: Vec<Vec<Option<SharedString>>>,
-    /// Which row each screen position shows. Sorting permutes this rather than
-    /// the rows, so the server's order is always still there to return to, and
-    /// nothing that holds a row index has to be told the rows moved.
-    order: Vec<usize>,
+    /// The `ORDER BY` the rows arrived in, as column indices: the server did
+    /// the sorting, so this is a readout of the statement that ran, not a state
+    /// the grid can change on its own.
+    sort: Vec<(usize, bool)>,
+    /// Whether a header click can sort this result at all. A control that does
+    /// nothing is worse than no control.
+    sortable: bool,
     /// The last cell copied, marked so a copy is visible. A double click that
     /// leaves the screen unchanged reads as a click that did nothing.
     copied: Option<(usize, usize)>,
@@ -88,7 +90,6 @@ impl ResultGrid {
                     .width(fitted_width(&column.name, &display, index))
                     .resizable(true)
                     .movable(false)
-                    .sortable()
                     // The cell padding is Slate's, applied in `render_td` and
                     // `render_th`. Taking the library's as well indents every
                     // value twice and leaves a column's width unknowable here.
@@ -98,33 +99,42 @@ impl ResultGrid {
 
         Self {
             columns,
-            order: (0..display.len()).collect(),
+            sort: Vec::new(),
+            sortable: false,
             result,
             display,
             copied: None,
         }
     }
 
-    /// The row a screen position is showing.
-    fn source_row(&self, row_ix: usize) -> Option<usize> {
-        self.order.get(row_ix).copied()
+    /// The sort the statement asked the server for, so the headers can say
+    /// which columns the rows are ordered by and in which direction, and
+    /// whether asking for another one is possible at all.
+    pub fn with_sort(mut self, sort: Vec<(usize, bool)>, sortable: bool) -> Self {
+        self.sort = sort;
+        self.sortable = sortable;
+        self
+    }
+
+    pub fn columns(&self) -> &[crate::db::Column] {
+        &self.result.columns
     }
 
     /// The whole value behind a cell, not the clipped one the grid paints: a
     /// column is a couple of hundred pixels wide and a JSONB document is not,
     /// and copying what happens to fit would be the same bug as reading a value
     /// through the column.
-    fn cell(&self, source_row: usize, col_ix: usize) -> Option<&str> {
-        self.result.rows.get(source_row)?.get(col_ix)?.as_deref()
+    fn cell(&self, row_ix: usize, col_ix: usize) -> Option<&str> {
+        self.result.rows.get(row_ix)?.get(col_ix)?.as_deref()
     }
 
     /// Every column of one row, named, typed where the type is known, and
     /// carrying the value itself rather than the string the column had room
     /// for. This is what the row inspector reads.
     pub fn fields(&self, row_ix: usize) -> Vec<Field> {
-        let Some(source_row) = self.source_row(row_ix) else {
+        if row_ix >= self.result.rows.len() {
             return Vec::new();
-        };
+        }
 
         self.result
             .columns
@@ -134,7 +144,7 @@ impl ResultGrid {
                 name: column.name.clone().into(),
                 data_type: column.data_type.clone().map(SharedString::from),
                 value: self
-                    .cell(source_row, col_ix)
+                    .cell(row_ix, col_ix)
                     .map(|value| clip_to(value, FIELD_DISPLAY_LIMIT).into()),
             })
             .collect()
@@ -190,36 +200,6 @@ fn clip_to(value: &str, limit: usize) -> String {
     }
 }
 
-/// Two cells ordered the way the values read rather than the way the text
-/// sorts: every value arrives as text over the simple protocol, so a numeric
-/// column would otherwise put 10 before 9, and a name column would put every
-/// capital letter ahead of every lowercase one.
-///
-/// NULL sorts last in both directions. An absent value is not a small value,
-/// and a descending sort that leads with a screen of NULLs has buried the
-/// answer the sort was asked for.
-fn compare(a: Option<&str>, b: Option<&str>, ascending: bool) -> Ordering {
-    let (a, b) = match (a, b) {
-        (Some(a), Some(b)) => (a, b),
-        (None, None) => return Ordering::Equal,
-        (None, Some(_)) => return Ordering::Greater,
-        (Some(_), None) => return Ordering::Less,
-    };
-
-    let ordering = match (a.trim().parse::<f64>(), b.trim().parse::<f64>()) {
-        (Ok(a), Ok(b)) => a.partial_cmp(&b).unwrap_or(Ordering::Equal),
-        _ => a
-            .chars()
-            .flat_map(char::to_lowercase)
-            .cmp(b.chars().flat_map(char::to_lowercase)),
-    };
-
-    match ascending {
-        true => ordering,
-        false => ordering.reverse(),
-    }
-}
-
 impl TableDelegate for ResultGrid {
     fn columns_count(&self, _: &App) -> usize {
         self.columns.len()
@@ -233,54 +213,87 @@ impl TableDelegate for ResultGrid {
         &self.columns[col_ix]
     }
 
-    /// Sorting is Slate's, not the server's: re-running the statement with an
-    /// `ORDER BY` would rewrite the user's SQL, and it would return a different
-    /// snapshot of the table than the rows already on screen.
-    fn perform_sort(
-        &mut self,
-        col_ix: usize,
-        sort: ColumnSort,
-        _: &mut Window,
-        cx: &mut Context<TableState<Self>>,
-    ) {
-        let mut order: Vec<usize> = (0..self.result.rows.len()).collect();
-
-        if sort != ColumnSort::Default {
-            let ascending = sort == ColumnSort::Ascending;
-            // Stable, so equal values keep the order the server sent them in.
-            order.sort_by(|&a, &b| {
-                compare(self.cell(a, col_ix), self.cell(b, col_ix), ascending)
-            });
-        }
-
-        self.order = order;
-        cx.notify();
-    }
-
     fn render_th(
         &mut self,
         col_ix: usize,
         _: &mut Window,
         cx: &mut Context<TableState<Self>>,
     ) -> impl IntoElement {
-        let muted = theme(cx).text_muted;
+        let (muted, faint, text) = {
+            let t = theme(cx);
+            (t.text_muted, t.text_faint, t.text)
+        };
+        let key = self
+            .sort
+            .iter()
+            .position(|(column, _)| *column == col_ix)
+            .map(|position| (position, self.sort[position].1));
+
         div()
+            .id(("column-header", col_ix))
             .h_full()
-            // Not `size_full`: the sort control is the header cell's next
-            // sibling, and a header that takes the whole width pushes it out
-            // of a cell that clips.
+            // Not `size_full`: the header cell clips, and the resize handle
+            // lives at its trailing edge.
             .flex_1()
             .min_w_0()
             .px(px(layout::SPACE_SM))
             .flex()
             .items_center()
+            .gap(px(layout::SPACE_XS))
             .overflow_hidden()
             .whitespace_nowrap()
-            .text_ellipsis()
             .text_size(px(layout::TEXT_SM))
             .font_weight(gpui::FontWeight::MEDIUM)
-            .text_color(muted)
-            .child(self.columns[col_ix].name.clone())
+            .text_color(match key.is_some() {
+                true => text,
+                false => muted,
+            })
+            .child(
+                div()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .child(self.columns[col_ix].name.clone()),
+            )
+            .child(
+                div()
+                    .ml_auto()
+                    .flex_shrink_0()
+                    .flex()
+                    .items_center()
+                    .gap(px(2.))
+                    .map(|control| match key {
+                        Some((_, ascending)) => control.child(
+                            icon(match ascending {
+                                true => icon::SORT_UP,
+                                false => icon::SORT_DOWN,
+                            })
+                            .size(px(12.))
+                            .text_color(text),
+                        ),
+                        // Faint rather than absent: a header that shows nothing
+                        // until it is clicked does not read as clickable. And
+                        // absent rather than faint where a click would do
+                        // nothing, which is the same rule the other way round.
+                        None => control.children(self.sortable.then(|| {
+                            icon(icon::SORTABLE).size(px(12.)).text_color(faint)
+                        })),
+                    })
+                    // Only worth saying which key this is when there is more
+                    // than one of them.
+                    .children(key.filter(|_| self.sort.len() > 1).map(|(position, _)| {
+                        div()
+                            .text_size(px(layout::TEXT_XS))
+                            .text_color(muted)
+                            .child((position + 1).to_string())
+                    })),
+            )
+            // The click goes to the workspace, which owns the statement: a sort
+            // is a change to the SQL and a re-run, not a reordering of rows the
+            // grid happens to be holding.
+            .on_click(cx.listener(move |_, _, window, cx| {
+                window.dispatch_action(Box::new(crate::SortColumn { column: col_ix }), cx);
+            }))
     }
 
     fn render_td(
@@ -293,18 +306,16 @@ impl TableDelegate for ResultGrid {
         // Rows are not guaranteed rectangular and an index can outlive the
         // result set it was taken from. Indexing here would abort the process
         // mid-paint and take the user's editor buffer with it.
-        let source_row = self.source_row(row_ix);
-        let cell = source_row
-            .and_then(|source_row| self.display.get(source_row))
+        let cell = self
+            .display
+            .get(row_ix)
             .and_then(|row| row.get(col_ix))
             .and_then(Option::as_ref);
         let (text, faint, copied_bg) = {
             let t = theme(cx);
             (t.text, t.text_faint, t.element_active)
         };
-        // Marked by the row it copied, not the position that row was in: a
-        // sort moves the rows and the clipboard does not follow them.
-        let copied = source_row.is_some() && self.copied == source_row.map(|row| (row, col_ix));
+        let copied = self.copied == Some((row_ix, col_ix));
 
         div()
             .id(("cell", row_ix * self.columns.len() + col_ix))
@@ -325,14 +336,11 @@ impl TableDelegate for ResultGrid {
             // The whole value, past both what the column shows and what the
             // row inspector shows.
             .on_double_click(cx.listener(move |table, _, _, cx| {
-                let Some(source_row) = table.delegate().source_row(row_ix) else {
-                    return;
-                };
-                let Some(value) = table.delegate().cell(source_row, col_ix) else {
+                let Some(value) = table.delegate().cell(row_ix, col_ix) else {
                     return;
                 };
                 cx.write_to_clipboard(ClipboardItem::new_string(value.to_string()));
-                table.delegate_mut().copied = Some((source_row, col_ix));
+                table.delegate_mut().copied = Some((row_ix, col_ix));
                 cx.notify();
             }))
     }
@@ -360,64 +368,6 @@ mod tests {
                 .collect(),
             ..QueryResult::default()
         })
-    }
-
-    /// The rows in the order they would be painted in.
-    fn shown(grid: &ResultGrid) -> Vec<Option<&str>> {
-        (0..grid.order.len())
-            .map(|row_ix| grid.cell(grid.source_row(row_ix).unwrap(), 0))
-            .collect()
-    }
-
-    /// `perform_sort` needs a window and a context; the ordering it applies
-    /// does not, so the tests drive that directly.
-    fn sorted(grid: &ResultGrid, ascending: bool) -> Vec<Option<&str>> {
-        let mut order: Vec<usize> = (0..grid.result.rows.len()).collect();
-        order.sort_by(|&a, &b| compare(grid.cell(a, 0), grid.cell(b, 0), ascending));
-        order.into_iter().map(|row| grid.cell(row, 0)).collect()
-    }
-
-    #[test]
-    fn a_number_column_sorts_as_numbers_not_as_text() {
-        // The whole point: every value arrives as text, so plain string order
-        // would put 10 between 1 and 9.
-        let grid = grid_of(&[Some("9"), Some("10"), Some("1"), Some("-2.5")]);
-
-        assert_eq!(
-            sorted(&grid, true),
-            vec![Some("-2.5"), Some("1"), Some("9"), Some("10")]
-        );
-        assert_eq!(
-            sorted(&grid, false),
-            vec![Some("10"), Some("9"), Some("1"), Some("-2.5")]
-        );
-    }
-
-    #[test]
-    fn text_sorts_by_letter_rather_than_by_case() {
-        let grid = grid_of(&[Some("banana"), Some("Apple"), Some("cherry")]);
-
-        assert_eq!(
-            sorted(&grid, true),
-            vec![Some("Apple"), Some("banana"), Some("cherry")]
-        );
-    }
-
-    #[test]
-    fn nulls_sort_last_in_both_directions() {
-        // An absent value is not a small value, and a descending sort that
-        // opens with a screen of NULLs has hidden the answer.
-        let grid = grid_of(&[None, Some("b"), None, Some("a")]);
-
-        assert_eq!(sorted(&grid, true), vec![Some("a"), Some("b"), None, None]);
-        assert_eq!(sorted(&grid, false), vec![Some("b"), Some("a"), None, None]);
-    }
-
-    #[test]
-    fn a_fresh_grid_shows_the_server_order() {
-        let grid = grid_of(&[Some("c"), Some("a"), Some("b")]);
-
-        assert_eq!(shown(&grid), vec![Some("c"), Some("a"), Some("b")]);
     }
 
     #[test]
