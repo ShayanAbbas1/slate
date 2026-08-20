@@ -33,6 +33,13 @@ guic-gpui-assets = "=0.2.0"
 icondata_lu = "=0.1.0"
 icondata_core = "=0.1.0"
 
+# GPUI does layout, text shaping and scene building on the CPU every frame, so
+# an unoptimized gpui drops frames the moment a grid scrolls. Dependencies are
+# compiled optimized even in dev; Slate's own crate stays at opt-level 0, so
+# incremental builds and debugging are unaffected once deps are built.
+[profile.dev.package."*"]
+opt-level = 3
+
 [profile.release]
 lto = "thin"
 codegen-units = 1
