@@ -4,7 +4,11 @@ use gpui_component::tree::TreeItem;
 
 use crate::db::{Catalog, Relation, RelationKind, Routine, RoutineKind};
 
-pub const PREVIEW_ROW_LIMIT: usize = 1_000;
+/// The row counts a preview can be asked for, and the one it opens with. Every
+/// result set is capped (spec §4.3); this is the part of the cap the user gets
+/// to move, and the grid shows which one is in effect.
+pub const ROW_LIMITS: [usize; 4] = [100, 1_000, 10_000, 100_000];
+pub const PREVIEW_ROW_LIMIT: usize = ROW_LIMITS[1];
 
 const RELATION_CATEGORIES: [(RelationKind, &str); 5] = [
     (RelationKind::Table, "Tables"),
@@ -149,9 +153,9 @@ fn category(label: &'static str, schema_index: usize, children: Vec<TreeItem>) -
         .children(children)
 }
 
-pub fn preview_sql(schema: &str, relation: &str) -> String {
+pub fn preview_sql(schema: &str, relation: &str, limit: usize) -> String {
     format!(
-        "SELECT * FROM {}.{} LIMIT {PREVIEW_ROW_LIMIT}",
+        "SELECT * FROM {}.{} LIMIT {limit}",
         quote_identifier(schema),
         quote_identifier(relation)
     )
@@ -302,7 +306,7 @@ mod tests {
     #[test]
     fn preview_sql_quotes_every_identifier_and_exposes_the_limit() {
         assert_eq!(
-            preview_sql(r#"odd"schema"#, r#"table"name"#),
+            preview_sql(r#"odd"schema"#, r#"table"name"#, PREVIEW_ROW_LIMIT),
             r#"SELECT * FROM "odd""schema"."table""name" LIMIT 1000"#
         );
     }

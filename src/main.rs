@@ -30,7 +30,10 @@ use gpui_component::{
 use db::{
     Catalog, Connection, ConnectionConfig, DbError, RelationKind, Routine, RoutineKind, Structure,
 };
-use explorer::{ExplorerLeaf, ExplorerTarget, ObjectKind, preview_sql, tree as build_explorer_tree};
+use explorer::{
+    ExplorerLeaf, ExplorerTarget, ObjectKind, PREVIEW_ROW_LIMIT, ROW_LIMITS, preview_sql,
+    tree as build_explorer_tree,
+};
 use icons::{Icons, icon};
 use result_grid::ResultGrid;
 use sql::{Buffer, SortKey};
@@ -43,6 +46,14 @@ use theme::{Theme, layout, theme};
 #[action(namespace = slate, no_json)]
 struct SortColumn {
     column: usize,
+}
+
+/// How many rows a relation's preview asks for. Slate's own statement carries
+/// the limit, so the only thing to say is the number.
+#[derive(Clone, PartialEq, Eq, Deserialize, Action)]
+#[action(namespace = slate, no_json)]
+struct SetRowLimit {
+    rows: usize,
 }
 
 actions!(
@@ -432,6 +443,10 @@ enum ObjectBody {
         /// The `ORDER BY` the header clicks have built up. Slate owns this
         /// statement, so sorting regenerates it rather than editing text.
         sort: Vec<SortKey>,
+        /// How many rows this preview asks for. Every result set is capped
+        /// (spec §4.3); this is the tab's own copy of the cap, so raising it
+        /// for one wide table does not raise it everywhere.
+        limit: usize,
     },
     Routine(Routine),
 }
@@ -1106,6 +1121,7 @@ impl Workspace {
                 results: result_grid(window, cx),
                 query: QueryState::Idle,
                 sort: Vec::new(),
+                limit: PREVIEW_ROW_LIMIT,
             },
         };
         self.profile_mut()?.session.objects.push(ObjectTab {
@@ -1130,7 +1146,10 @@ impl Workspace {
         else {
             return;
         };
-        let ObjectBody::Relation { query, sort, .. } = &tab.body else {
+        let ObjectBody::Relation {
+            query, sort, limit, ..
+        } = &tab.body
+        else {
             return;
         };
         if !matches!(query, QueryState::Idle | QueryState::Failed(_)) {
@@ -1138,7 +1157,7 @@ impl Workspace {
         }
 
         let (schema, relation) = (tab.schema.clone(), tab.name.clone());
-        let sql = relation_sql(&schema, &relation, sort);
+        let sql = relation_sql(&schema, &relation, sort, *limit);
         self.load_structure(id, schema, relation, cx);
         self.execute_sql(sql, Tab::Object(id), cx);
     }
@@ -1158,6 +1177,7 @@ impl Workspace {
             sort,
             results,
             query,
+            limit,
             ..
         } = &mut tab.body
         else {
@@ -1168,7 +1188,7 @@ impl Workspace {
             return;
         };
         cycle(sort, &expression);
-        let sql = relation_sql(&schema, &relation, sort);
+        let sql = relation_sql(&schema, &relation, sort, *limit);
         // A preview only re-queries when it is asked to, and this is the ask.
         *query = QueryState::Idle;
         self.execute_sql(sql, Tab::Object(id), cx);
@@ -1404,10 +1424,46 @@ impl Workspace {
             return;
         };
         let (schema, relation) = (tab.schema.clone(), tab.name.clone());
-        let ObjectBody::Relation { sort, query, .. } = &mut tab.body else {
+        let ObjectBody::Relation {
+            sort, query, limit, ..
+        } = &mut tab.body
+        else {
             return;
         };
-        let sql = relation_sql(&schema, &relation, sort);
+        let sql = relation_sql(&schema, &relation, sort, *limit);
+        *query = QueryState::Idle;
+        self.execute_sql(sql, Tab::Object(id), cx);
+    }
+
+    /// Ask a relation's preview for a different number of rows.
+    ///
+    /// The cap is the point of the row limit, so this moves it rather than
+    /// removing it: a `SELECT` with no limit at all is what the query tab is
+    /// for, where the statement is the user's and its cost is theirs to judge.
+    fn set_row_limit(&mut self, action: &SetRowLimit, _: &mut Window, cx: &mut Context<Self>) {
+        let rows = action.rows;
+        let Some(profile) = self.profile_mut() else {
+            return;
+        };
+        let Tab::Object(id) = profile.session.active else {
+            return;
+        };
+        let Some(tab) = profile.session.objects.iter_mut().find(|tab| tab.id == id) else {
+            return;
+        };
+        let (schema, relation) = (tab.schema.clone(), tab.name.clone());
+        let ObjectBody::Relation {
+            sort, query, limit, ..
+        } = &mut tab.body
+        else {
+            return;
+        };
+        if *limit == rows {
+            return;
+        }
+
+        *limit = rows;
+        let sql = relation_sql(&schema, &relation, sort, rows);
         *query = QueryState::Idle;
         self.execute_sql(sql, Tab::Object(id), cx);
     }
@@ -2407,6 +2463,33 @@ impl Workspace {
             }))
     }
 
+    /// One row-limit choice. A chip rather than a menu: four numbers fit, and a
+    /// number behind a popover is a number nobody checks.
+    fn row_limit_chip(rows: usize, selected: bool, cx: &mut Context<Self>) -> AnyElement {
+        let t = *theme(cx);
+        div()
+            .id(("row-limit", rows))
+            .flex()
+            .items_center()
+            .h(px(24.))
+            .px(px(layout::SPACE_SM))
+            .rounded(px(layout::RADIUS_CONTROL))
+            .text_size(px(layout::TEXT_SM))
+            .map(|chip| {
+                if selected {
+                    chip.bg(t.element_active).text_color(t.text)
+                } else {
+                    chip.text_color(t.text_muted)
+                        .hover(|style| style.bg(t.element_hover))
+                }
+            })
+            .child(compact_count(rows))
+            .on_click(cx.listener(move |_, _, window, cx| {
+                window.dispatch_action(Box::new(SetRowLimit { rows }), cx);
+            }))
+            .into_any_element()
+    }
+
     fn render_structure(state: &StructureState, cx: &mut Context<Self>) -> AnyElement {
         let t = *theme(cx);
         let mono = gpui_component::Theme::global(cx).mono_font_family.clone();
@@ -2723,6 +2806,36 @@ impl Workspace {
                 ObjectBody::Routine(_) => None,
             });
 
+        // What the preview asked the server for, and the only control over it.
+        // Beside the Data | Structure pair because it belongs to the same view:
+        // it is a property of these rows, not of the window.
+        let showing_rows = session.active_object().and_then(|tab| match &tab.body {
+            ObjectBody::Relation {
+                limit,
+                showing_structure: false,
+                ..
+            } => Some(*limit),
+            _ => None,
+        });
+        let row_limit = showing_rows.map(|limit| {
+            let chips: Vec<_> = ROW_LIMITS
+                .into_iter()
+                .map(|rows| Self::row_limit_chip(rows, rows == limit, cx))
+                .collect();
+            div()
+                .flex_shrink_0()
+                .flex()
+                .items_center()
+                .gap(px(layout::SPACE_XS))
+                .child(
+                    div()
+                        .text_size(px(layout::TEXT_SM))
+                        .text_color(t.text_faint)
+                        .child("Rows"),
+                )
+                .children(chips)
+        });
+
         let zoom = editor_zoom_percent(session.editor_font_size);
         let named = on_query_tab && session.open_query.is_some();
         let new_workspace = workspace.clone();
@@ -2768,6 +2881,7 @@ impl Workspace {
                     ),
             )
             .children(structure_toggle)
+            .children(row_limit)
             // 100% is not information; the readout appears only once the zoom
             // has somewhere to return to.
             .children((runnable && zoom != 100).then(|| {
@@ -3232,6 +3346,7 @@ impl Render for Workspace {
             .id("workspace")
             .on_action(cx.listener(Self::run_query))
             .on_action(cx.listener(Self::sort_column))
+            .on_action(cx.listener(Self::set_row_limit))
             .on_action(cx.listener(Self::show_editor))
             .on_action(cx.listener(Self::cycle_theme))
             .on_action(cx.listener(Self::save_query))
@@ -3317,8 +3432,8 @@ impl Render for Workspace {
 /// Slate's statement for a relation's tab, carrying the sort the headers asked
 /// for. Regenerated rather than edited, so the row limit and the quoting stay
 /// in one place.
-fn relation_sql(schema: &str, relation: &str, sort: &[SortKey]) -> String {
-    let preview = preview_sql(schema, relation);
+fn relation_sql(schema: &str, relation: &str, sort: &[SortKey], limit: usize) -> String {
+    let preview = preview_sql(schema, relation, limit);
     sql::with_order_by(&preview, sort).unwrap_or(preview)
 }
 
@@ -3481,6 +3596,15 @@ fn key_hint(t: Theme, stroke: &'static str, explanation: &'static str) -> impl I
 
 /// `1234567` → `1,234,567`. Row counts are read at a glance, and groups are
 /// what keeps six digits legible.
+/// A row count as a chip label: `1K` rather than `1,000`, because four of these
+/// sit side by side and the grouped form is twice as wide for no more meaning.
+fn compact_count(rows: usize) -> String {
+    match rows >= 1_000 && rows.is_multiple_of(1_000) {
+        true => format!("{}K", rows / 1_000),
+        false => rows.to_string(),
+    }
+}
+
 fn group_thousands(value: u64) -> String {
     let digits = value.to_string();
     let mut grouped = String::with_capacity(digits.len() + digits.len() / 3);
@@ -3692,8 +3816,39 @@ mod tests {
     }
 
     #[test]
+    fn a_preview_asks_for_the_rows_its_tab_was_set_to() {
+        assert_eq!(
+            relation_sql("public", "accounts", &[], 100),
+            r#"SELECT * FROM "public"."accounts" LIMIT 100"#
+        );
+        // A raised limit still keeps the sort ahead of it, or the rows would be
+        // ordered after being cut.
+        assert_eq!(
+            relation_sql("public", "accounts", &[SortKey::new(r#""id""#, true)], 100_000),
+            r#"SELECT * FROM "public"."accounts" ORDER BY "id" ASC LIMIT 100000"#
+        );
+    }
+
+    #[test]
+    fn a_row_limit_reads_as_a_chip_not_as_a_number() {
+        assert_eq!(compact_count(100), "100");
+        assert_eq!(compact_count(1_000), "1K");
+        assert_eq!(compact_count(100_000), "100K");
+        // Every offered limit has to be labelled by this, so none can come out
+        // as something like `1500`.
+        for rows in ROW_LIMITS {
+            assert!(compact_count(rows).len() <= 4, "{rows} is a wide label");
+        }
+    }
+
+    #[test]
     fn a_relations_statement_carries_its_sort_before_the_limit() {
-        let sorted = relation_sql("public", "accounts", &[SortKey::new(r#""id""#, false)]);
+        let sorted = relation_sql(
+            "public",
+            "accounts",
+            &[SortKey::new(r#""id""#, false)],
+            PREVIEW_ROW_LIMIT,
+        );
 
         assert_eq!(
             sorted,
