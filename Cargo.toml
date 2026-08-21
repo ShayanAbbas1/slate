@@ -15,8 +15,13 @@ gpui-component = { version = "=0.5.1", features = ["tree-sitter-languages"] }
 # gpui-component keeps its parse tree private, so we run our own parser to find
 # statement boundaries. Versions match what gpui-component pulls, to avoid
 # linking two copies of tree-sitter.
-tree-sitter = "0.25.4"
-tree-sitter-sequel = "0.3.8"
+#
+# Pinned exactly, for the same reason gpui is. The grammar decides where every
+# statement boundary falls and which statements `sql.rs` refuses to splice into,
+# so a bump changes what Slate sends to the server. It is a correctness
+# dependency, not a formatting one.
+tree-sitter = "=0.25.10"
+tree-sitter-sequel = "=0.3.11"
 
 # Blocking client, deliberately. GPUI's executor is async-task over Grand
 # Central Dispatch with no reactor, so a tokio future panics on it. This owns

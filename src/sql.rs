@@ -160,12 +160,7 @@ pub fn with_order_by(statement: &str, keys: &[SortKey]) -> Option<String> {
     // Replacing the existing clause, rather than adding a second one, is what
     // makes a repeated click a change of sort instead of an accumulation.
     if let Some(existing) = child_of_kind(&anchor, "order_by") {
-        let range = existing.byte_range();
-        let mut spliced = String::with_capacity(sql.len() + clause.len());
-        spliced.push_str(&sql[..range.start]);
-        spliced.push_str(&clause);
-        spliced.push_str(&sql[range.end..]);
-        return Some(collapse_gap(&spliced));
+        return Some(splice(sql, existing.byte_range(), &clause));
     }
 
     if clause.is_empty() {
@@ -175,9 +170,8 @@ pub fn with_order_by(statement: &str, keys: &[SortKey]) -> Option<String> {
     let insert_at = child_of_kind(&anchor, "limit")
         .map(|limit| limit.byte_range().start)
         .unwrap_or(anchor.byte_range().end);
-    let (head, tail) = sql.split_at(insert_at);
 
-    Some(collapse_gap(&format!("{head} {clause} {tail}")))
+    Some(splice(sql, insert_at..insert_at, &clause))
 }
 
 fn parse(sql: &str) -> Option<Tree> {
@@ -216,21 +210,33 @@ fn clause_anchor<'tree>(
 
     let mut cursor = statement.walk();
     let children: Vec<_> = statement.named_children(&mut cursor).collect();
-    // A `UNION` puts the whole query's `ORDER BY` after its last branch.
+    // A `UNION` puts the whole query's `ORDER BY` after its last branch, so its
+    // clauses hang under the set operation rather than the statement.
     if let Some(set_operation) = children
         .iter()
         .find(|node| node.kind() == "set_operation")
     {
         let mut cursor = set_operation.walk();
-        return set_operation
-            .named_children(&mut cursor)
-            .filter(|node| node.kind() == "from")
-            .last();
+        let branches: Vec<_> = set_operation.named_children(&mut cursor).collect();
+        return select_anchor(&branches);
     }
 
-    children
-        .into_iter()
-        .find(|node| node.kind() == "from")
+    select_anchor(&children)
+}
+
+/// The `from` of a query, and only of a query.
+///
+/// The grammar gives `DELETE FROM t` the same `from` child a `SELECT` has, so a
+/// `from` alone is not evidence that a sort belongs here — and writing one into
+/// a `DELETE` is what hard rule 1 forbids outright. A `select` beside it is the
+/// evidence. `WITH` leaves the outer query's `select` and `from` at this level
+/// too, beside the cte, so a CTE still sorts.
+fn select_anchor<'tree>(children: &[tree_sitter::Node<'tree>]) -> Option<tree_sitter::Node<'tree>> {
+    if !children.iter().any(|node| node.kind() == "select") {
+        return None;
+    }
+
+    children.iter().rfind(|node| node.kind() == "from").copied()
 }
 
 fn child_of_kind<'tree>(
@@ -242,36 +248,73 @@ fn child_of_kind<'tree>(
         .find(|child| child.kind() == kind)
 }
 
-/// A removed clause leaves the spaces that surrounded it behind.
-fn collapse_gap(sql: &str) -> String {
-    let mut collapsed = String::with_capacity(sql.len());
-    let mut spaces = 0;
-    for character in sql.chars() {
-        match character {
-            ' ' => spaces += 1,
-            _ => spaces = 0,
+/// `sql` with `range` replaced by `clause`, tidying only the seam.
+///
+/// Only the whitespace either side of the splice point is touched. Collapsing
+/// runs of spaces across the whole statement instead would rewrite string
+/// literals, quoted identifiers and the user's indentation — a silent edit to
+/// what the statement means, which is the one thing this module must not do.
+fn splice(sql: &str, range: Range<usize>, clause: &str) -> String {
+    let head = sql[..range.start].trim_end();
+    let tail = sql[range.end..].trim_start();
+
+    let mut spliced = String::with_capacity(head.len() + clause.len() + tail.len() + 2);
+    spliced.push_str(head);
+    for part in [clause, tail] {
+        if part.is_empty() {
+            continue;
         }
-        if spaces < 2 {
-            collapsed.push(character);
+        if !spliced.is_empty() {
+            spliced.push(' ');
         }
+        spliced.push_str(part);
     }
-    collapsed.trim_end().to_string()
+    spliced
 }
 
 /// The grammar declares exactly these three as the root's statement children.
 /// Filtering on them is not optional: comments are tree-sitter *extras*, so
-/// `comment`, `marginalia` and `ERROR` also land at the root, and sending one
-/// of those to the server returns an empty response the user cannot explain.
+/// `comment` and `marginalia` also land at the root, and sending one of those
+/// to the server returns an empty response the user cannot explain.
 const STATEMENT_KINDS: [&str; 3] = ["statement", "block", "transaction"];
 
 fn collect_statements(tree: &Tree, sql: &str) -> Vec<Range<usize>> {
     let root = tree.root_node();
     let mut cursor = root.walk();
+    let mut statements: Vec<Range<usize>> = Vec::new();
 
-    root.named_children(&mut cursor)
-        .filter(|node| STATEMENT_KINDS.contains(&node.kind()))
-        .filter_map(|node| trim_range(sql, node.byte_range()))
-        .collect()
+    for node in root.named_children(&mut cursor) {
+        // Whatever the grammar could not read lands in a sibling ERROR node.
+        // Dropping it would send the statement's head alone, and the head of a
+        // half-typed `DELETE … WHERE` is an unqualified DELETE. The tail was
+        // typed into this statement, so it goes to the server with it and the
+        // server is what explains the problem.
+        //
+        // Backwards only, deliberately. An ERROR *before* a statement means the
+        // statement's opening keyword is the part that did not parse, so what
+        // is left is a fragment the server rejects rather than a statement that
+        // runs and means something else — `GRANT SELECT ON t TO r` sends
+        // `SELECT ON t TO r`. Merging that one forward would attach a typo on
+        // the first line to the perfectly good statement underneath it.
+        if node.is_error() {
+            if let Some(last) = statements.last_mut()
+                && let Some(merged) = trim_range(sql, last.start..node.byte_range().end)
+            {
+                *last = merged;
+            }
+            continue;
+        }
+
+        if !STATEMENT_KINDS.contains(&node.kind()) {
+            continue;
+        }
+
+        if let Some(range) = trim_range(sql, node.byte_range()) {
+            statements.push(range);
+        }
+    }
+
+    statements
 }
 
 fn trim_range(sql: &str, range: Range<usize>) -> Option<Range<usize>> {
@@ -520,13 +563,101 @@ mod tests {
     #[test]
     fn incomplete_input_still_reports_something_runnable() {
         // Half-typed queries must not panic or wipe the statement list. The
-        // dangling `FROM` parses as an ERROR node and is dropped, so the cursor
-        // at the end runs `SELECT *` and the server explains the problem --
-        // better than shipping `FROM` on its own.
+        // dangling `FROM` is unparsable, so it stays with the statement it was
+        // typed into and the server explains the problem.
         let sql = "SELECT * FROM";
         let buffer = Buffer::parse(sql);
 
         assert!(buffer.statement_at(3).is_some());
-        assert_eq!(&sql[buffer.statement_at(sql.len()).unwrap()], "SELECT *");
+        assert_eq!(&sql[buffer.statement_at(sql.len()).unwrap()], "SELECT * FROM");
+    }
+
+    #[test]
+    fn an_unparsable_tail_stays_with_the_statement_it_was_typed_into() {
+        // The head of a half-typed `DELETE ... WHERE` is an unqualified
+        // DELETE. Sending it because the grammar could not read the tail is
+        // the worst thing this module could do, so the tail comes along and
+        // the server is what rejects it.
+        for sql in [
+            "DELETE FROM t WHERE ",
+            "UPDATE t SET a = 1 WHERE ",
+            "DELETE FROM t WHERE a = 'x",
+            "SELECT 1;\nDELETE FROM t WHERE ",
+            "GRANT SELECT ON t TO r",
+            "SELECT 1 LIMIT 1",
+        ] {
+            let buffer = Buffer::parse(sql);
+            let run = &sql[buffer.statement_at(sql.len()).unwrap()];
+            assert!(
+                sql.trim_end().ends_with(run),
+                "{sql:?} was truncated to {run:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_statement_that_is_not_a_query_takes_no_sort() {
+        // A header click asks Slate to write an ORDER BY. Hard rule 1 says it
+        // never writes a destructive statement, and the grammar gives `DELETE`
+        // the same `from` child a `SELECT` has -- so the guard is the presence
+        // of a `select`, not of a `from`.
+        for sql in [
+            "DELETE FROM t WHERE a = 1",
+            "DELETE FROM t WHERE a = 1 RETURNING *",
+            "UPDATE t SET a = 1",
+            "TRUNCATE t",
+            "INSERT INTO t (a) VALUES (1) RETURNING *",
+        ] {
+            assert!(order_by(sql).is_none(), "{sql} reported a sort");
+            assert!(
+                with_order_by(sql, &[SortKey::new("a", true)]).is_none(),
+                "{sql} was spliced"
+            );
+        }
+    }
+
+    #[test]
+    fn a_splice_changes_nothing_but_the_clause() {
+        // Collapsing whitespace across the whole statement rewrites string
+        // literals, quoted identifiers and indentation -- all of which change
+        // what the statement means or how it reads.
+        assert_eq!(
+            with_order_by(
+                "SELECT * FROM t WHERE note LIKE 'a  %' LIMIT 10",
+                &[SortKey::new("id", true)]
+            )
+            .unwrap(),
+            "SELECT * FROM t WHERE note LIKE 'a  %' ORDER BY id ASC LIMIT 10"
+        );
+        assert_eq!(
+            with_order_by(
+                r#"SELECT * FROM "public"."my  table""#,
+                &[SortKey::new("id", true)]
+            )
+            .unwrap(),
+            r#"SELECT * FROM "public"."my  table" ORDER BY id ASC"#
+        );
+        assert_eq!(
+            with_order_by(
+                "SELECT *\nFROM t\nWHERE a = 1\n  AND b = 2",
+                &[SortKey::new("id", true)]
+            )
+            .unwrap(),
+            "SELECT *\nFROM t\nWHERE a = 1\n  AND b = 2 ORDER BY id ASC"
+        );
+    }
+
+    #[test]
+    fn a_cte_still_takes_a_sort() {
+        // `WITH` puts the outer SELECT and its FROM at the top level, beside
+        // the cte. The select-child guard must not read the cte's own.
+        assert_eq!(
+            with_order_by(
+                "WITH x AS (SELECT 1 AS a) SELECT * FROM x",
+                &[SortKey::new("a", true)]
+            )
+            .unwrap(),
+            "WITH x AS (SELECT 1 AS a) SELECT * FROM x ORDER BY a ASC"
+        );
     }
 }
