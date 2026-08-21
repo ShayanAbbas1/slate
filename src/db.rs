@@ -157,14 +157,17 @@ impl ConnectionConfig {
             || url_parts
                 .query_pairs()
                 .any(|(key, _)| key.as_ref() == "port");
-        let parsed: postgres::Config = url
-            .parse()
-            .map_err(|error| format!("Connection URL is invalid: {error}"))?;
+        // Ahead of the driver's own parser, which accepts only `disable`,
+        // `prefer` and `require`: a `verify-full` URL dies there as "invalid
+        // connection string", naming neither the option nor the reason.
         for (key, value) in url_parts.query_pairs() {
             if key.as_ref() == "sslmode" {
                 reject_unsupported_sslmode(value.as_ref())?;
             }
         }
+        let parsed: postgres::Config = url
+            .parse()
+            .map_err(|error| format!("Connection URL is invalid: {error}"))?;
         let host = match parsed.get_hosts() {
             [Host::Tcp(host)] => host.clone(),
             [] => return Err("Connection URL does not contain a host.".into()),
@@ -193,8 +196,11 @@ impl ConnectionConfig {
 
         Ok(Self {
             host,
+            // Last wins, as in libpq: the driver's URL parser takes a port
+            // from the host section first -- 5432 when there is none -- and
+            // then pushes any `?port=` value after it.
             port: has_explicit_port
-                .then(|| parsed.get_ports().first().copied())
+                .then(|| parsed.get_ports().last().copied())
                 .flatten(),
             database,
             user,
@@ -411,11 +417,6 @@ impl Connection {
             position: None,
         })?;
 
-        let types = match typed {
-            true => column_types(&mut client, sql),
-            false => Vec::new(),
-        };
-
         // Timed from here, not from the call: one client serialises a profile's
         // queries, and time spent waiting behind the catalog load is not time
         // the server spent on this statement.
@@ -424,7 +425,25 @@ impl Connection {
             .simple_query(sql)
             .map_err(|error| query_error(&error, sql))?;
 
-        assemble(messages, types, started.elapsed())
+        let (mut result, commands) = assemble(messages, started.elapsed())?;
+
+        // Types are learned after the statement ran, and only from a single
+        // statement that returned columns. A refused `Parse` is an error
+        // inside the session's open transaction and aborts it, so describing
+        // first meant Slate's own probe ended the user's transaction and every
+        // later failure reported "current transaction is aborted" instead of
+        // its cause. Postgres refuses to prepare more than one statement at a
+        // time, which is exactly the case that used to do the damage.
+        //
+        // A single statement `simple_query` accepts but `prepare` refuses --
+        // some utility statements -- can still abort an open transaction. That
+        // is the whole of the remaining hole, and the driver exposes no
+        // transaction state to guard it with.
+        if typed && !result.columns.is_empty() && commands == 1 {
+            apply_types(&mut result.columns, &column_types(&mut client, sql));
+        }
+
+        Ok(result)
     }
 
     pub fn catalog(&self) -> Result<Catalog, DbError> {
@@ -452,7 +471,8 @@ impl Connection {
 /// parses and plans it and answers with the row description, and it never
 /// executes anything — Postgres refuses to prepare the utility statements that
 /// would have an effect, and refuses more than one statement at a time. Both
-/// refusals arrive here as "no types known", which is the honest answer.
+/// refusals arrive here as "no types known" -- honest, but not free: see
+/// [`Connection::run`] for why the ask has to come after the statement ran.
 fn column_types(client: &mut Client, sql: &str) -> Vec<String> {
     client
         .prepare(sql)
@@ -479,23 +499,18 @@ fn quote_literal(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
 
+/// The result, plus the number of statements the server completed -- one
+/// `CommandComplete` each, which is cheaper and more truthful than re-parsing
+/// the SQL to count them.
 fn assemble(
     messages: Vec<SimpleQueryMessage>,
-    types: Vec<String>,
     elapsed: Duration,
-) -> Result<QueryResult, DbError> {
+) -> Result<(QueryResult, usize), DbError> {
     let mut result = QueryResult {
         elapsed,
         ..Default::default()
     };
-    // Matched by position, and only when the two agree on how many columns
-    // there are: the description came from a separate round trip, and a type
-    // put against the wrong column is worse than no type at all.
-    let type_at = |index: usize, columns: usize| {
-        (types.len() == columns)
-            .then(|| types.get(index).cloned())
-            .flatten()
-    };
+    let mut commands = 0;
 
     for message in messages {
         match message {
@@ -506,10 +521,9 @@ fn assemble(
             SimpleQueryMessage::RowDescription(columns) => {
                 result.columns = columns
                     .iter()
-                    .enumerate()
-                    .map(|(index, column)| Column {
+                    .map(|column| Column {
                         name: column.name().to_string(),
-                        data_type: type_at(index, columns.len()),
+                        data_type: None,
                     })
                     .collect();
                 result.rows.clear();
@@ -524,10 +538,9 @@ fn assemble(
                     result.columns = row
                         .columns()
                         .iter()
-                        .enumerate()
-                        .map(|(index, column)| Column {
+                        .map(|column| Column {
                             name: column.name().to_string(),
-                            data_type: type_at(index, row.columns().len()),
+                            data_type: None,
                         })
                         .collect();
                 }
@@ -552,12 +565,26 @@ fn assemble(
             }
             SimpleQueryMessage::CommandComplete(count) => {
                 result.rows_affected = Some(count);
+                commands += 1;
             }
             _ => {}
         }
     }
 
-    Ok(result)
+    Ok((result, commands))
+}
+
+/// Matched by position, and only when the two agree on how many columns there
+/// are: the description came from a separate round trip, and a type put against
+/// the wrong column is worse than no type at all.
+fn apply_types(columns: &mut [Column], types: &[String]) {
+    if types.len() != columns.len() {
+        return;
+    }
+
+    for (column, data_type) in columns.iter_mut().zip(types) {
+        column.data_type = Some(data_type.clone());
+    }
 }
 
 fn assemble_catalog(relations: QueryResult, routines: QueryResult) -> Result<Catalog, DbError> {
@@ -661,15 +688,15 @@ fn required_cell<'a>(
         .columns
         .iter()
         .position(|column| column.name == column_name)
-        .ok_or_else(|| catalog_error(format!("Catalog query omitted column {column_name}.")))?;
+        .ok_or_else(|| plain_error(format!("Catalog query omitted column {column_name}.")))?;
 
     row.get(index)
         .and_then(Option::as_deref)
-        .ok_or_else(|| catalog_error(format!("Catalog query returned no {column_name}.")))
+        .ok_or_else(|| plain_error(format!("Catalog query returned no {column_name}.")))
 }
 
 fn unexpected_catalog_value(label: &str, value: &str) -> DbError {
-    catalog_error(format!("Catalog query returned unknown {label} {value}."))
+    plain_error(format!("Catalog query returned unknown {label} {value}."))
 }
 
 fn non_utf8_error(columns: &[Column], index: usize) -> DbError {
@@ -678,12 +705,12 @@ fn non_utf8_error(columns: &[Column], index: usize) -> DbError {
         .map(|column| format!("column {}", column.name))
         .unwrap_or_else(|| format!("column {index}"));
 
-    catalog_error(format!(
+    plain_error(format!(
         "A value in {column} is not valid UTF-8 text and cannot be displayed."
     ))
 }
 
-fn catalog_error(message: String) -> DbError {
+fn plain_error(message: String) -> DbError {
     DbError {
         message,
         position: None,
@@ -1052,12 +1079,45 @@ mod tests {
 
     #[test]
     fn a_url_demanding_tls_is_refused_rather_than_sent_in_the_clear() {
-        let error = ConnectionConfig::from_url(
-            "postgresql://someone@db.example.test/slate_test?sslmode=require",
-        )
-        .unwrap_err();
+        // The driver's own parser knows only `disable`, `prefer` and
+        // `require`, so the two `verify-` modes are the ones that prove Slate
+        // speaks before the generic "invalid connection string" can.
+        for mode in ["require", "verify-ca", "verify-full"] {
+            let url = format!("postgresql://someone@db.example.test/slate_test?sslmode={mode}");
 
-        assert!(error.contains("TLS"), "unexpected message: {error}");
+            assert_eq!(
+                ConnectionConfig::from_url(&url).unwrap_err(),
+                format!("sslmode={mode} requires TLS, which Slate does not support yet.")
+            );
+        }
+    }
+
+    #[test]
+    fn a_url_port_parameter_wins_over_the_port_in_the_host() {
+        // The driver fills the port from the host section first -- 5432 when
+        // there is none -- and pushes `?port=` after it, so reading the first
+        // entry connected to a different server than the URL named.
+        for (url, expected) in [
+            ("postgresql://someone@db.example.test/slate_test", None),
+            (
+                "postgresql://someone@db.example.test:5433/slate_test",
+                Some(5433),
+            ),
+            (
+                "postgresql://someone@db.example.test/slate_test?port=6000",
+                Some(6000),
+            ),
+            (
+                "postgresql://someone@db.example.test:5433/slate_test?port=6000",
+                Some(6000),
+            ),
+        ] {
+            assert_eq!(
+                ConnectionConfig::from_url(url).unwrap().port,
+                expected,
+                "{url}"
+            );
+        }
     }
 
     #[test]
@@ -1069,6 +1129,23 @@ mod tests {
                 "sslmode={mode} should be accepted"
             );
         }
+    }
+
+    #[test]
+    fn a_describe_disagreeing_on_the_column_count_types_nothing() {
+        let mut two = result(&["id", "label"], &[]);
+
+        apply_types(&mut two.columns, &["int4".to_string()]);
+        assert_eq!(types(&two), vec![None, None]);
+
+        apply_types(
+            &mut two.columns,
+            &["int4".to_string(), "text".to_string(), "bool".to_string()],
+        );
+        assert_eq!(types(&two), vec![None, None]);
+
+        apply_types(&mut two.columns, &["int4".to_string(), "text".to_string()]);
+        assert_eq!(types(&two), vec![Some("int4"), Some("text")]);
     }
 
     #[test]
@@ -1108,6 +1185,39 @@ mod tests {
         );
         assert_eq!(result.bytes, 7);
         assert_eq!(result.rows_affected, Some(2));
+    }
+
+    #[test]
+    #[ignore = "requires a local Postgres server configured through PG*"]
+    fn live_the_type_probe_leaves_an_open_transaction_alone() {
+        // Postgres refuses to prepare more than one statement at a time, and a
+        // refused `Parse` aborts the transaction it arrives in. Describing
+        // before running therefore killed a selection the simple protocol
+        // handles fine, and reported every later failure as "current
+        // transaction is aborted" instead of its own cause.
+        let connection = Connection::open(live_config()).expect("connection should open");
+        connection.query("BEGIN").expect("BEGIN should succeed");
+
+        let result = connection
+            .query("SELECT 1 AS a; SELECT 2 AS b")
+            .expect("a multi-statement selection must survive an open transaction");
+
+        assert_eq!(names(&result), vec!["b"]);
+        // Undescribable, so untyped -- but the transaction is still open.
+        assert_eq!(types(&result), vec![None]);
+
+        let error = connection
+            .query("SELECT * FROM no_such_relation")
+            .unwrap_err();
+
+        assert!(
+            error.message.contains("no_such_relation"),
+            "an error must report its own cause: {}",
+            error.message
+        );
+        connection
+            .query("ROLLBACK")
+            .expect("ROLLBACK should succeed");
     }
 
     #[test]
