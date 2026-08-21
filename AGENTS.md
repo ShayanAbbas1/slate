@@ -19,7 +19,7 @@ require it, stop and raise it instead.
    statement the user did not ask Slate to change. Row limits apply to
    Slate-generated preview queries only, and they are visible in the UI.
 
-   Slate *does* write SQL when the user asks it to, and only then. A header
+   Slate _does_ write SQL when the user asks it to, and only then. A header
    click asking for a sort is such an ask: the `ORDER BY` is spliced into the
    statement in the buffer, where the user can read it, edit it and undo it,
    and the statement that runs is the statement on screen. The same will hold
@@ -35,6 +35,7 @@ require it, stop and raise it instead.
    spec's §5 on this point. The reasoning there — that a client which silently
    alters statements cannot be trusted with the statements that matter — is
    why "silently" is still the word that carries the rule.
+
 2. **The result grid is read-only until row editing exists.** No code path leads
    from the grid to a mutating statement, and none may lead to a destructive
    one afterwards either.
@@ -67,7 +68,7 @@ gpui is pre-1.0 and breaks on minor bumps; `main` has declared `0.2.2` for ten
 months, which is a stalled version field rather than parity with the release.
 
 **Do not add tokio.** GPUI's executor is `async-task` over Grand Central
-Dispatch. A tokio future on `cx.background_executor().spawn(...)` *panics* the
+Dispatch. A tokio future on `cx.background_executor().spawn(...)` _panics_ the
 moment it touches a socket or timer. Database work uses the blocking `postgres`
 client, which owns its runtime internally, spawned onto the background executor.
 
@@ -152,28 +153,7 @@ Hard-won and easy to rediscover. Read before writing any animated element.
 
 ---
 
-## Reference implementations
-
-Read these rather than guessing at GPUI patterns. All three ship real apps.
-
-| Repo | Why |
-| --- | --- |
-| `0xErwin1/dbflux` | Keyboard-first multi-DB GPUI client. Blocking `postgres` driver, a large command palette, crates.io pins. Closest analogue. |
-| `duanebester/pgui` | GPUI Postgres client. Its author contributed the editor's inline-completion support upstream to gpui-component. |
-| `vicanso/zedis` | Best-commented of the three. Its `Cargo.toml` documents the real costs of git-pinning gpui. |
-| `~/hobby-projects/zeron` | A catalogue of hand-rolled GPUI widget patterns and a working popover open/closing/closed lifecycle. **Read for approach only — do not copy code.** See below. |
-
 ---
-
-## License hygiene
-
-**Slate vendors no third-party code, and the license carries exactly one
-copyright holder. Keep it that way.**
-
-Do not copy source from other projects, including `~/hobby-projects/zeron`, even
-where the license would permit it with attribution. Reading another codebase to
-understand an approach is fine and encouraged; pasting its code is not. If a
-problem seems to require vendoring, raise it rather than doing it.
 
 ## No animation in v1
 
