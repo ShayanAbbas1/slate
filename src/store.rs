@@ -1,4 +1,5 @@
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 
 use security_framework::passwords::{self, PasswordOptions};
@@ -7,6 +8,11 @@ use serde::{Deserialize, Serialize};
 const PROFILES_FILE: &str = "profiles.toml";
 const KEYCHAIN_SERVICE: &str = "Slate";
 const SCRATCH_FILE: &str = ".scratch.sql";
+/// `errSecItemNotFound`. Apple's `OSStatus` values are frozen ABI, and the
+/// named constant lives in `security-framework-sys`, which is not a dependency
+/// here -- adding it with the exact pin this project uses everywhere would
+/// fight `security-framework`'s own transitive bump of it.
+const ITEM_NOT_FOUND: i32 = -25300;
 
 /// Field order is load-bearing: TOML cannot emit a scalar after a table, so
 /// every scalar has to precede `open_objects`.
@@ -47,15 +53,39 @@ struct ProfileFile {
     profiles: Vec<StoredProfile>,
 }
 
-pub fn load_profiles() -> Vec<StoredProfile> {
-    let Ok(directory) = slate_directory() else {
-        return Vec::new();
+/// A missing file is the first run, and reads as an empty list. Every other
+/// failure is reported, a missing `HOME` included -- `save_profiles` refuses on
+/// that too, and an empty list here is what the next save writes back.
+pub fn load_profiles() -> Result<Vec<StoredProfile>, String> {
+    let path = slate_directory()?.join(PROFILES_FILE);
+    // A file we could not read is not renamed: nothing is recovered by moving
+    // it, so the overwrite hazard below technically remains. A directory we
+    // cannot read is one we almost certainly cannot write either.
+    let Some(text) = read_file(&path)? else {
+        return Ok(Vec::new());
     };
-    fs::read_to_string(directory.join(PROFILES_FILE))
-        .ok()
-        .and_then(|text| toml::from_str::<ProfileFile>(&text).ok())
+    decode_profiles(&text).map_err(|error| {
+        // The next save rewrites this path, so moving the unparsable file aside
+        // first is what keeps a profile list a single bad byte would cost.
+        let kept = path.with_file_name(format!("{PROFILES_FILE}.broken"));
+        match fs::rename(&path, &kept) {
+            Ok(()) => format!(
+                "Could not read {} as TOML, and it has been kept as {}: {error}",
+                path.display(),
+                kept.display()
+            ),
+            Err(rename_error) => format!(
+                "Could not read {} as TOML, and it could not be moved aside ({rename_error}): {error}",
+                path.display()
+            ),
+        }
+    })
+}
+
+fn decode_profiles(text: &str) -> Result<Vec<StoredProfile>, String> {
+    toml::from_str::<ProfileFile>(text)
         .map(|file| file.profiles)
-        .unwrap_or_default()
+        .map_err(|error| error.to_string())
 }
 
 pub fn save_profiles(profiles: &[StoredProfile]) -> Result<(), String> {
@@ -96,13 +126,26 @@ pub fn profile_id(name: &str, existing: &[String]) -> String {
     candidate
 }
 
-pub fn password(profile_id: &str) -> Option<String> {
-    let bytes = passwords::generic_password(PasswordOptions::new_generic_password(
+/// `Ok(None)` only for a keychain that holds no item for this profile. A denied
+/// prompt, a locked keychain and a secret that is not text are failures: a
+/// blank password is valid, so none of them can be inferred from the connect
+/// attempt that would follow.
+pub fn password(profile_id: &str) -> Result<Option<String>, String> {
+    let bytes = match passwords::generic_password(PasswordOptions::new_generic_password(
         KEYCHAIN_SERVICE,
         profile_id,
-    ))
-    .ok()?;
-    String::from_utf8(bytes).ok()
+    )) {
+        Ok(bytes) => bytes,
+        Err(error) if error.code() == ITEM_NOT_FOUND => return Ok(None),
+        Err(error) => {
+            return Err(format!(
+                "Could not read the password from the keychain: {error}"
+            ));
+        }
+    };
+    String::from_utf8(bytes)
+        .map(Some)
+        .map_err(|error| format!("The keychain password is not valid text: {error}"))
 }
 
 pub fn set_password(profile_id: &str, password: &str) -> Result<(), String> {
@@ -133,12 +176,26 @@ pub fn saved_queries(profile_id: &str) -> Vec<String> {
     names
 }
 
-pub fn read_query(profile_id: &str, name: &str) -> Option<String> {
-    fs::read_to_string(query_path(profile_id, name).ok()?).ok()
+pub fn read_query(profile_id: &str, name: &str) -> Result<Option<String>, String> {
+    read_file(&query_path(profile_id, name)?)
 }
 
 pub fn write_query(profile_id: &str, name: &str, sql: &str) -> Result<(), String> {
     write_file(&query_path(profile_id, name)?, sql)
+}
+
+/// Every query a profile saved, on its way out with the profile.
+///
+/// `profile_id` derives from the name, so a profile recreated under the name of
+/// a removed one is handed the same id -- and would open a dead profile's
+/// queries as its own. Leaving the directory behind is what makes that happen.
+pub fn delete_queries(profile_id: &str) -> Result<(), String> {
+    let directory = query_directory(profile_id)?;
+    match fs::remove_dir_all(&directory) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("Could not delete {}: {error}", directory.display())),
+    }
 }
 
 pub fn delete_query(profile_id: &str, name: &str) -> Result<(), String> {
@@ -153,8 +210,8 @@ pub fn validate_query_name(name: &str) -> Result<(), String> {
     }
 }
 
-pub fn read_scratch(profile_id: &str) -> Option<String> {
-    fs::read_to_string(query_directory(profile_id).ok()?.join(SCRATCH_FILE)).ok()
+pub fn read_scratch(profile_id: &str) -> Result<Option<String>, String> {
+    read_file(&query_directory(profile_id)?.join(SCRATCH_FILE))
 }
 
 pub fn write_scratch(profile_id: &str, sql: &str) -> Result<(), String> {
@@ -192,6 +249,17 @@ fn query_directory(profile_id: &str) -> Result<PathBuf, String> {
 fn query_path(profile_id: &str, name: &str) -> Result<PathBuf, String> {
     validate_query_name(name)?;
     Ok(query_directory(profile_id)?.join(format!("{name}.sql")))
+}
+
+/// `Ok(None)` for a file that is not there, which every caller has a sensible
+/// answer for. A file that exists and could not be read does not get the same
+/// answer -- that is the one that sends a person looking for lost work.
+fn read_file(path: &Path) -> Result<Option<String>, String> {
+    match fs::read_to_string(path) {
+        Ok(text) => Ok(Some(text)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!("Could not read {}: {error}", path.display())),
+    }
 }
 
 fn write_file(path: &Path, contents: &str) -> Result<(), String> {
@@ -249,6 +317,14 @@ mod tests {
         let decoded: ProfileFile = toml::from_str(&text).expect("profiles must decode");
 
         assert_eq!(decoded.profiles, vec![profile]);
+    }
+
+    #[test]
+    fn an_unparsable_profile_file_is_an_error_rather_than_an_empty_list() {
+        // The empty list is what the next save writes back, so a parse error
+        // that reads as "no profiles" is a parse error that deletes them.
+        assert!(decode_profiles("host = ").is_err());
+        assert_eq!(decode_profiles(""), Ok(Vec::new()));
     }
 
     #[test]

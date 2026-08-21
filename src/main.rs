@@ -218,11 +218,17 @@ impl Session {
 
         let saved_queries = store::saved_queries(&id);
         let open_query = open_query.filter(|name| saved_queries.contains(name));
-        let sql = match &open_query {
+        let stored_sql = match &open_query {
             Some(name) => store::read_query(&id, name),
             None => store::read_scratch(&id),
-        }
-        .unwrap_or_default();
+        };
+        // A buffer that could not be read is left empty either way, so the
+        // notice is the only thing between that and a session that looks like
+        // it never held anything.
+        let (sql, notice) = match stored_sql {
+            Ok(sql) => (sql.unwrap_or_default(), None),
+            Err(message) => (String::new(), Some(message)),
+        };
 
         Self {
             editor: cx.new(|cx| {
@@ -248,7 +254,7 @@ impl Session {
             save_name,
             naming: false,
             pending_delete: None,
-            notice: None,
+            notice,
             editor_font_size: EDITOR_FONT_SIZE_DEFAULT,
         }
     }
@@ -615,8 +621,14 @@ impl Workspace {
             next_generation: 0,
         };
 
-        for stored in store::load_profiles() {
-            workspace.restore_profile(stored, window, cx);
+        let mut load_failure = None;
+        match store::load_profiles() {
+            Ok(profiles) => {
+                for stored in profiles {
+                    workspace.restore_profile(stored, window, cx);
+                }
+            }
+            Err(message) => load_failure = Some(message),
         }
 
         match connection_config_from_environment() {
@@ -643,6 +655,12 @@ impl Workspace {
 
         if workspace.profiles.is_empty() && workspace.form.is_none() {
             workspace.form = Some(ConnectionForm::new(None, window, cx));
+        }
+
+        // After the form exists, because with no profiles the form is the only
+        // surface a notice has.
+        if let Some(message) = load_failure {
+            workspace.note(message, cx);
         }
 
         // Buffers are otherwise written only when one is swapped for another,
@@ -880,9 +898,15 @@ impl Workspace {
             let id = id.clone();
             async move {
                 if config.password.is_empty() {
-                    config.password = store::password(&id).unwrap_or_default();
+                    match store::password(&id) {
+                        Ok(Some(password)) => config.password = password,
+                        // No keychain item is not a missing password: a blank
+                        // one is valid, so this connects with what it has.
+                        Ok(None) => {}
+                        Err(message) => return Err(message),
+                    }
                 }
-                Connection::open(config)
+                Connection::open(config).map_err(|error| error.message)
             }
         });
 
@@ -895,7 +919,7 @@ impl Workspace {
                     };
                     profile.state = match result {
                         Ok(connection) => ProfileState::Connected(connection),
-                        Err(error) => ProfileState::Failed(error.message),
+                        Err(message) => ProfileState::Failed(message),
                     };
                     workspace.load_catalog(&id, generation, cx);
                     cx.notify();
@@ -1010,16 +1034,21 @@ impl Workspace {
             return;
         }
 
+        // Counted before the directory goes, because afterwards there is
+        // nothing left to count and the number is what the note reports.
+        let queries = store::saved_queries(&id).len();
+
         self.profiles.remove(index);
         store::delete_password(&id);
+        let removed_queries = store::delete_queries(&id);
         self.pending_removal = None;
-        self.active = self.active.min(self.profiles.len().saturating_sub(1));
+        self.active = active_after_removal(self.active, index, self.profiles.len());
         self.remember_profiles(cx);
         if self.profiles.is_empty() {
             self.form = Some(ConnectionForm::new(None, window, cx));
         } else {
             self.connect_active(cx);
-            self.note(format!("Removed {name}."), cx);
+            self.note(removal_note(&name, queries, removed_queries.err()), cx);
         }
         cx.notify();
     }
@@ -1694,11 +1723,19 @@ impl Workspace {
         let Some(profile) = self.profile_mut() else {
             return;
         };
-        let Some(sql) = store::read_query(&profile.id, &name) else {
-            profile.session.saved_queries = store::saved_queries(&profile.id);
-            profile.session.notice = Some(format!("{name} no longer exists."));
-            cx.notify();
-            return;
+        let sql = match store::read_query(&profile.id, &name) {
+            Ok(Some(sql)) => sql,
+            Ok(None) => {
+                profile.session.saved_queries = store::saved_queries(&profile.id);
+                profile.session.notice = Some(format!("{name} no longer exists."));
+                cx.notify();
+                return;
+            }
+            Err(message) => {
+                profile.session.notice = Some(message);
+                cx.notify();
+                return;
+            }
         };
         profile
             .session
@@ -1725,7 +1762,14 @@ impl Workspace {
         let Some(profile) = self.profile_mut() else {
             return;
         };
-        let sql = store::read_scratch(&profile.id).unwrap_or_default();
+        let sql = match store::read_scratch(&profile.id) {
+            Ok(sql) => sql.unwrap_or_default(),
+            Err(message) => {
+                profile.session.notice = Some(message);
+                cx.notify();
+                return;
+            }
+        };
         profile
             .session
             .editor
@@ -3633,6 +3677,30 @@ fn human_bytes(bytes: u64) -> String {
     }
 }
 
+/// Removing an entry below the active one shifts the vector under the index,
+/// so clamping to the new length alone silently activates the wrong profile.
+fn active_after_removal(active: usize, removed: usize, remaining: usize) -> usize {
+    let shifted = if removed < active { active - 1 } else { active };
+    shifted.min(remaining.saturating_sub(1))
+}
+
+/// What a removal took with it. The count is named because saved queries are
+/// the one thing a person could still want back, and a directory that outlived
+/// its profile is reported rather than passed over -- the id is derived from the
+/// name, so whatever is left there attaches itself to the next profile called
+/// the same thing.
+fn removal_note(name: &str, queries: usize, problem: Option<String>) -> String {
+    if let Some(problem) = problem {
+        return format!("Removed {name}, but its saved queries are still on disk: {problem}");
+    }
+
+    match queries {
+        0 => format!("Removed {name}."),
+        1 => format!("Removed {name} and its saved query."),
+        _ => format!("Removed {name} and its {queries} saved queries."),
+    }
+}
+
 fn adjusted_editor_font_size(current: f32, delta: f32) -> f32 {
     (current + delta).clamp(EDITOR_FONT_SIZE_MIN, EDITOR_FONT_SIZE_MAX)
 }
@@ -3764,6 +3832,34 @@ mod tests {
                 data_type: None,
             })
             .collect()
+    }
+
+    #[test]
+    fn removing_a_profile_keeps_the_same_one_active() {
+        assert_eq!(active_after_removal(2, 0, 3), 1);
+        assert_eq!(active_after_removal(2, 2, 3), 2);
+        assert_eq!(active_after_removal(2, 3, 3), 2);
+        // The active profile was last, so there is nothing at its index now.
+        assert_eq!(active_after_removal(2, 2, 2), 1);
+        assert_eq!(active_after_removal(0, 0, 0), 0);
+    }
+
+    #[test]
+    fn a_removal_says_what_went_with_the_profile() {
+        assert_eq!(removal_note("Prod", 0, None), "Removed Prod.");
+        assert_eq!(
+            removal_note("Prod", 1, None),
+            "Removed Prod and its saved query."
+        );
+        assert_eq!(
+            removal_note("Prod", 7, None),
+            "Removed Prod and its 7 saved queries."
+        );
+        // The count is not mentioned when the files are still there to count.
+        assert_eq!(
+            removal_note("Prod", 7, Some("permission denied".into())),
+            "Removed Prod, but its saved queries are still on disk: permission denied"
+        );
     }
 
     #[test]
