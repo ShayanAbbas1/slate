@@ -6,9 +6,13 @@ A SQL editor that shows results — not a database browser with an editor bolted
 on. Keyboard-first, minimal, and built to stay at display refresh rate on real
 data.
 
-> **Status: early development.** Slate can connect and run SQL; the result grid,
-> connection form and distribution work are still in progress. The design is at
-> [`docs/specs/2026-08-17-slate-design.md`](docs/specs/2026-08-17-slate-design.md).
+> **Status: early development, and there is no TLS yet.** Slate connects in
+> plaintext and refuses any `sslmode` it cannot honour rather than pretending to,
+> so do not point it at a database you would not query over an unencrypted
+> socket. Everything below under "What works" runs today.
+>
+> Design: [`docs/specs/2026-08-17-slate-design.md`](docs/specs/2026-08-17-slate-design.md),
+> amended by [`docs/specs/2026-08-23-in-grid-editing-design.md`](docs/specs/2026-08-23-in-grid-editing-design.md).
 
 ## Development database
 
@@ -41,22 +45,41 @@ docker compose down --volumes
 docker compose up -d postgres
 ```
 
-## Planned for v1
+## What works
 
-- Connection profiles with isolated workspaces — switch database, switch your
-  whole set of tabs, tree and history. Nothing shared.
-- Query editor with tree-sitter SQL highlighting. `cmd+enter` runs the selection,
-  or the statement under the cursor.
-- Virtualized result grid with a configurable row limit and a scrollable value
-  inspector for large JSONB and PostGIS values.
-- `cmd+p` fuzzy table search, `cmd+shift+p` command palette.
-- Schema browsing with an inline filter.
-- TLS.
+- **Connection profiles with isolated workspaces.** Switch database and your
+  whole set of tabs, tree and history switches with it. Nothing is shared, so a
+  buffer written against staging cannot be silently retargeted at production.
+  Profiles persist; passwords live in the Keychain.
+- **Query editor** with tree-sitter SQL highlighting. `cmd+enter` runs the
+  selection, or the statement under the cursor. Errors render inline.
+- **Virtualized result grid** with content-fitted draggable columns and a row
+  inspector showing whole values and their types. Table previews carry a
+  per-tab row limit; a query you wrote runs exactly as written, uncapped.
+- **Sorting that edits your SQL in front of you.** A header click splices an
+  `ORDER BY` into the statement in the buffer — the statement that runs is the
+  statement on screen, and you can edit or undo it.
+- **In-grid editing.** Click or arrow to a cell, `Enter` to edit, `cmd+c` to copy
+  the whole value. Apply writes one `UPDATE` per changed row into the buffer and
+  runs it. A cell is editable only when Slate can identify its row by primary
+  key; joins, aggregates, views and keyless tables stay read-only and say why.
+- **Schema explorer** over schemas, tables, views, functions and procedures, with
+  an inline filter and a structure view for columns, indexes and constraints.
+
+## Planned
+
+`cmd+p` fuzzy table search and `cmd+shift+p` command palette · TLS with an
+sslmode selector · multiple unsaved buffers · a Homebrew tap.
 
 ## Not planned
 
-Row editing, visual query builders, ER diagrams, migrations. Slate assumes you
-write SQL.
+Visual query builders, ER diagrams, migrations, foreign-key navigation. Slate
+assumes you write SQL.
+
+**Slate will never write a `DELETE`, `DROP` or `TRUNCATE`** — not on request, not
+by accident. Generated statements pass a whitelist gate that admits `UPDATE` and
+nothing else, so the guarantee is structural rather than a list of names someone
+remembered to check.
 
 ## License
 
