@@ -1,14 +1,16 @@
 use gpui::{
-    App, ClipboardItem, Context, InteractiveElement, IntoElement, ParentElement, SharedString,
-    StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder, px,
+    App, AppContext, Context, Entity, Focusable, InteractiveElement, IntoElement,
+    ParentElement, SharedString, StatefulInteractiveElement, Styled, Window, div,
+    prelude::FluentBuilder, px,
 };
 use gpui_component::{
     InteractiveElementExt,
+    input::{Input, InputState},
     table::{Column, TableDelegate, TableState},
 };
 
 use crate::{
-    db::QueryResult,
+    db::{EditTarget, QueryResult},
     icons::icon,
     theme::{layout, theme},
 };
@@ -21,8 +23,8 @@ const CELL_DISPLAY_LIMIT: usize = 300;
 
 /// ponytail: the inspector shows the value, not a column's worth of it -- but
 /// "the value" has to stop somewhere, because a multi-megabyte document laid
-/// out as wrapped text stalls the frame it is laid out in. A double click on
-/// the cell still copies all of it. Raise this if a real value gets cut.
+/// out as wrapped text stalls the frame it is laid out in. `cmd+c` on the cell
+/// still copies all of it. Raise this if a real value gets cut.
 const FIELD_DISPLAY_LIMIT: usize = 4_000;
 
 /// What an absent value is called wherever one is shown.
@@ -61,9 +63,55 @@ pub struct ResultGrid {
     /// Whether a header click can sort this result at all. A control that does
     /// nothing is worse than no control.
     sortable: bool,
-    /// The last cell copied, marked so a copy is visible. A double click that
-    /// leaves the screen unchanged reads as a click that did nothing.
-    copied: Option<(usize, usize)>,
+    /// The cell a keystroke acts on. Slate's, not the library's: gpui-component
+    /// tracks a selected row *or* a selected column as mutually exclusive
+    /// modes and never a cell, so a coordinate has to be assembled here or
+    /// `Enter` has no target. A click sets it outright; the library's arrow
+    /// keys reach it through `select_row` and `select_col`. Both paths end in
+    /// `set_active`, so there is one answer to where the user is.
+    active: Option<(usize, usize)>,
+    /// What the user has changed and not yet applied. `result.rows` is never
+    /// written, so the grid can always show pending against as-fetched and
+    /// discarding is dropping this.
+    ///
+    /// ponytail: a linear scan per visible cell per frame, over the handful of
+    /// cells one person edits between applies. A map keyed by `(row, col)` is
+    /// the upgrade path if that handful ever becomes thousands.
+    pending: Vec<PendingEdit>,
+    /// The one cell showing an input, if any. At most one: every other cell
+    /// stays on the fast path that `display`'s no-allocation rule is about.
+    editing: Option<Editing>,
+}
+
+/// One changed cell, held beside the fetched value rather than over it.
+struct PendingEdit {
+    row: usize,
+    col: usize,
+    /// What will be written. Whole, because this is what the `UPDATE` carries.
+    value: SharedString,
+    /// What the column paints, clipped for the same reason `display` is.
+    shown: SharedString,
+}
+
+struct Editing {
+    row: usize,
+    col: usize,
+    /// Built on the first render of the cell, because an input needs a window
+    /// and opening an edit deliberately does not.
+    input: Option<Entity<InputState>>,
+}
+
+/// One row's worth of pending edits, resolved to real column names and ready
+/// for `sql::update_row`. Alias resolution happens here so the caller does none.
+#[allow(dead_code)]
+pub struct PendingRow {
+    pub schema: String,
+    pub table: String,
+    /// Real column name and its new value, one per changed column.
+    pub sets: Vec<(String, String)>,
+    /// The key columns' real names against their **as-fetched** values: the row
+    /// is identified by what the server holds, not by what the user has typed.
+    pub keys: Vec<(String, String)>,
 }
 
 impl ResultGrid {
@@ -103,7 +151,9 @@ impl ResultGrid {
             sortable: false,
             result,
             display,
-            copied: None,
+            active: None,
+            pending: Vec::new(),
+            editing: None,
         }
     }
 
@@ -148,6 +198,248 @@ impl ResultGrid {
                     .map(|value| clip_to(value, FIELD_DISPLAY_LIMIT).into()),
             })
             .collect()
+    }
+}
+
+/// The editing half of the grid: what the user has changed, and not one
+/// statement of SQL. Generating and running that is the workspace's job, which
+/// is why every one of these is computable without a window.
+// The caller is the UI wiring in `main.rs`, which does not exist yet. Landing
+// the delegate half first means the wiring has nothing left to invent.
+#[allow(dead_code)]
+impl ResultGrid {
+    /// The cell `Enter` acts on, if the user has reached one. `None` on a
+    /// result set nobody has touched yet, and on every new one.
+    pub fn active(&self) -> Option<(usize, usize)> {
+        self.active
+    }
+
+    /// The whole value behind the active cell, which is what `cmd+c` copies —
+    /// not the clipped string the column had room for. `None` while an input is
+    /// open, because there `cmd+c` is the input's own text selection, and on a
+    /// NULL, which is an absent value rather than the word painted for one.
+    pub fn active_value(&self) -> Option<&str> {
+        if self.editing.is_some() {
+            return None;
+        }
+        let (row, col) = self.active?;
+        self.cell(row, col)
+    }
+
+    /// Fold the library's row selection into the active cell. Its own arrow-key
+    /// actions move that selection, so folding the event here is what makes
+    /// them move the ring, and there is no competing binding to fight.
+    ///
+    /// The column is kept: moving down a column is not moving out of it. With
+    /// nothing active yet the first column is the origin, because a keystroke
+    /// on a grid has to leave the ring somewhere readable.
+    pub fn select_row(&mut self, row: usize) {
+        self.set_active(row, self.active.map_or(0, |(_, col)| col));
+    }
+
+    /// The same fold for a column change, keeping the row. A header click lands
+    /// here too, and is deliberately not special-cased: on a sortable result
+    /// the sort re-runs and replaces this delegate wholesale, so the ring is
+    /// dropped either way, and on one that cannot be sorted the ring sitting at
+    /// the top of the column the user just pointed at is where their last
+    /// action was.
+    pub fn select_col(&mut self, col: usize) {
+        self.set_active(self.active.map_or(0, |(row, _)| row), col);
+    }
+
+    /// Move the ring to a cell. An input open on some other cell goes with it:
+    /// one cell holding a focused input while another wears the ring `Enter`
+    /// follows is two cells claiming the keyboard.
+    fn set_active(&mut self, row: usize, col: usize) {
+        if self
+            .editing
+            .as_ref()
+            .is_some_and(|editing| (editing.row, editing.col) != (row, col))
+        {
+            self.editing = None;
+        }
+        self.active = Some((row, col));
+    }
+
+    /// Whether this cell can be written back at all: the result has to be
+    /// traceable to one table, the column has to exist in it, and it must not
+    /// be part of the key — a key edit is the one edit whose result cannot be
+    /// re-verified afterwards, so the spec's §3 refuses it.
+    pub fn editable(&self, row: usize, col: usize) -> bool {
+        let Some(edit) = &self.result.edit else {
+            return false;
+        };
+        row < self.result.rows.len()
+            && edit.columns.get(col).is_some_and(Option::is_some)
+            && !edit.keys.contains(&col)
+    }
+
+    /// Open an input on a cell. `false` when the cell is not editable, and
+    /// nothing at all happens then: the notice belongs to `main.rs`.
+    pub fn begin_edit(&mut self, row: usize, col: usize) -> bool {
+        if !self.editable(row, col) {
+            return false;
+        }
+        self.editing = Some(Editing {
+            row,
+            col,
+            input: None,
+        });
+        true
+    }
+
+    /// Abandon the open input, leaving nothing behind.
+    pub fn cancel_edit(&mut self) {
+        self.editing = None;
+    }
+
+    /// Record a new value for a cell. `false` when the cell is not editable, in
+    /// which case nothing is recorded.
+    pub fn set_pending(&mut self, row: usize, col: usize, value: String) -> bool {
+        if !self.editable(row, col) {
+            return false;
+        }
+
+        let value: SharedString = value.into();
+        // Bytes, not characters: it only has to be cheap and never under-count,
+        // and `clip` is a no-op on anything that turns out to fit.
+        let shown = match value.len() > CELL_DISPLAY_LIMIT {
+            true => clip(&value).into(),
+            false => value.clone(),
+        };
+        match self
+            .pending
+            .iter_mut()
+            .find(|edit| edit.row == row && edit.col == col)
+        {
+            Some(edit) => {
+                edit.value = value;
+                edit.shown = shown;
+            }
+            None => self.pending.push(PendingEdit {
+                row,
+                col,
+                value,
+                shown,
+            }),
+        }
+        true
+    }
+
+    pub fn has_pending(&self) -> bool {
+        !self.pending.is_empty()
+    }
+
+    /// Back to exactly what the server returned.
+    pub fn discard_pending(&mut self) {
+        self.pending.clear();
+        self.editing = None;
+    }
+
+    /// One entry per changed row, in the order the rows were first edited, with
+    /// every changed column of that row in a single `SET`.
+    ///
+    /// A row whose key is not fully readable is dropped rather than guessed at:
+    /// a `NULL` in a key column, or a key column the result set does not carry,
+    /// leaves Slate unable to name the row.
+    pub fn pending_updates(&self) -> Vec<PendingRow> {
+        let Some(edit) = &self.result.edit else {
+            return Vec::new();
+        };
+
+        let mut rows: Vec<usize> = Vec::new();
+        for row in self.pending.iter().map(|edit| edit.row) {
+            if !rows.contains(&row) {
+                rows.push(row);
+            }
+        }
+
+        rows.into_iter()
+            .filter_map(|row| {
+                let sets: Vec<(String, String)> = self
+                    .pending
+                    .iter()
+                    .filter(|pending| pending.row == row)
+                    .filter_map(|pending| {
+                        let name = edit.columns.get(pending.col)?.clone()?;
+                        Some((name, pending.value.to_string()))
+                    })
+                    .collect();
+                if sets.is_empty() {
+                    return None;
+                }
+                Some(PendingRow {
+                    schema: edit.schema.clone(),
+                    table: edit.table.clone(),
+                    sets,
+                    keys: self.key_values(edit, row)?,
+                })
+            })
+            .collect()
+    }
+
+    /// The row's key columns, named and carrying the value the server sent.
+    /// `None` if any of them is missing, which is what refuses the whole row.
+    fn key_values(&self, edit: &EditTarget, row: usize) -> Option<Vec<(String, String)>> {
+        edit.keys
+            .iter()
+            .map(|&col| {
+                let name = edit.columns.get(col)?.clone()?;
+                Some((name, self.cell(row, col)?.to_string()))
+            })
+            .collect()
+    }
+
+    fn pending_at(&self, row: usize, col: usize) -> Option<&PendingEdit> {
+        self.pending
+            .iter()
+            .find(|edit| edit.row == row && edit.col == col)
+    }
+
+    /// The input for the cell being edited, created on its first render. `None`
+    /// for every other cell, which is every cell but one.
+    fn editing_input(
+        &mut self,
+        row: usize,
+        col: usize,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Option<Entity<InputState>> {
+        let editing = self.editing.as_ref()?;
+        if (editing.row, editing.col) != (row, col) {
+            return None;
+        }
+        if let Some(input) = &editing.input {
+            return Some(input.clone());
+        }
+
+        // The whole value, not the clipped one: this is the value being
+        // changed, and a NULL is edited as the empty string because there is no
+        // way to type one back (spec §3).
+        let seed = match self.pending_at(row, col) {
+            Some(pending) => pending.value.clone(),
+            None => self
+                .cell(row, col)
+                .map(|value| SharedString::from(value.to_string()))
+                .unwrap_or_default(),
+        };
+        let input = cx.new(|cx| InputState::new(window, cx).default_value(seed));
+        // The keystrokes that follow belong to the value rather than to the
+        // grid's selection, so the input takes focus as it appears.
+        input.focus_handle(cx).focus(window);
+        self.editing.as_mut()?.input = Some(input.clone());
+        Some(input)
+    }
+
+    /// Take the open input's value into the pending set.
+    fn commit_edit(&mut self, cx: &App) {
+        let Some(editing) = self.editing.take() else {
+            return;
+        };
+        let Some(input) = editing.input else {
+            return;
+        };
+        self.set_pending(editing.row, editing.col, input.read(cx).value().to_string());
     }
 }
 
@@ -300,47 +592,104 @@ impl TableDelegate for ResultGrid {
         &mut self,
         row_ix: usize,
         col_ix: usize,
-        _: &mut Window,
+        window: &mut Window,
         cx: &mut Context<TableState<Self>>,
     ) -> impl IntoElement {
-        // Rows are not guaranteed rectangular and an index can outlive the
-        // result set it was taken from. Indexing here would abort the process
-        // mid-paint and take the user's editor buffer with it.
-        let cell = self
-            .display
-            .get(row_ix)
-            .and_then(|row| row.get(col_ix))
-            .and_then(Option::as_ref);
-        let (text, faint, copied_bg) = {
+        let (text, faint, edited_bg, active_ring) = {
             let t = theme(cx);
-            (t.text, t.text_faint, t.element_active)
+            (t.text, t.text_faint, t.edited, t.accent)
         };
-        let copied = self.copied == Some((row_ix, col_ix));
-
-        div()
+        let base = div()
             .id(("cell", row_ix * self.columns.len() + col_ix))
             .size_full()
             .px(px(layout::SPACE_SM))
+            // A ring rather than a wash: the pending-edit wash is taken, and
+            // the active cell has to be distinguishable while wearing it.
+            // Unconditional width so the ring appearing costs the row no
+            // reflow -- gpui lays a border out whether or not there is a
+            // colour to paint it with.
+            .border_1()
+            .when(self.active == Some((row_ix, col_ix)), |cell| {
+                cell.border_color(active_ring)
+            })
             .flex()
-            .items_center()
-            .overflow_hidden()
+            .items_center();
+
+        if let Some(input) = self.editing_input(row_ix, col_ix, window, cx) {
+            return base
+                .bg(edited_bg)
+                .child(
+                    Input::new(&input)
+                        // The cell is the frame; a second border and background
+                        // inside one would read as a control in a hole.
+                        .appearance(false)
+                        .px_0()
+                        .text_size(px(layout::TEXT_MD)),
+                )
+                // The input has focus, so both keystrokes arrive here on their
+                // way out of it. Consumed rather than propagated: `escape`
+                // otherwise reaches the workspace and moves focus to the editor.
+                .on_action(cx.listener(
+                    move |table, _: &gpui_component::input::Enter, window, cx| {
+                        table.delegate_mut().commit_edit(cx);
+                        table.focus_handle(cx).focus(window);
+                        cx.stop_propagation();
+                        cx.notify();
+                    },
+                ))
+                .on_action(cx.listener(
+                    move |table, _: &gpui_component::input::Escape, window, cx| {
+                        table.delegate_mut().cancel_edit();
+                        table.focus_handle(cx).focus(window);
+                        cx.stop_propagation();
+                        cx.notify();
+                    },
+                ));
+        }
+
+        // A pending value is painted from the pending set rather than by
+        // patching `display`, which stays exactly as fetched.
+        let pending = self.pending_at(row_ix, col_ix);
+        let cell = match pending {
+            Some(pending) => Some(pending.shown.clone()),
+            // Rows are not guaranteed rectangular and an index can outlive the
+            // result set it was taken from. Indexing here would abort the
+            // process mid-paint and take the user's editor buffer with it.
+            None => self
+                .display
+                .get(row_ix)
+                .and_then(|row| row.get(col_ix))
+                .and_then(Option::as_ref)
+                .cloned(),
+        };
+
+        base.overflow_hidden()
             .whitespace_nowrap()
             .text_ellipsis()
             .text_color(if cell.is_some() { text } else { faint })
             // Italic so a NULL cannot be mistaken for the four-letter string.
             .when(cell.is_none(), |cell| cell.italic())
-            // Held until the next copy rather than timed out: this is a mark of
-            // what is on the clipboard, and that does not expire either.
-            .when(copied, |cell| cell.bg(copied_bg))
-            .child(cell.cloned().unwrap_or(NULL_LABEL))
-            // The whole value, past both what the column shows and what the
-            // row inspector shows.
+            .when(pending.is_some(), |cell| cell.bg(edited_bg))
+            .child(cell.unwrap_or(NULL_LABEL))
+            // No fallback: `begin_edit` already refuses silently on a cell
+            // that cannot be written, which is the right outcome here too --
+            // a double click on a read-only cell does nothing rather than
+            // copying, because copying is `cmd+c` on every cell alike.
             .on_double_click(cx.listener(move |table, _, _, cx| {
-                let Some(value) = table.delegate().cell(row_ix, col_ix) else {
-                    return;
-                };
-                cx.write_to_clipboard(ClipboardItem::new_string(value.to_string()));
-                table.delegate_mut().copied = Some((row_ix, col_ix));
+                if table.delegate_mut().begin_edit(row_ix, col_ix) {
+                    cx.notify();
+                }
+            }))
+            // What `Enter` will act on. The library records the row of a cell
+            // click and never the column, so the coordinate is set here whole.
+            // The row it does record arrives as `SelectRow` and folds back in
+            // keeping this column, so the two orders converge on the same cell.
+            // Runs on the first click of a double click too, and
+            // `set_active` on the cell an editor just opened on is a no-op --
+            // same coordinates, so `editing` survives -- which is what keeps
+            // the second listener from closing what the first just opened.
+            .on_click(cx.listener(move |table, _, _, cx| {
+                table.delegate_mut().set_active(row_ix, col_ix);
                 cx.notify();
             }))
     }
@@ -368,6 +717,368 @@ mod tests {
                 .collect(),
             ..QueryResult::default()
         })
+    }
+
+    /// A grid over `id, note, total` where `id` is the key, `note` is an alias
+    /// for the real column `body`, and `total` is computed. One column of each
+    /// kind that editing has to tell apart.
+    fn editable_grid() -> ResultGrid {
+        ResultGrid::new(QueryResult {
+            columns: vec![column("id"), column("note"), column("total")],
+            rows: vec![
+                vec![Some("7".into()), Some("first".into()), Some("1".into())],
+                vec![Some("8".into()), Some("second".into()), Some("2".into())],
+            ],
+            edit: Some(EditTarget {
+                schema: "public".into(),
+                table: "measurements".into(),
+                columns: vec![Some("id".into()), Some("body".into()), None],
+                keys: vec![0],
+            }),
+            ..QueryResult::default()
+        })
+    }
+
+    #[test]
+    fn a_pending_edit_leaves_the_fetched_rows_alone() {
+        // The grid shows changed-against-server by holding both. Writing the
+        // edit into `result.rows` would lose the server's value for good.
+        let mut grid = editable_grid();
+        assert!(grid.set_pending(0, 1, "changed".into()));
+
+        assert_eq!(grid.result.rows[0][1].as_deref(), Some("first"));
+        assert_eq!(grid.display[0][1].as_ref().map(SharedString::as_ref), Some("first"));
+        assert_eq!(grid.cell(0, 1), Some("first"));
+        assert!(grid.has_pending());
+    }
+
+    #[test]
+    fn several_edits_on_one_row_become_one_update() {
+        // One statement per row, not per cell: two `UPDATE`s against the same
+        // key would be two round trips writing over each other's work.
+        let mut grid = editable_grid();
+        assert!(grid.set_pending(0, 1, "once".into()));
+        assert!(grid.set_pending(0, 1, "twice".into()));
+
+        let updates = grid.pending_updates();
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].schema, "public");
+        assert_eq!(updates[0].table, "measurements");
+        // The alias is resolved here, so the caller generates SQL against the
+        // column the table actually has.
+        assert_eq!(updates[0].sets, vec![("body".to_string(), "twice".to_string())]);
+    }
+
+    #[test]
+    fn two_edited_rows_become_two_updates() {
+        let mut grid = editable_grid();
+        assert!(grid.set_pending(1, 1, "later".into()));
+        assert!(grid.set_pending(0, 1, "earlier".into()));
+
+        let updates = grid.pending_updates();
+        assert_eq!(updates.len(), 2);
+        // In the order they were edited, so the batch reads the way it was made.
+        assert_eq!(updates[0].keys, vec![("id".to_string(), "8".to_string())]);
+        assert_eq!(updates[1].keys, vec![("id".to_string(), "7".to_string())]);
+    }
+
+    #[test]
+    fn a_key_travels_as_the_value_the_server_sent() {
+        // The `WHERE` names the row the server holds. Taking a key value from
+        // the pending set would build a predicate that matches nothing.
+        let mut grid = editable_grid();
+        assert!(grid.set_pending(0, 1, "changed".into()));
+
+        let updates = grid.pending_updates();
+        assert_eq!(updates[0].keys, vec![("id".to_string(), "7".to_string())]);
+        assert_eq!(updates[0].sets, vec![("body".to_string(), "changed".to_string())]);
+    }
+
+    #[test]
+    fn a_row_slate_cannot_name_produces_no_statement() {
+        // A NULL key value leaves no predicate to write, and a row updated by
+        // guesswork is the failure this whole feature is built to avoid.
+        let mut grid = ResultGrid::new(QueryResult {
+            columns: vec![column("id"), column("note")],
+            rows: vec![vec![None, Some("orphan".into())]],
+            edit: Some(EditTarget {
+                schema: "public".into(),
+                table: "measurements".into(),
+                columns: vec![Some("id".into()), Some("body".into())],
+                keys: vec![0],
+            }),
+            ..QueryResult::default()
+        });
+
+        assert!(grid.set_pending(0, 1, "changed".into()));
+        assert!(grid.pending_updates().is_empty());
+    }
+
+    #[test]
+    fn a_primary_key_column_cannot_be_edited() {
+        // `SET id = new WHERE id = old` is the one edit whose result cannot be
+        // re-verified afterwards -- spec §3.
+        let mut grid = editable_grid();
+
+        assert!(!grid.editable(0, 0));
+        assert!(!grid.begin_edit(0, 0));
+        assert!(!grid.set_pending(0, 0, "99".into()));
+        assert!(!grid.has_pending());
+    }
+
+    #[test]
+    fn a_computed_column_cannot_be_edited() {
+        // There is no column behind it to write to.
+        let mut grid = editable_grid();
+
+        assert!(!grid.editable(0, 2));
+        assert!(!grid.set_pending(0, 2, "99".into()));
+        // Nor does a column past the end of the result set become editable.
+        assert!(!grid.set_pending(0, 9, "99".into()));
+        // Nor a row past the end of it.
+        assert!(!grid.set_pending(9, 1, "99".into()));
+        assert!(!grid.has_pending());
+    }
+
+    #[test]
+    fn nothing_is_editable_without_an_edit_target() {
+        // A join, an aggregate, or a select that dropped the key: `db` says the
+        // rows cannot be addressed, and the grid stays read-only.
+        let mut grid = grid_of(&[Some("x")]);
+
+        assert!(!grid.editable(0, 0));
+        assert!(!grid.begin_edit(0, 0));
+        assert!(!grid.set_pending(0, 0, "y".into()));
+        assert!(grid.pending_updates().is_empty());
+    }
+
+    #[test]
+    fn discarding_leaves_the_grid_as_fetched() {
+        // Discarding is dropping a collection, which is the whole reason the
+        // fetched rows are never written.
+        let mut grid = editable_grid();
+        grid.set_pending(0, 1, "changed".into());
+        grid.begin_edit(1, 1);
+
+        grid.discard_pending();
+
+        assert!(!grid.has_pending());
+        assert!(grid.editing.is_none());
+        assert!(grid.pending_updates().is_empty());
+        assert_eq!(grid.cell(0, 1), Some("first"));
+    }
+
+    #[test]
+    fn a_long_pending_value_is_clipped_for_the_column_but_not_for_the_update() {
+        // The same split as `display` against `cell`: the column paints what
+        // fits, the statement carries the value.
+        let value = "x".repeat(CELL_DISPLAY_LIMIT * 2);
+        let mut grid = editable_grid();
+        assert!(grid.set_pending(0, 1, value.clone()));
+
+        let pending = grid.pending_at(0, 1).unwrap();
+        assert_eq!(pending.value.as_ref(), value);
+        assert_eq!(pending.shown.chars().count(), CELL_DISPLAY_LIMIT + 1);
+        assert_eq!(grid.pending_updates()[0].sets[0].1, value);
+    }
+
+    #[test]
+    fn a_clicked_cell_is_remembered_as_the_active_one() {
+        // gpui-component has no cell selection -- `set_selected_row` and
+        // `set_selected_col` are mutually exclusive modes, not two halves of a
+        // coordinate -- so if the grid forgets this, `Enter` has no target.
+        let mut grid = editable_grid();
+        assert!(grid.active().is_none());
+
+        grid.set_active(1, 1);
+        assert_eq!(grid.active(), Some((1, 1)));
+        grid.set_active(0, 2);
+        assert_eq!(grid.active(), Some((0, 2)));
+    }
+
+    #[test]
+    fn enter_opens_an_input_on_the_active_cell_and_refuses_where_it_must() {
+        // The two halves of the keystroke: the active cell is what `Enter`
+        // acts on, and being active does not make an unwritable cell writable.
+        let mut grid = editable_grid();
+
+        grid.set_active(1, 1);
+        let (row, col) = grid.active().unwrap();
+        assert!(grid.begin_edit(row, col));
+        assert!(grid.editing.is_some());
+
+        grid.cancel_edit();
+        grid.set_active(1, 0);
+        let (row, col) = grid.active().unwrap();
+        assert!(!grid.begin_edit(row, col));
+        assert!(grid.editing.is_none());
+    }
+
+    #[test]
+    fn an_input_open_elsewhere_closes_when_another_cell_becomes_active() {
+        // Two cells claiming the keyboard -- one holding a focused input, the
+        // other wearing the ring `Enter` follows -- is a grid nobody can read.
+        let mut grid = editable_grid();
+        grid.set_active(0, 1);
+        assert!(grid.begin_edit(0, 1));
+
+        grid.set_active(1, 1);
+
+        assert!(grid.editing.is_none());
+    }
+
+    #[test]
+    fn a_double_click_opens_the_editor_when_the_cell_allows_one() {
+        // GPUI's click plumbing needs a window this module does not build, so
+        // this drives `begin_edit`, the function the listener calls, rather
+        // than the listener itself. Copy-on-double-click is gone -- `cmd+c`
+        // covers it -- so `begin_edit`'s answer is the whole outcome: an
+        // editable cell opens, the primary key column (read-only) stays closed.
+        let mut grid = editable_grid();
+
+        assert!(grid.begin_edit(0, 1));
+        assert!(grid.editing.is_some());
+
+        grid.cancel_edit();
+        assert!(!grid.begin_edit(0, 0));
+        assert!(grid.editing.is_none());
+    }
+
+    #[test]
+    fn folding_a_selected_row_keeps_the_column_and_a_selected_column_keeps_the_row() {
+        // The library moves a row *or* a column; the ring is a cell. If a fold
+        // dropped the other half, an arrow key would send the ring back to the
+        // first column or the first row instead of one cell over.
+        let mut grid = editable_grid();
+        grid.set_active(1, 2);
+
+        grid.select_row(0);
+        assert_eq!(grid.active(), Some((0, 2)));
+        grid.select_col(1);
+        assert_eq!(grid.active(), Some((0, 1)));
+    }
+
+    #[test]
+    fn folding_with_nothing_active_yet_lands_on_a_cell_that_exists() {
+        // The first arrow key of a session arrives with no ring on screen. A
+        // half-coordinate is not a cell, so the missing half has to be an
+        // origin rather than nothing at all.
+        let mut grid = editable_grid();
+        grid.select_row(1);
+        assert_eq!(grid.active(), Some((1, 0)));
+
+        let mut grid = editable_grid();
+        grid.select_col(2);
+        assert_eq!(grid.active(), Some((0, 2)));
+    }
+
+    #[test]
+    fn a_click_and_the_selection_event_it_causes_converge_on_one_cell() {
+        // A cell click sets the coordinate here and makes the library emit
+        // `SelectRow` for the same row. Whichever arrives first, both have to
+        // leave the ring on the clicked cell -- a listener order that decided
+        // the answer would be the same two-notions-of-position bug again.
+        let mut clicked_first = editable_grid();
+        clicked_first.set_active(1, 2);
+        clicked_first.select_row(1);
+
+        let mut event_first = editable_grid();
+        event_first.select_row(1);
+        event_first.set_active(1, 2);
+
+        assert_eq!(clicked_first.active(), Some((1, 2)));
+        assert_eq!(event_first.active(), Some((1, 2)));
+    }
+
+    #[test]
+    fn an_input_does_not_survive_the_ring_moving_off_its_cell() {
+        // An arrow key routes through the same guard a click does. An input
+        // holding focus on one cell while the ring sits on another is two cells
+        // claiming the keyboard, and `Enter` acting on neither.
+        let mut grid = editable_grid();
+        grid.set_active(0, 1);
+        assert!(grid.begin_edit(0, 1));
+
+        grid.select_row(1);
+
+        assert!(grid.editing.is_none());
+        assert_eq!(grid.active(), Some((1, 1)));
+    }
+
+    #[test]
+    fn a_copy_offers_the_whole_value_and_not_the_string_the_column_shows() {
+        // `cmd+c` on a value wider than its column has to carry the value. The
+        // clipped display string is what the previous copy gesture deliberately
+        // did not read, and the reason it read the fetched row instead.
+        let value = "x".repeat(CELL_DISPLAY_LIMIT * 2);
+        let mut grid = ResultGrid::new(QueryResult {
+            columns: vec![column("a"), column("b")],
+            rows: vec![vec![Some(value.clone()), None]],
+            ..QueryResult::default()
+        });
+
+        // Nothing active, nothing to copy.
+        assert!(grid.active_value().is_none());
+
+        grid.select_row(0);
+        assert_eq!(grid.active_value(), Some(value.as_str()));
+        assert_ne!(
+            grid.display[0][0].as_ref().map(SharedString::as_ref),
+            Some(value.as_str())
+        );
+
+        // A NULL is an absent value, not the word the grid paints for one.
+        grid.select_col(1);
+        assert!(grid.active_value().is_none());
+    }
+
+    #[test]
+    fn a_copy_stays_out_of_the_way_of_an_open_input() {
+        // Inside an input `cmd+c` is the text selection's. A grid copy firing
+        // there would replace what the user just selected with the whole cell.
+        let mut grid = editable_grid();
+        grid.set_active(0, 1);
+        assert_eq!(grid.active_value(), Some("first"));
+
+        assert!(grid.begin_edit(0, 1));
+        assert!(grid.active_value().is_none());
+
+        grid.cancel_edit();
+        assert_eq!(grid.active_value(), Some("first"));
+    }
+
+    #[test]
+    fn a_read_only_cell_still_has_a_value_to_copy() {
+        // The point of the gesture: a join, an aggregate or a key column can
+        // never open an input, and every one of them has values worth copying.
+        let mut keyless = grid_of(&[Some("joined")]);
+        keyless.select_row(0);
+        assert!(!keyless.editable(0, 0));
+        assert_eq!(keyless.active_value(), Some("joined"));
+
+        let mut grid = editable_grid();
+        grid.set_active(0, 0);
+        assert!(!grid.editable(0, 0));
+        assert_eq!(grid.active_value(), Some("7"));
+    }
+
+    #[test]
+    fn a_fresh_result_set_starts_with_no_active_cell() {
+        // A coordinate outliving its rows is what `render_td`'s bounds checks
+        // are about: it would put the ring on a cell nobody clicked and point
+        // `Enter` at a row that no longer exists. Dropped with the delegate.
+        let mut grid = editable_grid();
+        grid.set_active(1, 1);
+
+        let replaced = ResultGrid::new(QueryResult {
+            columns: vec![column("a")],
+            rows: vec![vec![Some("only".into())]],
+            ..QueryResult::default()
+        });
+
+        assert!(replaced.active().is_none());
+        // And an index that did outlive its rows opens nothing.
+        assert!(!grid.begin_edit(9, 1));
     }
 
     #[test]
@@ -470,7 +1181,7 @@ mod tests {
         });
 
         let row = &grid.display[0];
-        assert!(row.get(0).is_some());
+        assert!(!row.is_empty());
         assert!(row.get(1).is_none(), "row should be short, not padded");
     }
 }

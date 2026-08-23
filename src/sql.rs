@@ -17,6 +17,8 @@ use std::ops::Range;
 
 use tree_sitter::{Parser, Tree};
 
+use crate::{db::quote_literal, explorer::quote_identifier};
+
 /// The runnable statements of a query buffer, as byte ranges into it.
 pub struct Buffer {
     statements: Vec<Range<usize>>,
@@ -172,6 +174,92 @@ pub fn with_order_by(statement: &str, keys: &[SortKey]) -> Option<String> {
         .unwrap_or(anchor.byte_range().end);
 
     Some(splice(sql, insert_at..insert_at, &clause))
+}
+
+/// One row's `UPDATE`: every column in `sets` assigned, every column in `keys`
+/// matched.
+///
+/// Values go in as literals and are never cast. Postgres applies the target
+/// column's assignment cast, so `'123'` lands in an `int4` exactly as `123`
+/// would, and a cast Slate chose for itself could only ever be the wrong one.
+/// A cleared cell is therefore the empty string; writing a NULL is not
+/// expressible here.
+///
+/// `None` when either list is empty. A statement with no `WHERE` rewrites every
+/// row in the table and one with no `SET` is not a statement at all, so a caller
+/// that has lost the row's key gets nothing to run rather than something that
+/// runs.
+pub fn update_row(
+    schema: &str,
+    table: &str,
+    sets: &[(&str, &str)],
+    keys: &[(&str, &str)],
+) -> Option<String> {
+    if sets.is_empty() || keys.is_empty() {
+        return None;
+    }
+
+    Some(format!(
+        "UPDATE {}.{} SET {} WHERE {}",
+        quote_identifier(schema),
+        quote_identifier(table),
+        assignments(sets, ", "),
+        assignments(keys, " AND ")
+    ))
+}
+
+/// Whether `sql` is a statement Slate could have written: one or more `UPDATE`s
+/// and nothing else at all.
+///
+/// The one gate every Slate-generated statement passes before anything runs,
+/// and the code half of hard rule 1 — Slate never writes a `DROP`, `TRUNCATE`
+/// or `DELETE`, whatever the user asked for. A whitelist, because a blocklist
+/// of keywords is only a list of the spellings someone thought of.
+pub fn is_generated_update(sql: &str) -> bool {
+    let Some(tree) = parse(sql) else {
+        return false;
+    };
+    let root = tree.root_node();
+    let mut cursor = root.walk();
+    let statements: Vec<_> = root.named_children(&mut cursor).collect();
+
+    // Comments are tree-sitter extras and land at the root too, so anything
+    // that is not a statement here is something Slate did not generate.
+    !statements.is_empty()
+        && statements.iter().all(|statement| {
+            statement.kind() == "statement"
+                && statement
+                    .named_child(0)
+                    .is_some_and(|node| node.kind() == "update")
+        })
+        && !destructive(root)
+}
+
+fn assignments(columns: &[(&str, &str)], separator: &str) -> String {
+    columns
+        .iter()
+        .map(|(column, value)| format!("{} = {}", quote_identifier(column), quote_literal(value)))
+        .collect::<Vec<_>>()
+        .join(separator)
+}
+
+/// The grammar offers no `drop` or `truncate` node to look for. `DROP TABLE` is
+/// `drop_table`, one of thirteen `drop_*` siblings, and `TRUNCATE t` is a bare
+/// `statement` holding a `keyword_truncate` with no wrapper node at all. The
+/// keyword is the one part every spelling of either has.
+const DESTRUCTIVE_KINDS: [&str; 4] = [
+    "delete",
+    "keyword_delete",
+    "keyword_drop",
+    "keyword_truncate",
+];
+
+/// Anywhere in the tree, not only at the root. `WITH x AS (DELETE FROM t
+/// RETURNING *) UPDATE …` is a real statement shape whose root child is an
+/// `update` node, so the whitelist alone would let it through.
+fn destructive(node: tree_sitter::Node) -> bool {
+    let mut cursor = node.walk();
+    DESTRUCTIVE_KINDS.contains(&node.kind()) || node.children(&mut cursor).any(destructive)
 }
 
 fn parse(sql: &str) -> Option<Tree> {
@@ -645,6 +733,143 @@ mod tests {
             .unwrap(),
             "SELECT *\nFROM t\nWHERE a = 1\n  AND b = 2 ORDER BY id ASC"
         );
+    }
+
+    #[test]
+    fn a_generated_update_sets_every_column_it_was_given() {
+        // One column and several. A missing separator between assignments is a
+        // statement the server rejects; a missing one in the WHERE would be a
+        // statement it accepts and applies to the wrong rows.
+        assert_eq!(
+            update_row("public", "measurements", &[("note", "ok")], &[("id", "7")]).unwrap(),
+            r#"UPDATE "public"."measurements" SET "note" = 'ok' WHERE "id" = '7'"#
+        );
+        assert_eq!(
+            update_row(
+                "public",
+                "measurements",
+                &[("note", "ok"), ("depth", "12")],
+                &[("id", "7")]
+            )
+            .unwrap(),
+            r#"UPDATE "public"."measurements" SET "note" = 'ok', "depth" = '12' WHERE "id" = '7'"#
+        );
+    }
+
+    #[test]
+    fn a_composite_key_matches_on_all_of_its_columns() {
+        // Joined by OR, or with a column dropped, this updates rows the user
+        // never edited.
+        assert_eq!(
+            update_row(
+                "app",
+                "memberships",
+                &[("role", "owner")],
+                &[("org_id", "1"), ("user_id", "2")]
+            )
+            .unwrap(),
+            r#"UPDATE "app"."memberships" SET "role" = 'owner' WHERE "org_id" = '1' AND "user_id" = '2'"#
+        );
+    }
+
+    #[test]
+    fn user_data_is_quoted_rather_than_interpolated() {
+        // An apostrophe in a value and a double quote in a column name are the
+        // two ways a cell's contents become SQL of its own.
+        assert_eq!(
+            update_row("s", "t", &[("a", "it's")], &[("id", "o'hara")]).unwrap(),
+            r#"UPDATE "s"."t" SET "a" = 'it''s' WHERE "id" = 'o''hara'"#
+        );
+        assert_eq!(
+            update_row("s", r#"od"d"#, &[(r#"we"ird"#, "x")], &[("id", "1")]).unwrap(),
+            r#"UPDATE "s"."od""d" SET "we""ird" = 'x' WHERE "id" = '1'"#
+        );
+    }
+
+    #[test]
+    fn an_update_with_nothing_to_match_on_is_refused() {
+        // No WHERE rewrites every row in the table. It must not be possible to
+        // produce that statement, so a caller with no key gets nothing.
+        assert!(update_row("s", "t", &[("a", "1")], &[]).is_none());
+        assert!(update_row("s", "t", &[], &[("id", "1")]).is_none());
+    }
+
+    #[test]
+    fn the_gate_accepts_an_update_and_a_batch_of_updates() {
+        assert!(is_generated_update("UPDATE t SET a = '1' WHERE id = '2'"));
+        assert!(is_generated_update(
+            "UPDATE t SET a = '1' WHERE id = '2'; UPDATE t SET a = '3' WHERE id = '4'"
+        ));
+    }
+
+    #[test]
+    fn the_gate_refuses_everything_that_is_not_an_update() {
+        // Hard rule 1 in code: DROP, TRUNCATE and DELETE never leave Slate,
+        // whatever the user asked for. SELECT and INSERT are here because the
+        // gate is a whitelist -- being harmless is not the test, being an
+        // UPDATE is.
+        for sql in [
+            "DROP TABLE t",
+            "DROP VIEW v",
+            "DROP DATABASE d",
+            "TRUNCATE t",
+            "TRUNCATE TABLE t",
+            "DELETE FROM t WHERE a = '1'",
+            "SELECT 1",
+            "INSERT INTO t (a) VALUES ('1')",
+        ] {
+            assert!(!is_generated_update(sql), "{sql} passed the gate");
+        }
+    }
+
+    #[test]
+    fn the_gate_refuses_a_batch_with_one_destructive_statement_in_it() {
+        // Every statement is checked, not the first one. A DELETE appended to a
+        // run of legitimate updates is the shape an injected value would take.
+        assert!(!is_generated_update(
+            "UPDATE t SET a = '1' WHERE id = '2'; DELETE FROM t; UPDATE t SET a = '3' WHERE id = '4'"
+        ));
+    }
+
+    #[test]
+    fn the_gate_refuses_a_destructive_statement_wrapped_in_a_cte() {
+        // The root statement's first child here really is an `update` node, so
+        // the whitelist passes it and only the subtree scan catches it.
+        assert!(!is_generated_update(
+            "WITH x AS (DELETE FROM t RETURNING *) UPDATE u SET a = '1' WHERE id = '2'"
+        ));
+    }
+
+    #[test]
+    fn the_gate_refuses_what_the_grammar_cannot_read_whole() {
+        // An unreadable tree says nothing about what the statement does, and a
+        // gate that cannot see has to refuse. The empty buffer is here because
+        // it parses cleanly into no statements at all.
+        for sql in [
+            "not sql at all !!",
+            "UPDATE t SET a = ",
+            "-- UPDATE t SET a = '1'",
+            "",
+        ] {
+            assert!(!is_generated_update(sql), "{sql:?} passed the gate");
+        }
+    }
+
+    #[test]
+    fn the_gate_accepts_what_update_row_writes() {
+        // The one test that keeps the generator and the gate from drifting
+        // apart: whatever quoting or clause order changes here, the statement
+        // Slate builds is still one the gate can read as an UPDATE.
+        let statement = update_row(
+            "public",
+            "measurements",
+            &[("note", "it's fine"), ("depth", "12")],
+            &[("id", "7"), ("run", "a'b")],
+        )
+        .unwrap();
+
+        assert!(is_generated_update(&statement), "{statement} was refused");
+        assert!(is_generated_update(&format!("{statement}; {statement}")));
     }
 
     #[test]

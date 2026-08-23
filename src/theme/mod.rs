@@ -202,6 +202,11 @@ pub struct Theme {
     pub on_accent: Srgb,
     pub selection: Rgba,
     pub cursor: Srgb,
+    /// A grid cell the user has changed and not yet applied. A wash under the
+    /// value rather than a colour on it, so the value still reads as the value —
+    /// and a hue of its own, because the accent wash next to it already means
+    /// "selected".
+    pub edited: Rgba,
 
     pub danger: Srgb,
     pub success: Srgb,
@@ -403,6 +408,7 @@ impl Theme {
             on_accent: neutral(0.14),
             selection: Oklch::new(0.68, 0.15, 250.0).to_srgb().alpha(0.28),
             cursor: Oklch::new(0.72, 0.14, 250.0).to_srgb(),
+            edited: Oklch::new(0.60, 0.15, 75.0).to_srgb().alpha(0.32),
 
             danger: Oklch::new(0.70, 0.19, 25.0).to_srgb(),
             success: Oklch::new(0.72, 0.15, 150.0).to_srgb(),
@@ -446,6 +452,7 @@ impl Theme {
             on_accent: WHITE,
             selection: Oklch::new(0.52, 0.17, 250.0).to_srgb().alpha(0.20),
             cursor: Oklch::new(0.48, 0.18, 250.0).to_srgb(),
+            edited: Oklch::new(0.80, 0.14, 75.0).to_srgb().alpha(0.30),
 
             danger: Oklch::new(0.52, 0.20, 25.0).to_srgb(),
             success: Oklch::new(0.52, 0.15, 150.0).to_srgb(),
@@ -538,6 +545,9 @@ mod tests {
             check(t, "on_accent over accent", t.on_accent, t.accent, AA_LARGE);
             // Button labels are body-size UI text on the control tone.
             check(t, "text on control", t.text, t.control, AA_TEXT);
+            // A changed cell is still a cell in the dense grid: the wash marks
+            // it, it does not get to make the value harder to read.
+            check(t, "text on an edited cell", t.text, t.edited.flatten(t.bg), AAA_TEXT);
         }
     }
 

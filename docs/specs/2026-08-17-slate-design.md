@@ -34,7 +34,7 @@ Explicitly out of scope for v1. Each is a deliberate cut, not an oversight.
 
 | Not in v1 | Why |
 | --- | --- |
-| Row editing / `UPDATE` via grid | Slate is an editor, not a data-entry surface. The grid is read-only. |
+| ~~Row editing / `UPDATE` via grid~~ | Superseded — see `2026-08-23-in-grid-editing-design.md`. The reasoning below still holds for `DELETE`, `INSERT` and the rest of a data-entry surface; only `UPDATE` by primary key is in. |
 | Visual filter and join builders | Users who reach for a SQL client write SQL. |
 | Foreign-key navigation | Depends on the browser-first model Slate rejects. |
 | SSH tunneling | Additive later; the config is shaped for it. |
@@ -200,6 +200,10 @@ the real data, and the resulting rule has no exceptions to remember.
 
 > **2. The result grid is read-only in v1.** No path exists from the grid to a
 > mutating statement.
+
+Superseded by `2026-08-23-in-grid-editing-design.md`. The invariant that
+replaces it: **no path leads from the grid to a destructive statement**, enforced
+by a whitelist gate rather than by the absence of any write path at all.
 
 > **3. No environment-specific behaviour.** No vendor binary names, no
 > assumption that a loopback host implies plaintext, no hardcoded ports.
@@ -429,8 +433,8 @@ and a syntax error shows up under the editor instead of crashing.
 
 Animation and transitions · SSH tunneling · cloud IAM authentication · CSV export
 · configurable keybindings · views and functions in the schema inspector ·
-server-side cursors for unbounded result sets · a second database engine · row
-editing.
+server-side cursors for unbounded result sets · a second database engine ·
+~~row editing~~ (no longer deferred — `2026-08-23-in-grid-editing-design.md`).
 
 ---
 

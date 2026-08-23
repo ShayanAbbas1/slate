@@ -161,7 +161,7 @@ pub fn preview_sql(schema: &str, relation: &str, limit: usize) -> String {
     )
 }
 
-fn quote_identifier(identifier: &str) -> String {
+pub(crate) fn quote_identifier(identifier: &str) -> String {
     format!("\"{}\"", identifier.replace('"', "\"\""))
 }
 

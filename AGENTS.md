@@ -36,9 +36,16 @@ require it, stop and raise it instead.
    alters statements cannot be trusted with the statements that matter — is
    why "silently" is still the word that carries the rule.
 
-2. **The result grid is read-only until row editing exists.** No code path leads
-   from the grid to a mutating statement, and none may lead to a destructive
-   one afterwards either.
+2. **No code path leads from the grid to a destructive statement.** The grid can
+   now write an `UPDATE` — see `docs/specs/2026-08-23-in-grid-editing-design.md`
+   — and `sql::is_generated_update` is the single gate every generated statement
+   passes first. It is a whitelist, so `DROP`, `TRUNCATE` and `DELETE` are
+   refused structurally rather than by name. Do not add a second path that
+   bypasses it.
+
+   A cell is editable only when Slate can name its row by primary key. When it
+   cannot, the grid stays read-only and says why; it never guesses at a
+   predicate.
 3. **No environment-specific behaviour.** No vendor binary names in error
    strings, no assumption that a loopback host means plaintext, no hardcoded
    ports or hostnames. Slate is a generic client.

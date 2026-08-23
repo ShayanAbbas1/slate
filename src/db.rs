@@ -132,6 +132,33 @@ WHERE namespace.nspname = {schema}
 ORDER BY table_constraint.conname
 ";
 
+// Keyed by oid rather than by name: two schemas can hold a table of the same
+// name, and the row description says exactly which one the server read.
+const PRIMARY_KEY_SQL: &str = "
+SELECT
+    namespace.nspname AS schema_name,
+    class.relname AS table_name,
+    attribute.attnum AS attribute_number,
+    attribute.attname AS column_name,
+    CASE WHEN attribute.attnum = ANY (index_entry.indkey) THEN 'yes' ELSE 'no' END
+        AS in_primary_key
+-- An inner join on the primary index is what makes a table without one
+-- return nothing, which is the same answer as a table Slate cannot identify
+-- rows in.
+FROM pg_catalog.pg_index AS index_entry
+JOIN pg_catalog.pg_class AS class
+    ON class.oid = index_entry.indrelid
+JOIN pg_catalog.pg_namespace AS namespace
+    ON namespace.oid = class.relnamespace
+JOIN pg_catalog.pg_attribute AS attribute
+    ON attribute.attrelid = class.oid
+WHERE index_entry.indrelid = {oid}
+    AND index_entry.indisprimary
+    AND attribute.attnum > 0
+    AND NOT attribute.attisdropped
+ORDER BY attribute.attnum
+";
+
 const CONNECT_TIMEOUT_SECONDS: u64 = 10;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -357,6 +384,28 @@ pub struct QueryResult {
     /// zero both for commands that affected no rows and commands without a row
     /// count, so callers must not infer the command kind from this value.
     pub rows_affected: Option<u64>,
+    /// Where these rows can be written back to, when they can be at all.
+    /// `None` is the answer for every result set Slate cannot address a single
+    /// row of, and it is not an error — see [`Connection::edit_target`].
+    pub edit: Option<EditTarget>,
+}
+
+/// The table a result set's rows can be written back to, already resolved to
+/// names and result-column positions.
+///
+/// The identity work — which oid, which attribute number — happens inside this
+/// module and stops here (hard rule 4). A caller gets an answer it can build
+/// SQL from, not a puzzle it has to ask the catalog about.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EditTarget {
+    pub schema: String,
+    pub table: String,
+    /// The real column name behind each result column, positionally. `None`
+    /// where the result column is computed rather than read from the table, so
+    /// `SELECT id AS ident, count(*)` gives `[Some("id"), None]`.
+    pub columns: Vec<Option<String>>,
+    /// Result-column indices that together identify one row. Never empty.
+    pub keys: Vec<usize>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -439,11 +488,44 @@ impl Connection {
         // some utility statements -- can still abort an open transaction. That
         // is the whole of the remaining hole, and the driver exposes no
         // transaction state to guard it with.
-        if typed && !result.columns.is_empty() && commands == 1 {
-            apply_types(&mut result.columns, &column_types(&mut client, sql));
+        let mut probed = if typed && !result.columns.is_empty() && commands == 1 {
+            describe_columns(&mut client, sql)
+        } else {
+            Vec::new()
+        };
+        // Everything read from the description is positional, and it arrived on
+        // its own round trip. If the two disagree on how many columns there
+        // are, nothing it says can be trusted -- not a type, and not a column's
+        // identity, which would point an edit at the wrong column.
+        if probed.len() != result.columns.len() {
+            probed.clear();
         }
+        apply_types(&mut result.columns, &probed);
+
+        // The client mutex is not reentrant and `edit_target` runs its catalog
+        // query through it, so the lock has to go before the question is asked.
+        drop(client);
+        result.edit = self.edit_target(&probed);
 
         Ok(result)
+    }
+
+    /// Which table these columns can be written back to, if any.
+    ///
+    /// Every step is allowed to answer "no": an unprepared statement, a join, a
+    /// computed column, a table without a primary key, a key the select omitted.
+    /// A failure answers "no" too — this runs after the user's statement
+    /// already succeeded, and a catalog query refused inside a transaction the
+    /// user has aborted must not turn that success into an error.
+    fn edit_target(&self, probed: &[ProbedColumn]) -> Option<EditTarget> {
+        let table = sole_table(probed)?;
+        let catalog = self
+            .internal_query(&PRIMARY_KEY_SQL.replace("{oid}", &table.to_string()))
+            .ok()?;
+        // ponytail: one catalog round trip per result set, no cache. A map from
+        // oid to key held on the connection is the upgrade path if the trip
+        // shows up in query timings.
+        resolve_edit_target(probed, &keyed_table(&catalog)?)
     }
 
     pub fn catalog(&self) -> Result<Catalog, DbError> {
@@ -463,27 +545,133 @@ impl Connection {
     }
 }
 
-/// The type of each column a statement would return, in order.
+/// One column as the server describes it: its type, and where it came from.
+///
+/// The provenance is plumbing between the probe and [`resolve_edit_target`].
+/// Neither the table oid nor the attribute number leaves this module.
+struct ProbedColumn {
+    type_name: String,
+    /// The oid of the table the value was read from, absent for a computed
+    /// column. The driver already reports the wire protocol's zero as absent.
+    table: Option<u32>,
+    /// Postgres's own identity for the column within that table.
+    attribute: Option<i16>,
+}
+
+/// What each column a statement would return is, in order.
 ///
 /// The simple query protocol hands back every value as text and describes none
 /// of it, so the only way to know that a column of digits is an `int8` and not
-/// a `numeric` is to ask separately. Preparing the statement asks: the server
-/// parses and plans it and answers with the row description, and it never
-/// executes anything — Postgres refuses to prepare the utility statements that
-/// would have an effect, and refuses more than one statement at a time. Both
-/// refusals arrive here as "no types known" -- honest, but not free: see
-/// [`Connection::run`] for why the ask has to come after the statement ran.
-fn column_types(client: &mut Client, sql: &str) -> Vec<String> {
+/// a `numeric` — or that it is `accounts.id` rather than an expression — is to
+/// ask separately. Preparing the statement asks: the server parses and plans it
+/// and answers with the row description, and it never executes anything —
+/// Postgres refuses to prepare the utility statements that would have an
+/// effect, and refuses more than one statement at a time. Both refusals arrive
+/// here as "nothing known" -- honest, but not free: see [`Connection::run`] for
+/// why the ask has to come after the statement ran.
+fn describe_columns(client: &mut Client, sql: &str) -> Vec<ProbedColumn> {
     client
         .prepare(sql)
         .map(|statement| {
             statement
                 .columns()
                 .iter()
-                .map(|column| column.type_().name().to_string())
+                .map(|column| ProbedColumn {
+                    type_name: column.type_().name().to_string(),
+                    table: column.table_oid(),
+                    attribute: column.column_id(),
+                })
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// The one table every column that came from a table came from.
+///
+/// A result set spanning two of them is a join, and a row of it is not a row of
+/// either table, so there is nothing to write back to. A result set spanning
+/// none is entirely computed.
+fn sole_table(probed: &[ProbedColumn]) -> Option<u32> {
+    let mut tables = probed.iter().filter_map(|column| column.table);
+    let first = tables.next()?;
+    tables.all(|table| table == first).then_some(first)
+}
+
+/// One table as the catalog describes it, keyed by Postgres's own column
+/// identity so the probe's provenance can be matched to a name.
+struct KeyedTable {
+    schema: String,
+    table: String,
+    columns: Vec<(i16, String)>,
+    key: Vec<i16>,
+}
+
+fn keyed_table(result: &QueryResult) -> Option<KeyedTable> {
+    let first = result.rows.first()?;
+    let mut keyed = KeyedTable {
+        schema: required_cell(result, first, "schema_name")
+            .ok()?
+            .to_string(),
+        table: required_cell(result, first, "table_name").ok()?.to_string(),
+        columns: Vec::new(),
+        key: Vec::new(),
+    };
+
+    for row in &result.rows {
+        let attribute: i16 = required_cell(result, row, "attribute_number")
+            .ok()?
+            .parse()
+            .ok()?;
+        keyed.columns.push((
+            attribute,
+            required_cell(result, row, "column_name").ok()?.to_string(),
+        ));
+        if required_cell(result, row, "in_primary_key").ok()? == "yes" {
+            keyed.key.push(attribute);
+        }
+    }
+
+    Some(keyed)
+}
+
+/// The probe's provenance decided against one table's catalog entry.
+///
+/// Refuses unless *every* primary key column is present in the result set: a
+/// partial key matches more rows than the one the user is looking at, and an
+/// empty one matches all of them.
+fn resolve_edit_target(probed: &[ProbedColumn], table: &KeyedTable) -> Option<EditTarget> {
+    // The caller has already established that the columns carrying a table all
+    // carry the same one, so carrying a table at all means carrying this one.
+    let attribute_of = |column: &ProbedColumn| column.table.and(column.attribute);
+    let keys = table
+        .key
+        .iter()
+        .map(|attribute| {
+            probed
+                .iter()
+                .position(|column| attribute_of(column) == Some(*attribute))
+        })
+        .collect::<Option<Vec<usize>>>()?;
+    if keys.is_empty() {
+        return None;
+    }
+
+    Some(EditTarget {
+        schema: table.schema.clone(),
+        table: table.table.clone(),
+        columns: probed
+            .iter()
+            .map(|column| {
+                let attribute = attribute_of(column)?;
+                table
+                    .columns
+                    .iter()
+                    .find(|(number, _)| *number == attribute)
+                    .map(|(_, name)| name.clone())
+            })
+            .collect(),
+        keys,
+    })
 }
 
 fn structure_sql(template: &str, schema: &str, relation: &str) -> String {
@@ -495,7 +683,7 @@ fn structure_sql(template: &str, schema: &str, relation: &str) -> String {
 /// A relation name is user data and can contain a quote. Doubling is enough
 /// because `standard_conforming_strings` is on by default, so a backslash in a
 /// name is not an escape character.
-fn quote_literal(value: &str) -> String {
+pub(crate) fn quote_literal(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
 
@@ -577,13 +765,13 @@ fn assemble(
 /// Matched by position, and only when the two agree on how many columns there
 /// are: the description came from a separate round trip, and a type put against
 /// the wrong column is worse than no type at all.
-fn apply_types(columns: &mut [Column], types: &[String]) {
-    if types.len() != columns.len() {
+fn apply_types(columns: &mut [Column], probed: &[ProbedColumn]) {
+    if probed.len() != columns.len() {
         return;
     }
 
-    for (column, data_type) in columns.iter_mut().zip(types) {
-        column.data_type = Some(data_type.clone());
+    for (column, described) in columns.iter_mut().zip(probed) {
+        column.data_type = Some(described.type_name.clone());
     }
 }
 
@@ -833,6 +1021,33 @@ mod tests {
             .iter()
             .map(|column| column.data_type.as_deref())
             .collect()
+    }
+
+    fn probed(columns: &[(&str, Option<u32>, Option<i16>)]) -> Vec<ProbedColumn> {
+        columns
+            .iter()
+            .map(|(type_name, table, attribute)| ProbedColumn {
+                type_name: (*type_name).to_string(),
+                table: *table,
+                attribute: *attribute,
+            })
+            .collect()
+    }
+
+    fn keyed(columns: &[(i16, &str, bool)]) -> KeyedTable {
+        KeyedTable {
+            schema: "public".into(),
+            table: "accounts".into(),
+            columns: columns
+                .iter()
+                .map(|(attribute, name, _)| (*attribute, (*name).to_string()))
+                .collect(),
+            key: columns
+                .iter()
+                .filter(|(_, _, in_key)| *in_key)
+                .map(|(attribute, _, _)| *attribute)
+                .collect(),
+        }
     }
 
     #[test]
@@ -1135,17 +1350,115 @@ mod tests {
     fn a_describe_disagreeing_on_the_column_count_types_nothing() {
         let mut two = result(&["id", "label"], &[]);
 
-        apply_types(&mut two.columns, &["int4".to_string()]);
+        apply_types(&mut two.columns, &probed(&[("int4", None, None)]));
         assert_eq!(types(&two), vec![None, None]);
 
         apply_types(
             &mut two.columns,
-            &["int4".to_string(), "text".to_string(), "bool".to_string()],
+            &probed(&[
+                ("int4", None, None),
+                ("text", None, None),
+                ("bool", None, None),
+            ]),
         );
         assert_eq!(types(&two), vec![None, None]);
 
-        apply_types(&mut two.columns, &["int4".to_string(), "text".to_string()]);
+        apply_types(
+            &mut two.columns,
+            &probed(&[("int4", None, None), ("text", None, None)]),
+        );
         assert_eq!(types(&two), vec![Some("int4"), Some("text")]);
+    }
+
+    #[test]
+    fn only_a_result_set_reading_one_table_has_a_table_to_write_back_to() {
+        // A join's row is a row of neither table, and an all-computed result
+        // set is a row of nothing. Accepting either would send an UPDATE at a
+        // table the user never named.
+        assert_eq!(
+            sole_table(&probed(&[
+                ("int4", Some(42), Some(1)),
+                ("text", Some(42), Some(3)),
+                ("int8", None, None),
+            ])),
+            Some(42)
+        );
+        assert_eq!(
+            sole_table(&probed(&[
+                ("int4", Some(42), Some(1)),
+                ("text", Some(77), Some(1)),
+            ])),
+            None
+        );
+        assert_eq!(sole_table(&probed(&[("int8", None, None)])), None);
+        assert_eq!(sole_table(&[]), None);
+    }
+
+    #[test]
+    fn an_edit_target_names_real_columns_and_locates_the_whole_key() {
+        // The grid holds the aliases the user typed; an UPDATE has to name the
+        // columns the table actually has. A computed column has none.
+        let target = resolve_edit_target(
+            &probed(&[
+                ("int4", Some(42), Some(1)),
+                ("int8", None, None),
+                ("text", Some(42), Some(3)),
+            ]),
+            &keyed(&[(1, "id", true), (2, "email", false), (3, "name", false)]),
+        )
+        .expect("one table with its key present is editable");
+
+        assert_eq!(target.schema, "public");
+        assert_eq!(target.table, "accounts");
+        assert_eq!(
+            target.columns,
+            vec![Some("id".to_string()), None, Some("name".to_string())]
+        );
+        assert_eq!(target.keys, vec![0]);
+    }
+
+    #[test]
+    fn a_composite_key_reports_every_column_it_is_made_of() {
+        let target = resolve_edit_target(
+            &probed(&[
+                ("text", Some(42), Some(3)),
+                ("int4", Some(42), Some(1)),
+                ("int4", Some(42), Some(2)),
+            ]),
+            &keyed(&[(1, "id", true), (2, "revision", true), (3, "name", false)]),
+        )
+        .expect("both key columns are present");
+
+        // Positions of the key in the *result*, not in the table -- the caller
+        // reads cells by result column.
+        assert_eq!(target.keys, vec![1, 2]);
+    }
+
+    #[test]
+    fn a_result_set_missing_part_of_the_key_is_not_editable() {
+        // Half a composite key matches more rows than the one on screen, and
+        // no key at all matches every row in the table.
+        assert_eq!(
+            resolve_edit_target(
+                &probed(&[("int4", Some(42), Some(1)), ("text", Some(42), Some(3))]),
+                &keyed(&[(1, "id", true), (2, "revision", true), (3, "name", false)]),
+            ),
+            None
+        );
+        assert_eq!(
+            resolve_edit_target(
+                &probed(&[("text", Some(42), Some(3))]),
+                &keyed(&[(1, "id", true), (3, "name", false)]),
+            ),
+            None
+        );
+        assert_eq!(
+            resolve_edit_target(
+                &probed(&[("int4", Some(42), Some(1))]),
+                &keyed(&[(1, "id", false)]),
+            ),
+            None
+        );
     }
 
     #[test]
@@ -1247,6 +1560,159 @@ mod tests {
 
         assert_eq!(names(&empty), vec!["id", "label"]);
         assert!(empty.rows.is_empty());
+    }
+
+    #[test]
+    #[ignore = "requires the repository development database configured through PG*"]
+    fn live_a_single_table_select_is_editable_by_its_primary_key() {
+        // The whole point of the widened probe: the grid holds names the user
+        // chose, in the order they asked for, and an UPDATE needs the table's
+        // own names and the key's position among them.
+        let result = Connection::open(live_config())
+            .expect("connection should open")
+            .query("SELECT name, id FROM accounts")
+            .expect("query should succeed");
+        let edit = result.edit.expect("accounts has a primary key");
+
+        assert_eq!(edit.schema, "public");
+        assert_eq!(edit.table, "accounts");
+        assert_eq!(
+            edit.columns,
+            vec![Some("name".to_string()), Some("id".to_string())]
+        );
+        assert_eq!(edit.keys, vec![1]);
+    }
+
+    #[test]
+    #[ignore = "requires the repository development database configured through PG*"]
+    fn live_an_aliased_or_computed_column_reports_what_the_table_calls_it() {
+        // An alias is the one case where the result's own column name is a lie
+        // about the table, and an expression has no name in the table at all.
+        let result = Connection::open(live_config())
+            .expect("connection should open")
+            .query("SELECT id AS ident, upper(name) AS shouted, name FROM accounts")
+            .expect("query should succeed");
+        let edit = result.edit.expect("accounts has a primary key");
+
+        assert_eq!(
+            edit.columns,
+            vec![Some("id".to_string()), None, Some("name".to_string())]
+        );
+        assert_eq!(edit.keys, vec![0]);
+    }
+
+    #[test]
+    #[ignore = "requires the repository development database configured through PG*"]
+    fn live_a_join_or_an_aggregate_is_not_editable() {
+        // Two tables, or no table: either way the row on screen is not a row
+        // of anything Slate could write back to.
+        let connection = Connection::open(live_config()).expect("connection should open");
+
+        for sql in [
+            "SELECT accounts.id, locations.name
+             FROM accounts JOIN locations ON locations.id = accounts.id",
+            "SELECT plan, count(*) FROM accounts GROUP BY plan",
+            "SELECT 1 AS one",
+        ] {
+            assert!(
+                connection
+                    .query(sql)
+                    .expect("query should succeed")
+                    .edit
+                    .is_none(),
+                "{sql}"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "requires the repository development database configured through PG*"]
+    fn live_a_select_omitting_the_key_is_not_editable() {
+        // Nothing in this result set identifies which account a row is.
+        let result = Connection::open(live_config())
+            .expect("connection should open")
+            .query("SELECT name, email FROM accounts")
+            .expect("query should succeed");
+
+        assert!(result.edit.is_none());
+    }
+
+    #[test]
+    #[ignore = "requires a local Postgres server configured through PG*"]
+    fn live_a_table_without_a_primary_key_is_not_editable() {
+        // There is no predicate that names one of two identical rows.
+        let connection = Connection::open(live_config()).expect("connection should open");
+        connection
+            .query("CREATE TEMP TABLE slate_unkeyed (value integer, label text)")
+            .expect("the temporary table should be created");
+
+        let result = connection
+            .query("SELECT value, label FROM slate_unkeyed")
+            .expect("query should succeed");
+
+        assert!(result.edit.is_none());
+    }
+
+    #[test]
+    #[ignore = "requires a local Postgres server configured through PG*"]
+    fn live_a_composite_primary_key_reports_every_column_it_is_made_of() {
+        let connection = Connection::open(live_config()).expect("connection should open");
+        connection
+            .query(
+                "CREATE TEMP TABLE slate_composite (
+                    left_id integer,
+                    right_id integer,
+                    label text,
+                    PRIMARY KEY (left_id, right_id)
+                )",
+            )
+            .expect("the temporary table should be created");
+
+        let edit = connection
+            .query("SELECT label, right_id, left_id FROM slate_composite")
+            .expect("query should succeed")
+            .edit
+            .expect("both key columns are in the result set");
+
+        assert_eq!(edit.table, "slate_composite");
+        assert!(
+            edit.schema.starts_with("pg_temp"),
+            "a temporary table lives in a per-session schema: {}",
+            edit.schema
+        );
+        // Result positions, in the key's own column order.
+        assert_eq!(edit.keys, vec![2, 1]);
+    }
+
+    #[test]
+    #[ignore = "requires the repository development database configured through PG*"]
+    fn live_resolving_an_edit_target_leaves_an_open_transaction_alone() {
+        // The edit target costs a second round trip, on the same connection,
+        // inside whatever transaction the user has open. It must be as
+        // harmless there as the type probe beside it.
+        let connection = Connection::open(live_config()).expect("connection should open");
+        connection.query("BEGIN").expect("BEGIN should succeed");
+
+        assert!(
+            connection
+                .query("SELECT id FROM accounts")
+                .expect("query should succeed")
+                .edit
+                .is_some()
+        );
+
+        let error = connection
+            .query("SELECT * FROM no_such_relation")
+            .unwrap_err();
+
+        assert!(
+            error.message.contains("no_such_relation"),
+            "an error must report its own cause: {}",
+            error.message
+        );
+        connection
+            .query("ROLLBACK")
+            .expect("ROLLBACK should succeed");
     }
 
     #[test]

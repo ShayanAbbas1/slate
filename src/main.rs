@@ -10,20 +10,20 @@ mod theme;
 use std::{borrow::Cow, collections::HashMap, sync::Arc};
 
 use gpui::{
-    Action, AnyElement, App, AppContext, Application, ClickEvent, Context, Entity,
+    Action, AnyElement, App, AppContext, Application, ClickEvent, ClipboardItem, Context, Entity,
     EntityInputHandler, Focusable, FontWeight, InteractiveElement, IntoElement, KeyBinding,
     Keystroke, ParentElement, Render, StatefulInteractiveElement, Styled, TitlebarOptions, Window,
     WindowOptions, actions, div, point, prelude::FluentBuilder, px,
 };
 use serde::Deserialize;
 use gpui_component::{
-    InteractiveElementExt, Root, Sizable,
+    Disableable, InteractiveElementExt, Root, Sizable,
     button::{Button, ButtonVariants},
     input::{Input, InputEvent, InputState},
     kbd::Kbd,
     list::ListItem,
     resizable::{h_resizable, resizable_panel, v_resizable},
-    table::{Table, TableDelegate, TableState},
+    table::{Table, TableDelegate, TableEvent, TableState},
     tree::{TreeState, tree as render_tree},
 };
 
@@ -35,7 +35,7 @@ use explorer::{
     tree as build_explorer_tree,
 };
 use icons::{Icons, icon};
-use result_grid::ResultGrid;
+use result_grid::{PendingRow, ResultGrid};
 use sql::{Buffer, SortKey};
 use theme::{Theme, layout, theme};
 
@@ -70,6 +70,10 @@ actions!(
         ZoomEditorIn,
         ZoomEditorOut,
         ResetEditorZoom,
+        EditCell,
+        CopyCell,
+        ApplyEdits,
+        DiscardEdits,
     ]
 );
 
@@ -180,6 +184,25 @@ struct Session {
     pending_delete: Option<String>,
     notice: Option<String>,
     editor_font_size: f32,
+    /// The statement behind the query tab's grid.
+    ///
+    /// Held rather than derived from the buffer, unlike the sort path, and a
+    /// deliberate exception to that rule (in-grid editing spec, §4): applying
+    /// edits appends the `UPDATE` to the buffer, so the cursor no longer sits on
+    /// the `SELECT` and the text can no longer say where these rows came from.
+    last_query: Option<String>,
+    /// The generated batch a relation tab is showing before it runs. That tab
+    /// has no buffer to put SQL in, so the modal is where the statement is on
+    /// screen — and nothing runs until Run.
+    apply_review: Option<ApplyReview>,
+}
+
+/// A generated `UPDATE` batch waiting to be read and run.
+struct ApplyReview {
+    /// The tab the edits came from, so the modal is shown over that surface
+    /// and a run cannot land in another tab's grid.
+    tab: Tab,
+    sql: String,
 }
 
 impl Session {
@@ -256,6 +279,8 @@ impl Session {
             pending_delete: None,
             notice,
             editor_font_size: EDITOR_FONT_SIZE_DEFAULT,
+            last_query: None,
+            apply_review: None,
         }
     }
 
@@ -273,6 +298,18 @@ impl Session {
             None => Some(&self.query),
             Some(tab) => match &tab.body {
                 ObjectBody::Relation { query, .. } => Some(query),
+                ObjectBody::Routine(_) => None,
+            },
+        }
+    }
+
+    /// The grid the visible surface is showing. A routine's tab has none: it is
+    /// read, not run.
+    fn active_results(&self) -> Option<&Entity<TableState<ResultGrid>>> {
+        match self.active_object() {
+            None => Some(&self.results),
+            Some(tab) => match &tab.body {
+                ObjectBody::Relation { results, .. } => Some(results),
                 ObjectBody::Routine(_) => None,
             },
         }
@@ -467,7 +504,7 @@ fn result_grid(
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) -> Entity<TableState<ResultGrid>> {
-    cx.new(|cx| {
+    let grid = cx.new(|cx| {
         TableState::new(ResultGrid::empty(), window, cx)
             // Sorting is the grid's own, over the rows it already holds. It
             // never re-runs the statement, so the rows on screen stay the one
@@ -477,7 +514,36 @@ fn result_grid(
             .col_resizable(true)
             .row_selectable(true)
             .col_selectable(true)
+    });
+
+    // The library's arrow keys move its own selection, which is a row or a
+    // column and never a cell. Folded into the active cell here, they move the
+    // ring instead -- so every grid is navigable by keyboard, and Slate needs
+    // no arrow binding competing with the library's own actions.
+    //
+    // Hooked in the constructor because every relation tab builds its grid
+    // through it: a subscription set up at one call site would leave the other
+    // grid navigating an invisible selection.
+    cx.subscribe(&grid, |_, table, event: &TableEvent, cx| match event {
+        TableEvent::SelectRow(row) => {
+            let row = *row;
+            table.update(cx, |table, cx| {
+                table.delegate_mut().select_row(row);
+                cx.notify();
+            });
+        }
+        TableEvent::SelectColumn(col) => {
+            let col = *col;
+            table.update(cx, |table, cx| {
+                table.delegate_mut().select_col(col);
+                cx.notify();
+            });
+        }
+        _ => {}
     })
+    .detach();
+
+    grid
 }
 
 struct ConnectionForm {
@@ -587,6 +653,15 @@ impl ConnectionForm {
             },
         ))
     }
+}
+
+/// What runs once a generated batch has succeeded.
+enum Refresh {
+    /// The query tab's stashed `SELECT`.
+    Statement(String),
+    /// A relation tab, refreshed the way its own controls refresh it — so it
+    /// picks up whatever sort and row limit the tab is now set to.
+    Relation(u64),
 }
 
 enum QueryState {
@@ -1394,6 +1469,11 @@ impl Workspace {
             cx.notify();
             return;
         }
+        // Whatever is in front, in the order it is stacked: the batch panel is
+        // over the surface, so `escape` backs out of it first.
+        if self.close_apply_review(cx) {
+            return;
+        }
         let Some(profile) = self.profile_mut() else {
             return;
         };
@@ -1559,6 +1639,199 @@ impl Workspace {
         replaced.replace_range(range, &sorted);
         editor.update(cx, |editor, cx| editor.set_value(replaced, window, cx));
         self.execute_sql(sorted, Tab::Query, cx);
+    }
+
+    /// `Enter` on the active cell opens an input on it. Everything after this
+    /// keystroke — the input, the commit, the cancel — belongs to the grid; the
+    /// refusal belongs here, because the grid has nowhere to say anything.
+    fn edit_cell(&mut self, _: &EditCell, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(profile) = self.profile() else {
+            return;
+        };
+        // A batch already on screen was generated from the pending set as it
+        // stood. Another edit behind the modal would leave the statement the
+        // user is reading describing something other than what the grid holds.
+        if profile.session.apply_review.is_some() {
+            return;
+        }
+        let Some(results) = profile.session.active_results().cloned() else {
+            return;
+        };
+        // The grid's own active cell, not the library's selection: its selected
+        // row and column are mutually exclusive modes rather than a cell, so
+        // `selected_col` is `None` after a click. Both of its selections are
+        // folded into this coordinate, which is why arrow keys land here too.
+        let Some((row, col)) = results.read(cx).delegate().active() else {
+            return;
+        };
+        if results.update(cx, |table, cx| {
+            let opened = table.delegate_mut().begin_edit(row, col);
+            cx.notify();
+            opened
+        }) {
+            return;
+        }
+
+        // Which of the two refusals this is, read off `editable` rather than off
+        // an edit target the grid deliberately does not expose: a result Slate
+        // cannot trace to one table has no editable cell anywhere in the row,
+        // and one it can has this column alone refused.
+        let traced = {
+            let table = results.read(cx);
+            (0..table.delegate().columns().len()).any(|col| table.delegate().editable(row, col))
+        };
+        self.note(
+            match traced {
+                true => "This column cannot be edited.".into(),
+                false => "Slate cannot tell which table these rows come from.".into(),
+            },
+            cx,
+        );
+    }
+
+    /// `cmd+c` on the active cell, whole value and all.
+    ///
+    /// Slate ships no CSV or Parquet export because clipboard copy covers the
+    /// common case (2026-08-17 spec §2), so this is load-bearing for a decision
+    /// already taken. It works on every cell, including the ones that can never
+    /// open an input — a join, an aggregate, a view, a primary-key column — and
+    /// the grid withholds the value while an input is open, where `cmd+c`
+    /// belongs to the input's own text selection.
+    fn copy_cell(&mut self, _: &CopyCell, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(profile) = self.profile() else {
+            return;
+        };
+        let Some(results) = profile.session.active_results() else {
+            return;
+        };
+        let Some(value) = results.read(cx).delegate().active_value().map(str::to_string) else {
+            return;
+        };
+        cx.write_to_clipboard(ClipboardItem::new_string(value));
+    }
+
+    /// Turn the grid's pending edits into SQL and put it where the user can read
+    /// it: the query tab's buffer, or a relation tab's modal.
+    ///
+    /// Deliberately not on a keybinding. `cmd+enter` means "run the statement
+    /// under the cursor" and nothing else, and a mutation one fat finger away
+    /// from that is a write nobody asked for.
+    fn apply_edits(&mut self, _: &ApplyEdits, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(profile) = self.profile() else {
+            return;
+        };
+        let tab = profile.session.active;
+        let Some(results) = profile.session.active_results().cloned() else {
+            return;
+        };
+        let pending = results.read(cx).delegate().pending_updates();
+        let Some(batch) = update_batch(&pending) else {
+            self.note(
+                match pending.is_empty() {
+                    true => "There are no edits to apply.".into(),
+                    // Nothing partial runs: a batch missing one of its rows is
+                    // not the change the user made.
+                    false => "Slate cannot name an edited row by its primary key.".into(),
+                },
+                cx,
+            );
+            return;
+        };
+        // The gate every generated statement passes before anything executes
+        // (`AGENTS.md` rule 2). Failing it means Slate wrote something that is
+        // not an `UPDATE`, which is a bug in Slate rather than a user error.
+        if !sql::is_generated_update(&batch) {
+            self.note(
+                "Slate refused to run a statement it wrote itself: it is not an UPDATE.".into(),
+                cx,
+            );
+            return;
+        }
+
+        match tab {
+            Tab::Query => self.apply_in_buffer(batch, window, cx),
+            Tab::Object(_) => {
+                if let Some(profile) = self.profile_mut() {
+                    profile.session.apply_review = Some(ApplyReview { tab, sql: batch });
+                    cx.notify();
+                }
+            }
+        }
+    }
+
+    /// The query tab: the batch is appended to the user's buffer, runs from
+    /// there, and the `SELECT` that produced the grid runs after it.
+    ///
+    /// The append is what keeps a failure readable. `execute_sql` clears the
+    /// grid as it starts, so the pending edits are gone either way — but the
+    /// statement that was attempted is still in the buffer.
+    fn apply_in_buffer(&mut self, batch: String, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(profile) = self.profile() else {
+            return;
+        };
+        let editor = profile.session.editor.clone();
+        let Some(select) = profile.session.last_query.clone() else {
+            self.note(
+                "Slate does not know which statement produced these rows.".into(),
+                cx,
+            );
+            return;
+        };
+
+        let text = editor.read(cx).value().to_string();
+        let appended = appended_statement(&text, &batch);
+        editor.update(cx, |editor, cx| editor.set_value(appended, window, cx));
+        self.execute_and_then(batch, Tab::Query, Some(Refresh::Statement(select)), cx);
+    }
+
+    /// Run the batch a relation tab is showing. The modal stays up until it
+    /// succeeds, so a failure leaves the statement on screen.
+    fn run_apply_review(&mut self, cx: &mut Context<Self>) {
+        let Some(profile) = self.profile() else {
+            return;
+        };
+        let Some(review) = &profile.session.apply_review else {
+            return;
+        };
+        let (tab, sql) = (review.tab, review.sql.clone());
+        let Tab::Object(id) = tab else {
+            return;
+        };
+        // Without the refresh the grid would show the UPDATE's empty result set
+        // and the user would watch their table vanish.
+        self.execute_and_then(sql, tab, Some(Refresh::Relation(id)), cx);
+    }
+
+    /// Put the batch away, leaving the edits pending: reading a statement and
+    /// deciding not to run it is not the same as throwing the edits out, which
+    /// is what Discard is for.
+    fn close_apply_review(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(profile) = self.profile_mut() else {
+            return false;
+        };
+        let closed = profile.session.apply_review.take().is_some();
+        if closed {
+            cx.notify();
+        }
+        closed
+    }
+
+    /// Back to exactly the rows the server sent.
+    fn discard_edits(&mut self, _: &DiscardEdits, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(results) = self
+            .profile()
+            .and_then(|profile| profile.session.active_results().cloned())
+        else {
+            return;
+        };
+        results.update(cx, |table, cx| {
+            table.delegate_mut().discard_pending();
+            table.refresh(cx);
+        });
+        if let Some(profile) = self.profile_mut() {
+            profile.session.apply_review = None;
+        }
+        cx.notify();
     }
 
     fn persist_buffer(&self, cx: &App) -> Result<(), String> {
@@ -1812,6 +2085,23 @@ impl Workspace {
     /// through a profile's own editor or explorer, so the absence of one is not
     /// a state the user can be shown an error about.
     fn execute_sql(&mut self, sql: String, tab: Tab, cx: &mut Context<Self>) {
+        self.execute_and_then(sql, tab, None, cx);
+    }
+
+    /// As `execute_sql`, with something to run once this statement has
+    /// succeeded.
+    ///
+    /// Chained inside the completion rather than called after it: `execute_sql`
+    /// refuses to start while a query is running, so a second call made here
+    /// would be dropped on the floor. Nothing follows a failure — the error is
+    /// what there is to see, and a refresh would replace it with rows.
+    fn execute_and_then(
+        &mut self,
+        sql: String,
+        tab: Tab,
+        refresh: Option<Refresh>,
+        cx: &mut Context<Self>,
+    ) {
         let Some(profile) = self.profile_mut() else {
             return;
         };
@@ -1855,6 +2145,9 @@ impl Workspace {
         let keys = sql::order_by(&sql);
         let sortable = keys.is_some();
         let keys = keys.unwrap_or_default();
+        // Kept only where it is read back: the query tab's grid has to be able
+        // to say which statement produced it.
+        let statement = matches!(tab, Tab::Query).then(|| sql.clone());
         let query_task = cx
             .background_executor()
             .spawn(async move { connection.query(&sql) });
@@ -1863,31 +2156,60 @@ impl Workspace {
             let result = query_task.await;
             workspace
                 .update(cx, |workspace, cx| {
-                    let Some(profile) = workspace.issued_to(&id, generation) else {
-                        return;
-                    };
-                    let Some((state, results)) = profile.session.slot(tab) else {
-                        return;
+                    let (succeeded, produced_grid) = {
+                        let Some(profile) = workspace.issued_to(&id, generation) else {
+                            return;
+                        };
+                        let Some((state, results)) = profile.session.slot(tab) else {
+                            return;
+                        };
+
+                        match result {
+                            Ok(result) => {
+                                *state = QueryState::Complete {
+                                    rows: result.rows.len(),
+                                    bytes: result.bytes,
+                                    elapsed: result.elapsed,
+                                    rows_affected: result.rows_affected,
+                                };
+                                let produced_grid = !result.columns.is_empty();
+                                results.update(cx, |table, cx| {
+                                    let sort = sort_columns(&keys, &result.columns);
+                                    *table.delegate_mut() =
+                                        ResultGrid::new(result).with_sort(sort, sortable);
+                                    table.refresh(cx);
+                                });
+                                (true, produced_grid)
+                            }
+                            Err(error) => {
+                                *state = QueryState::Failed(error);
+                                (false, false)
+                            }
+                        }
                     };
 
-                    match result {
-                        Ok(result) => {
-                            *state = QueryState::Complete {
-                                rows: result.rows.len(),
-                                bytes: result.bytes,
-                                elapsed: result.elapsed,
-                                rows_affected: result.rows_affected,
-                            };
-                            results.update(cx, |table, cx| {
-                                let sort = sort_columns(&keys, &result.columns);
-                                *table.delegate_mut() =
-                                    ResultGrid::new(result).with_sort(sort, sortable);
-                                table.refresh(cx);
-                            });
+                    if succeeded && let Some(profile) = workspace.issued_to(&id, generation) {
+                        // A statement that returned no columns produced no grid,
+                        // so it is not the statement to go back to — which is
+                        // what keeps an applied UPDATE from becoming the query
+                        // an apply re-runs.
+                        if produced_grid && let Some(statement) = statement {
+                            profile.session.last_query = Some(statement);
                         }
-                        Err(error) => *state = QueryState::Failed(error),
+                        // Nothing left to read once the batch it was showing has
+                        // run.
+                        if refresh.is_some() {
+                            profile.session.apply_review = None;
+                        }
                     }
                     cx.notify();
+
+                    if succeeded && let Some(refresh) = refresh {
+                        match refresh {
+                            Refresh::Statement(sql) => workspace.execute_sql(sql, tab, cx),
+                            Refresh::Relation(id) => workspace.refresh_relation(id, cx),
+                        }
+                    }
                 })
                 .ok();
         })
@@ -2325,6 +2647,11 @@ impl Workspace {
                         .min_w_0()
                         .h_full()
                         .font_family(mono)
+                        // The grid's own delegate has no key hook and the focused
+                        // element is the table root, so `enter` is caught here on
+                        // its way out of the Table context.
+                        .on_action(cx.listener(Self::edit_cell))
+                        .on_action(cx.listener(Self::copy_cell))
                         .child(Table::new(results).bordered(false).stripe(true)),
                 )
                 .children(Self::render_row_inspector(results, cx))
@@ -2977,6 +3304,105 @@ impl Workspace {
             .into_any_element()
     }
 
+    /// A relation tab's generated batch, on screen before it runs.
+    ///
+    /// The statement is the point of the panel: a relation tab has no buffer, so
+    /// this is where rule 1's "the statement that runs is the statement on
+    /// screen" is satisfied, and Run is the ask.
+    ///
+    /// It stays up until the batch succeeds. `execute_sql` clears the grid as it
+    /// starts and the pending edits go with it, so after a failure this is the
+    /// only remaining copy of what was attempted.
+    fn render_apply_review(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let t = *theme(cx);
+        let mono = gpui_component::Theme::global(cx).mono_font_family.clone();
+        let profile = self.profile()?;
+        let review = profile.session.apply_review.as_ref()?;
+        if review.tab != profile.session.active {
+            return None;
+        }
+        // The batch is the only thing this tab can have run while the panel is
+        // open, so a failure on it is this batch's failure.
+        let error = match profile.session.active_query() {
+            Some(QueryState::Failed(error)) => Some(error.message.clone()),
+            _ => None,
+        };
+        let running = matches!(profile.session.active_query(), Some(QueryState::Running));
+        let lines: Vec<String> = review.sql.lines().map(str::to_string).collect();
+        let cancel_workspace = cx.entity().downgrade();
+        let run_workspace = cancel_workspace.clone();
+
+        Some(
+            div()
+                .absolute()
+                .inset_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(
+                    div()
+                        .w(px(layout::DIALOG_WIDTH))
+                        .p(px(layout::SPACE_LG))
+                        .flex()
+                        .flex_col()
+                        .gap(px(layout::SPACE_MD))
+                        .bg(t.overlay)
+                        .border_1()
+                        .border_color(t.border_strong)
+                        .rounded(px(layout::RADIUS_PANEL))
+                        .shadow_lg()
+                        .child(section_label(t, "Apply edits"))
+                        .child(
+                            div()
+                                .id("apply-review-sql")
+                                .max_h(px(220.))
+                                .overflow_y_scroll()
+                                .font_family(mono)
+                                .text_size(px(layout::TEXT_SM))
+                                // Line by line: a single child carrying newlines
+                                // is one run of text to the layout.
+                                .children(lines.into_iter().map(|line| div().child(line))),
+                        )
+                        .children(error.map(|message| {
+                            div()
+                                .text_size(px(layout::TEXT_SM))
+                                .text_color(t.danger)
+                                .child(message)
+                        }))
+                        .child(
+                            div()
+                                .flex()
+                                .justify_end()
+                                .gap(px(layout::SPACE_SM))
+                                .child(
+                                    Button::new("cancel-apply")
+                                        .label("Cancel")
+                                        .ghost()
+                                        .small()
+                                        .on_click(move |_, _, cx| {
+                                            _ = cancel_workspace.update(cx, |workspace, cx| {
+                                                workspace.close_apply_review(cx);
+                                            });
+                                        }),
+                                )
+                                .child(
+                                    Button::new("run-apply")
+                                        .label("Run")
+                                        .primary()
+                                        .small()
+                                        .disabled(running)
+                                        .on_click(move |_, _, cx| {
+                                            _ = run_workspace.update(cx, |workspace, cx| {
+                                                workspace.run_apply_review(cx);
+                                            });
+                                        }),
+                                ),
+                        ),
+                )
+                .into_any_element(),
+        )
+    }
+
     /// The connection switcher: a bottom-anchored row that opens a floating
     /// panel above itself, the way an account switcher floats over a sidebar,
     /// rather than an accordion that shoves the tree around.
@@ -3385,10 +3811,21 @@ impl Render for Workspace {
             _ => None,
         };
         let notice = profile.session.notice.clone();
+        // Edits waiting to be written back. Read off the grid rather than held
+        // here, so the footer cannot disagree with the cells.
+        let has_pending = profile
+            .session
+            .active_results()
+            .is_some_and(|results| results.read(cx).delegate().has_pending());
+        let apply_workspace = cx.entity().downgrade();
+        let discard_workspace = apply_workspace.clone();
 
         div()
             .id("workspace")
+            .relative()
             .on_action(cx.listener(Self::run_query))
+            .on_action(cx.listener(Self::apply_edits))
+            .on_action(cx.listener(Self::discard_edits))
             .on_action(cx.listener(Self::sort_column))
             .on_action(cx.listener(Self::set_row_limit))
             .on_action(cx.listener(Self::show_editor))
@@ -3464,8 +3901,41 @@ impl Render for Workspace {
                     }))
                     .children(query_status.map(|query_status| {
                         div().ml_auto().text_color(t.text_faint).child(query_status)
+                    }))
+                    // Only while there is something to apply: a pair of buttons
+                    // that do nothing is a pair of buttons to read past. Apply
+                    // has no keybinding on purpose -- see `apply_edits`.
+                    .children(has_pending.then(|| {
+                        div()
+                            .ml_auto()
+                            .flex()
+                            .items_center()
+                            .gap(px(layout::SPACE_XS))
+                            .child(
+                                Button::new("discard-edits")
+                                    .label("Discard")
+                                    .ghost()
+                                    .xsmall()
+                                    .on_click(move |_, window, cx| {
+                                        _ = discard_workspace.update(cx, |workspace, cx| {
+                                            workspace.discard_edits(&DiscardEdits, window, cx);
+                                        });
+                                    }),
+                            )
+                            .child(
+                                Button::new("apply-edits")
+                                    .label("Apply edits")
+                                    .primary()
+                                    .xsmall()
+                                    .on_click(move |_, window, cx| {
+                                        _ = apply_workspace.update(cx, |workspace, cx| {
+                                            workspace.apply_edits(&ApplyEdits, window, cx);
+                                        });
+                                    }),
+                            )
                     })),
             )
+            .children(self.render_apply_review(cx))
     }
 }
 
@@ -3479,6 +3949,63 @@ impl Render for Workspace {
 fn relation_sql(schema: &str, relation: &str, sort: &[SortKey], limit: usize) -> String {
     let preview = preview_sql(schema, relation, limit);
     sql::with_order_by(&preview, sort).unwrap_or(preview)
+}
+
+/// Every pending row as one `UPDATE`, joined into a single string.
+///
+/// One `simple_query` round trip is one implicit transaction, so a batch sent
+/// this way is all-or-nothing with no transaction code at all.
+///
+/// `None` when there is nothing to apply, and `None` — rather than a shorter
+/// batch — when any one row cannot be written: a partial apply is not the change
+/// the user made, and Slate would have no way to say which part of it ran.
+fn update_batch(rows: &[PendingRow]) -> Option<String> {
+    if rows.is_empty() {
+        return None;
+    }
+
+    fn borrowed(pairs: &[(String, String)]) -> Vec<(&str, &str)> {
+        pairs
+            .iter()
+            .map(|(column, value)| (column.as_str(), value.as_str()))
+            .collect()
+    }
+    let statements: Option<Vec<String>> = rows
+        .iter()
+        .map(|row| {
+            sql::update_row(
+                &row.schema,
+                &row.table,
+                &borrowed(&row.sets),
+                &borrowed(&row.keys),
+            )
+            // Terminated, not separated: the last statement carries its
+            // semicolon too, so appending to a buffer cannot fuse it onto
+            // whatever the user writes next.
+            .map(|statement| format!("{statement};"))
+        })
+        .collect();
+
+    Some(statements?.join("\n"))
+}
+
+/// Slate's statement appended to the buffer the user is writing in.
+///
+/// The terminator is the whole subtlety: an unterminated statement with an
+/// `UPDATE` appended to it becomes one statement, and the next `cmd+enter`
+/// would send both as one. Slate is writing here because the user asked it to,
+/// so the boundary of what they wrote has to survive the ask.
+fn appended_statement(buffer: &str, statement: &str) -> String {
+    let text = buffer.trim_end();
+    if text.is_empty() {
+        return statement.to_string();
+    }
+
+    let terminator = match text.ends_with(';') {
+        true => "",
+        false => ";",
+    };
+    format!("{text}{terminator}\n\n{statement}")
 }
 
 /// How a column is named in an `ORDER BY`.
@@ -3791,6 +4318,15 @@ fn main() {
             KeyBinding::new("cmd-=", ZoomEditorIn, None),
             KeyBinding::new("cmd--", ZoomEditorOut, None),
             KeyBinding::new("cmd-0", ResetEditorZoom, None),
+            // Scoped to the grid: `enter` everywhere else already belongs to
+            // whatever is focused. Applying the edits has no binding at all --
+            // `cmd+enter` runs the statement under the cursor and nothing else.
+            KeyBinding::new("enter", EditCell, Some("Table")),
+            // Scoped the same way, and for the same reason it has to be scoped
+            // at all: an open input is deeper in the dispatch path, so its own
+            // `cmd+c` wins there and the grid's copy never steals a text
+            // selection.
+            KeyBinding::new("cmd-c", CopyCell, Some("Table")),
         ]);
 
         // The platform titlebar is kept only for its window buttons: a system
@@ -4001,5 +4537,88 @@ mod tests {
         assert_eq!(human_bytes(999), "999 B");
         assert_eq!(human_bytes(578_923), "578.9 KB");
         assert_eq!(human_bytes(1_500_000), "1.5 MB");
+    }
+
+    fn pending_row(sets: &[(&str, &str)], keys: &[(&str, &str)]) -> PendingRow {
+        fn owned(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+            pairs
+                .iter()
+                .map(|(column, value)| (column.to_string(), value.to_string()))
+                .collect()
+        }
+        PendingRow {
+            schema: "public".to_string(),
+            table: "accounts".to_string(),
+            sets: owned(sets),
+            keys: owned(keys),
+        }
+    }
+
+    #[test]
+    fn several_pending_rows_become_one_semicolon_joined_batch() {
+        let rows = vec![
+            pending_row(&[("name", "Ada")], &[("id", "1")]),
+            pending_row(&[("name", "Bo")], &[("id", "2")]),
+        ];
+
+        let batch = update_batch(&rows).unwrap();
+        assert_eq!(
+            batch,
+            "UPDATE \"public\".\"accounts\" SET \"name\" = 'Ada' WHERE \"id\" = '1';\n\
+             UPDATE \"public\".\"accounts\" SET \"name\" = 'Bo' WHERE \"id\" = '2';"
+        );
+        // The batch Slate builds has to pass the same gate Slate checks every
+        // generated statement against, or the generator and the gate have
+        // drifted apart.
+        assert!(sql::is_generated_update(&batch));
+    }
+
+    #[test]
+    fn a_row_with_no_key_to_find_it_by_refuses_the_whole_batch() {
+        let rows = vec![
+            pending_row(&[("name", "Ada")], &[("id", "1")]),
+            // No keys at all: sql::update_row refuses this one, since there is
+            // nothing to identify the row it would touch.
+            pending_row(&[("name", "Bo")], &[]),
+        ];
+
+        assert!(sql::update_row("public", "accounts", &[("name", "Bo")], &[]).is_none());
+        assert_eq!(update_batch(&rows), None);
+    }
+
+    #[test]
+    fn an_empty_batch_of_rows_has_nothing_to_send() {
+        assert_eq!(update_batch(&[]), None);
+    }
+
+    #[test]
+    fn an_unterminated_buffer_is_terminated_before_the_appended_statement() {
+        // Without the semicolon, "SELECT 1" and "UPDATE ..." would read back
+        // as a single statement, and cmd+enter would send both at once.
+        assert_eq!(
+            appended_statement("SELECT 1", "UPDATE t SET a = 1"),
+            "SELECT 1;\n\nUPDATE t SET a = 1"
+        );
+    }
+
+    #[test]
+    fn an_already_terminated_buffer_keeps_a_single_semicolon() {
+        assert_eq!(
+            appended_statement("SELECT 1;", "UPDATE t SET a = 1"),
+            "SELECT 1;\n\nUPDATE t SET a = 1"
+        );
+    }
+
+    #[test]
+    fn an_empty_buffer_yields_just_the_statement() {
+        assert_eq!(appended_statement("", "UPDATE t SET a = 1"), "UPDATE t SET a = 1");
+    }
+
+    #[test]
+    fn trailing_whitespace_in_the_buffer_does_not_ragged_the_join() {
+        assert_eq!(
+            appended_statement("SELECT 1\n\n  ", "UPDATE t SET a = 1"),
+            "SELECT 1;\n\nUPDATE t SET a = 1"
+        );
     }
 }
