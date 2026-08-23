@@ -65,11 +65,16 @@ docker compose up -d postgres
   key; joins, aggregates, views and keyless tables stay read-only and say why.
 - **Schema explorer** over schemas, tables, views, functions and procedures, with
   an inline filter and a structure view for columns, indexes and constraints.
+- **`cmd+p` and `cmd+shift+p`.** One flat fuzzy list over every table, view,
+  routine and saved query the connection has, and one over the verbs that apply
+  to what is on screen. Every row runs the same code the buttons do.
+- **`cmd+w`** closes the tab in front. A saved query is listed while its file
+  exists, so closing that one is deleting it and it asks first; everything else
+  just goes.
 
 ## Planned
 
-`cmd+p` fuzzy table search and `cmd+shift+p` command palette · TLS with an
-sslmode selector · multiple unsaved buffers · a Homebrew tap.
+TLS with an sslmode selector · multiple unsaved buffers · a Homebrew tap.
 
 ## Not planned
 

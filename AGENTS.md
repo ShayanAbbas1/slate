@@ -66,7 +66,7 @@ require it, stop and raise it instead.
 gpui = "=0.2.2"
 gpui-component = { version = "=0.5.1", features = ["tree-sitter-languages"] }
 postgres = "0.19"          # blocking client, NOT tokio-postgres
-nucleo-matcher = "*"       # fuzzy scoring; gpui-component ships no scorer
+nucleo-matcher = "=0.3.1"  # fuzzy scoring; gpui-component ships no scorer
 icondata_lu = "=0.1.0"     # Lucide icon data; gpui-component ships no icon files
 ```
 
@@ -106,7 +106,12 @@ multi-line editor, IME, line numbers), `src/highlighter/` (tree-sitter; SQL via
 `tree_sitter_sequel`), `src/table/` (grid virtualized on both axes),
 `src/dock/` (panels, tab bars), `Root` dialog layers (modal overlays).
 
-It does **not** provide a fuzzy matcher or a command palette. Those are ours.
+It does **not** provide a fuzzy matcher or a command palette. Those are ours —
+`src/palette.rs` scores with `nucleo-matcher` and presents through the
+library's `ListState`, which owns the search field, the virtualized scroll and
+the click-to-confirm. A palette row carries a `Command`; `Workspace::run_command`
+routes every one of them into the method its button or keystroke already calls,
+so the palette is never a second implementation of anything.
 
 It also does **not** ship the icons its `IconName` names: those are Lucide file
 paths with no files behind them. `src/icons.rs` is Slate's `AssetSource` — it
@@ -141,6 +146,25 @@ Hard-won and easy to rediscover. Read before writing any animated element.
   do not shift.
 - **`.hover()` snaps with no transition.** Colour fades are manual — see the
   ported `motion.rs` hover-fade system.
+
+Two more that are not about animation, and cost a round each to find:
+
+- **A window with nothing focused has no dispatch path, so every keybinding is
+  dead.** A keystroke reaches a handler only along the focused element's path to
+  the root. Unmount whatever had focus — close a modal, switch to a surface with
+  no focusable element — and the app stops responding to the keyboard entirely
+  until something is clicked. Anything that takes focus away must hand it back;
+  `Workspace::close_palette` is the worked example, and `Focus::Window` is the
+  floor under it for surfaces that have nothing to type into.
+- **A binding with no context predicate wins over a scoped one.**
+  `Keymap::binding_enabled` scores an unscoped binding at `contexts.len()` —
+  the maximum — while `Some("Foo")` scores at the depth of that node, and the
+  deepest match takes the keystroke. So a library binding scoped to an inner
+  element beats the container's, which is why the palette's arrows are bound
+  against `Palette > Input`: a descendant predicate matches at the leaf, which
+  is the only depth that takes them back from gpui-component's input. Ties are
+  broken by registration order, and Slate's `cx.bind_keys` runs after
+  `gpui_component::init`.
 
 ---
 

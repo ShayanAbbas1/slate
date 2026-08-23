@@ -77,6 +77,10 @@ pub mod layout {
     pub const SIDEBAR_MIN_WIDTH: f32 = 180.0;
     pub const SIDEBAR_MAX_WIDTH: f32 = 480.0;
     pub const DIALOG_WIDTH: f32 = 420.0;
+    /// The palette. Wide enough for a schema-qualified name and its kind, and
+    /// capped so a catalog of thousands scrolls rather than filling the window.
+    pub const PALETTE_WIDTH: f32 = 520.0;
+    pub const PALETTE_MAX_HEIGHT: f32 = 360.0;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

@@ -1,5 +1,6 @@
 mod db;
 mod explorer;
+mod palette;
 mod result_grid;
 mod sql;
 mod store;
@@ -11,17 +12,17 @@ use std::{borrow::Cow, collections::HashMap, sync::Arc};
 
 use gpui::{
     Action, AnyElement, App, AppContext, Application, ClickEvent, ClipboardItem, Context, Entity,
-    EntityInputHandler, Focusable, FontWeight, InteractiveElement, IntoElement, KeyBinding,
+    EntityInputHandler, FocusHandle, Focusable, FontWeight, InteractiveElement, IntoElement, KeyBinding,
     Keystroke, ParentElement, Render, StatefulInteractiveElement, Styled, TitlebarOptions, Window,
     WindowOptions, actions, div, point, prelude::FluentBuilder, px,
 };
 use serde::Deserialize;
 use gpui_component::{
-    Disableable, InteractiveElementExt, Root, Sizable,
+    Disableable, IndexPath, InteractiveElementExt, Root, Sizable,
     button::{Button, ButtonVariants},
     input::{Input, InputEvent, InputState},
     kbd::Kbd,
-    list::ListItem,
+    list::{List, ListEvent, ListItem, ListState},
     resizable::{h_resizable, resizable_panel, v_resizable},
     table::{Table, TableDelegate, TableEvent, TableState},
     tree::{TreeState, tree as render_tree},
@@ -35,6 +36,7 @@ use explorer::{
     tree as build_explorer_tree,
 };
 use icons::{Icons, icon};
+use palette::{Command, Mode as PaletteMode, Palette};
 use result_grid::{PendingRow, ResultGrid};
 use sql::{Buffer, SortKey};
 use theme::{Theme, layout, theme};
@@ -74,6 +76,11 @@ actions!(
         CopyCell,
         ApplyEdits,
         DiscardEdits,
+        FuzzyOpen,
+        CommandPalette,
+        PaletteNext,
+        PalettePrevious,
+        CloseTab,
     ]
 );
 
@@ -182,6 +189,13 @@ struct Session {
     save_name: Entity<InputState>,
     naming: bool,
     pending_delete: Option<String>,
+    /// The saved query `cmd+w` is asking about.
+    ///
+    /// A saved query has no closed state — it is in the strip while its file
+    /// exists and gone when it does not — so closing its tab is deleting it,
+    /// and it is the one tab that says so before it goes. Separate from
+    /// `pending_delete`, which is the chip's own quieter two-click arming.
+    pending_close: Option<String>,
     notice: Option<String>,
     editor_font_size: f32,
     /// The statement behind the query tab's grid.
@@ -277,6 +291,7 @@ impl Session {
             save_name,
             naming: false,
             pending_delete: None,
+            pending_close: None,
             notice,
             editor_font_size: EDITOR_FONT_SIZE_DEFAULT,
             last_query: None,
@@ -357,6 +372,11 @@ impl Session {
 enum Focus {
     Buffer(Entity<InputState>),
     Grid(Entity<TableState<ResultGrid>>),
+    /// The window itself, for a surface with nothing in it to type into. Not a
+    /// no-op: a keystroke only reaches the workspace along the focused
+    /// element's dispatch path, so focusing nothing at all is what makes every
+    /// binding dead until something is clicked.
+    Window,
 }
 
 enum CatalogState {
@@ -368,10 +388,31 @@ enum CatalogState {
 /// Which surface the main pane is showing, and what a run targets. Object tabs
 /// are addressed by id rather than by index, so closing one cannot land an
 /// in-flight result in its neighbour's grid.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Tab {
     Query,
     Object(u64),
+}
+
+/// What `cmd+w` has to do with the surface in front of it.
+#[derive(Debug, PartialEq, Eq)]
+enum CloseTarget {
+    /// Close it. It is a view onto something the database still holds, and
+    /// reopening it costs a click.
+    Object(u64),
+    /// Ask first. A saved query is listed while its file exists and gone when
+    /// it does not, so closing its tab is deleting it.
+    SavedQuery(String),
+}
+
+/// `None` for the scratch buffer, which is always in the strip: there is no
+/// closed state for it to go to, so `cmd+w` on it does nothing rather than
+/// inventing one.
+fn close_target(active: Tab, open_query: Option<&str>) -> Option<CloseTarget> {
+    match active {
+        Tab::Object(id) => Some(CloseTarget::Object(id)),
+        Tab::Query => open_query.map(|name| CloseTarget::SavedQuery(name.to_string())),
+    }
 }
 
 /// An opened database object. It stays in the tab strip until it is closed, so
@@ -683,6 +724,14 @@ struct Workspace {
     switcher_open: bool,
     pending_removal: Option<String>,
     next_generation: u64,
+    /// The palette, built from scratch every time it opens. Its rows are a
+    /// snapshot of what the catalog held and which tab was in front, and both
+    /// can move underneath it — so it is thrown away on the way out rather
+    /// than kept and refreshed.
+    palette: Option<Entity<ListState<Palette>>>,
+    /// The window's own focus, for the moments when nothing inside it can hold
+    /// any. See [`Focus::Window`].
+    focus: FocusHandle,
 }
 
 impl Workspace {
@@ -694,6 +743,8 @@ impl Workspace {
             switcher_open: false,
             pending_removal: None,
             next_generation: 0,
+            palette: None,
+            focus: cx.focus_handle(),
         };
 
         let mut load_failure = None;
@@ -1362,6 +1413,10 @@ impl Workspace {
         if let Some(profile) = self.profile_mut() {
             profile.session.active = tab;
             profile.session.pending_delete = None;
+            // Both armed deletes name the buffer they were raised over. Left
+            // standing, the dialog would offer to delete one query while
+            // another is on screen.
+            profile.session.pending_close = None;
             // A half-finished name belongs to the buffer it was opened over.
             // Left standing it would name a different one, and it holds the
             // focus the new surface needs.
@@ -1469,8 +1524,15 @@ impl Workspace {
             cx.notify();
             return;
         }
-        // Whatever is in front, in the order it is stacked: the batch panel is
-        // over the surface, so `escape` backs out of it first.
+        // Whatever is in front, in the order it is stacked: the palette is over
+        // the batch panel, which is over the surface, so `escape` backs out of
+        // them one at a time.
+        if self.close_palette(cx) {
+            return;
+        }
+        if self.cancel_close_tab(cx) {
+            return;
+        }
         if self.close_apply_review(cx) {
             return;
         }
@@ -1490,6 +1552,183 @@ impl Workspace {
         profile.session.editor_needs_focus = true;
         self.remember_profiles(cx);
         cx.notify();
+    }
+
+    /// `cmd+w` on whatever surface is in front.
+    ///
+    /// An object tab closes: it is a view onto something the database still
+    /// holds, and reopening it costs a click. A saved query is a file, and
+    /// closing its tab is deleting that file — the strip has no room for a
+    /// query that exists but is not listed — so that one asks first. The
+    /// scratch buffer has no closed state at all and is left alone.
+    fn close_tab(&mut self, _: &CloseTab, _: &mut Window, cx: &mut Context<Self>) {
+        // The palette is over the tab and holds the keyboard: a stroke that
+        // reached here through it would close a tab nobody was looking at.
+        if self.palette.is_some() {
+            return;
+        }
+        let Some(profile) = self.profile() else {
+            return;
+        };
+        let session = &profile.session;
+        match close_target(session.active, session.open_query.as_deref()) {
+            Some(CloseTarget::Object(id)) => self.close_object(id, cx),
+            Some(CloseTarget::SavedQuery(name)) => {
+                if let Some(profile) = self.profile_mut() {
+                    profile.session.pending_close = Some(name);
+                }
+                cx.notify();
+            }
+            None => {}
+        }
+    }
+
+    fn cancel_close_tab(&mut self, cx: &mut Context<Self>) -> bool {
+        let cancelled = self
+            .profile_mut()
+            .and_then(|profile| profile.session.pending_close.take())
+            .is_some();
+        if cancelled {
+            cx.notify();
+        }
+        cancelled
+    }
+
+    fn fuzzy_open(&mut self, _: &FuzzyOpen, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_palette(PaletteMode::Jump, window, cx);
+    }
+
+    fn command_palette(&mut self, _: &CommandPalette, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_palette(PaletteMode::Commands, window, cx);
+    }
+
+    /// The same stroke again closes the palette; the other one swaps which list
+    /// it is showing, so the two surfaces are one keystroke apart.
+    fn open_palette(&mut self, mode: PaletteMode, window: &mut Window, cx: &mut Context<Self>) {
+        let showing = self
+            .palette
+            .as_ref()
+            .map(|list| list.read(cx).delegate().mode());
+        if showing == Some(mode) || self.profile().is_none() {
+            self.close_palette(cx);
+            return;
+        }
+
+        let palette = Palette::new(mode, self, cx);
+        let list = cx.new(|cx| ListState::new(palette, window, cx).searchable(true));
+        // Nothing is selected on a fresh list, and `enter` on nothing selected
+        // does nothing -- so the first row is chosen before it is ever drawn.
+        list.update(cx, |list, cx| {
+            list.set_selected_index(Some(IndexPath::default()), window, cx);
+        });
+        cx.subscribe_in(&list, window, Self::on_palette_event).detach();
+        self.palette = Some(list);
+        cx.notify();
+    }
+
+    /// The palette is dismissed before its command runs, always. A command can
+    /// open a tab, a form or a modal, and none of them can come up underneath
+    /// an overlay that is still holding the keyboard.
+    fn on_palette_event(
+        &mut self,
+        list: &Entity<ListState<Palette>>,
+        event: &ListEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let command = match event {
+            ListEvent::Select(_) => return,
+            ListEvent::Cancel => None,
+            ListEvent::Confirm(index) => list.read(cx).delegate().command(index.row).cloned(),
+        };
+        self.close_palette(cx);
+        if let Some(command) = command {
+            self.run_command(command, window, cx);
+        }
+    }
+
+    /// Take the palette down and hand the keyboard back.
+    ///
+    /// Handing it back is the whole job. The palette's search field is what had
+    /// focus, and it goes with the palette — leaving the window focused on
+    /// nothing, with no dispatch path, and every binding dead until something
+    /// is clicked. Including the one that would reopen the palette.
+    ///
+    /// Every way out routes through here for that reason: `escape`, the same
+    /// stroke again, a click outside, and confirming a row.
+    fn close_palette(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.palette.take().is_none() {
+            return false;
+        }
+        if let Some(profile) = self.profile_mut() {
+            profile.session.editor_needs_focus = true;
+        }
+        cx.notify();
+        true
+    }
+
+    /// Every row runs through the method its button or keystroke already calls.
+    /// The palette is another way in, never a second implementation.
+    fn run_command(&mut self, command: Command, window: &mut Window, cx: &mut Context<Self>) {
+        match command {
+            Command::OpenObject(target) => self.open_explorer_target(target, false, window, cx),
+            Command::OpenQuery(name) => self.open_saved_query(name, window, cx),
+            Command::OpenScratch => self.open_scratch_query(window, cx),
+            Command::NewQuery => self.new_query(&NewQuery, window, cx),
+            Command::RunQuery => self.run_query(&RunQuery, window, cx),
+            Command::SaveQuery => self.save_query(&SaveQuery, window, cx),
+            Command::RenameQuery => self.rename_query(window, cx),
+            Command::ShowStructure(showing) => self.show_structure(showing, cx),
+            Command::RefreshRelation(id) => self.refresh_relation(id, cx),
+            Command::CloseObject(id) => self.close_object(id, cx),
+            Command::ApplyEdits => self.apply_edits(&ApplyEdits, window, cx),
+            Command::DiscardEdits => self.discard_edits(&DiscardEdits, window, cx),
+            Command::SwitchProfile(index) => self.activate(index, cx),
+            Command::NewConnection => self.open_connection_form(&NewConnection, window, cx),
+            Command::CycleTheme => self.cycle_theme(&CycleTheme, window, cx),
+            Command::ResetEditorZoom => self.reset_editor_zoom(&ResetEditorZoom, window, cx),
+        }
+    }
+
+    fn palette_next(&mut self, _: &PaletteNext, window: &mut Window, cx: &mut Context<Self>) {
+        self.move_palette_selection(1, window, cx);
+    }
+
+    fn palette_previous(&mut self, _: &PalettePrevious, window: &mut Window, cx: &mut Context<Self>) {
+        self.move_palette_selection(-1, window, cx);
+    }
+
+    /// The list binds the arrows itself, but the search field is deeper in the
+    /// dispatch path than the list is, and a single-line input swallows them
+    /// without passing them on. So the palette moves its own selection.
+    fn move_palette_selection(&mut self, step: isize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(list) = self.palette.clone() else {
+            return;
+        };
+        list.update(cx, |list, cx| {
+            let rows = list.delegate().len() as isize;
+            if rows == 0 {
+                return;
+            }
+            let row = list.selected_index().map_or(0, |index| index.row) as isize;
+            // Wrapping, because a list this short is faster to reach the end of
+            // from the top than by holding a key down.
+            let row = (row + step).rem_euclid(rows) as usize;
+            list.set_selected_index(Some(IndexPath::new(row)), window, cx);
+            list.scroll_to_selected_item(window, cx);
+        });
+    }
+
+    /// Edits sitting in the visible grid, waiting to be written back. Read off
+    /// the grid rather than held anywhere, so nothing can disagree with the
+    /// cells about whether there is something to apply.
+    fn has_pending_edits(&self, cx: &App) -> bool {
+        self.profile().is_some_and(|profile| {
+            profile
+                .session
+                .active_results()
+                .is_some_and(|results| results.read(cx).delegate().has_pending())
+        })
     }
 
     fn run_query(&mut self, _: &RunQuery, window: &mut Window, cx: &mut Context<Self>) {
@@ -2032,6 +2271,20 @@ impl Workspace {
             self.note(message, cx);
             return;
         }
+        if let Some(profile) = self.profile_mut() {
+            profile.session.notice = None;
+        }
+        self.load_scratch_buffer(window, cx);
+        self.activate_tab(Tab::Query, cx);
+    }
+
+    /// Put the scratch file in the editor, whatever the buffer was showing.
+    ///
+    /// Deliberately does not write the buffer out first, unlike every other
+    /// swap. Its callers have either just persisted it or just deleted the file
+    /// it came from, and in the second case a write would put a deleted query's
+    /// text into the scratch file — over whatever was actually in there.
+    fn load_scratch_buffer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(profile) = self.profile_mut() else {
             return;
         };
@@ -2049,11 +2302,18 @@ impl Workspace {
             .update(cx, |editor, cx| editor.set_value(sql, window, cx));
         profile.session.open_query = None;
         profile.session.query = QueryState::Idle;
-        profile.session.notice = None;
-        self.activate_tab(Tab::Query, cx);
+        cx.notify();
     }
 
-    fn delete_saved_query(&mut self, name: String, cx: &mut Context<Self>) {
+    /// The chip's own delete: the first click arms it and the second one means
+    /// it. Quieter than the dialog `cmd+w` raises, because the trash icon is
+    /// already an unambiguous ask and the tab it belongs to is right there.
+    fn arm_delete_saved_query(
+        &mut self,
+        name: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(profile) = self.profile_mut() else {
             return;
         };
@@ -2062,18 +2322,33 @@ impl Workspace {
             cx.notify();
             return;
         }
+        self.delete_saved_query(name, window, cx);
+    }
+
+    fn delete_saved_query(&mut self, name: String, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(profile) = self.profile() else {
+            return;
+        };
         let id = profile.id.clone();
+        // Read before the delete, because afterwards the buffer is showing a
+        // file that no longer exists and only this says so.
+        let was_open = profile.session.open_query.as_deref() == Some(&name);
         if let Err(message) = store::delete_query(&id, &name) {
             self.note(message, cx);
             return;
         }
         if let Some(profile) = self.profile_mut() {
-            if profile.session.open_query.as_deref() == Some(&name) {
-                profile.session.open_query = None;
-            }
             profile.session.saved_queries = store::saved_queries(&id);
             profile.session.pending_delete = None;
+            profile.session.pending_close = None;
             profile.session.notice = Some(format!("Deleted {name}."));
+        }
+        // Dropping the name alone would leave the deleted query's text sitting
+        // in the buffer as the scratch buffer's contents — and the next save
+        // would write it over the scratch file, taking unsaved work with a
+        // deletion that was never asked to touch it.
+        if was_open {
+            self.load_scratch_buffer(window, cx);
         }
         self.remember_profiles(cx);
         cx.notify();
@@ -3045,13 +3320,17 @@ impl Workspace {
                                 .ghost()
                                 .xsmall()
                                 .tooltip("Delete query")
-                                .on_click(move |_, _, cx| {
+                                .on_click(move |_, window, cx| {
                                     // Or the chip underneath opens the query in
                                     // the same click, and the confirmation this
                                     // arms is cleared before it can be seen.
                                     cx.stop_propagation();
                                     _ = delete_workspace.update(cx, |workspace, cx| {
-                                        workspace.delete_saved_query(delete_name.clone(), cx);
+                                        workspace.arm_delete_saved_query(
+                                            delete_name.clone(),
+                                            window,
+                                            cx,
+                                        );
                                     });
                                 }),
                         ),
@@ -3304,6 +3583,119 @@ impl Workspace {
             .into_any_element()
     }
 
+    /// The palette, centred over everything else.
+    ///
+    /// `key_context` is load-bearing: the arrow keys are bound against
+    /// `Palette > Input`, which is the only predicate deep enough to win the
+    /// keystroke back from the search field. See `move_palette_selection`.
+    fn render_palette(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let t = *theme(cx);
+        let list = self.palette.as_ref()?;
+        let placeholder = list.read(cx).delegate().placeholder();
+        let workspace = cx.entity().downgrade();
+
+        Some(
+            div()
+                .absolute()
+                .inset_0()
+                .flex()
+                .justify_center()
+                .child(
+                    div()
+                        .id("palette")
+                        .key_context("Palette")
+                        // Below the titlebar rather than centred vertically:
+                        // the eye is already at the top of the window, and the
+                        // list grows downwards from a fixed line.
+                        .mt(px(layout::TITLEBAR_HEIGHT * 2.))
+                        .w(px(layout::PALETTE_WIDTH))
+                        .bg(t.overlay)
+                        .border_1()
+                        .border_color(t.border_strong)
+                        .rounded(px(layout::RADIUS_PANEL))
+                        .shadow_lg()
+                        .overflow_hidden()
+                        .child(
+                            List::new(list)
+                                .search_placeholder(placeholder)
+                                .max_h(px(layout::PALETTE_MAX_HEIGHT)),
+                        )
+                        .on_mouse_down_out(move |_, _, cx| {
+                            _ = workspace.update(cx, |workspace, cx| {
+                                workspace.close_palette(cx);
+                            });
+                        }),
+                )
+                .into_any_element(),
+        )
+    }
+
+    /// What `cmd+w` asks before it takes a saved query with the tab.
+    fn render_close_confirmation(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let t = *theme(cx);
+        let name = self.profile()?.session.pending_close.clone()?;
+        let cancel_workspace = cx.entity().downgrade();
+        let delete_workspace = cancel_workspace.clone();
+        let deleted = name.clone();
+
+        Some(
+            div()
+                .absolute()
+                .inset_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(
+                    dialog(t)
+                        .child(section_label(t, "Close query"))
+                        .child(
+                            div()
+                                .text_size(px(layout::TEXT_SM))
+                                .text_color(t.text_muted)
+                                // The whole point of the dialog: a saved query
+                                // is listed while its file exists, so closing
+                                // its tab and deleting it are one act.
+                                .child(format!(
+                                    "{name} is a saved query. Closing its tab deletes it."
+                                )),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .justify_end()
+                                .gap(px(layout::SPACE_SM))
+                                .child(
+                                    Button::new("cancel-close-tab")
+                                        .label("Cancel")
+                                        .ghost()
+                                        .small()
+                                        .on_click(move |_, _, cx| {
+                                            _ = cancel_workspace.update(cx, |workspace, cx| {
+                                                workspace.cancel_close_tab(cx);
+                                            });
+                                        }),
+                                )
+                                .child(
+                                    Button::new("confirm-close-tab")
+                                        .label("Delete")
+                                        .danger()
+                                        .small()
+                                        .on_click(move |_, window, cx| {
+                                            _ = delete_workspace.update(cx, |workspace, cx| {
+                                                workspace.delete_saved_query(
+                                                    deleted.clone(),
+                                                    window,
+                                                    cx,
+                                                );
+                                            });
+                                        }),
+                                ),
+                        ),
+                )
+                .into_any_element(),
+        )
+    }
+
     /// A relation tab's generated batch, on screen before it runs.
     ///
     /// The statement is the point of the panel: a relation tab has no buffer, so
@@ -3340,17 +3732,7 @@ impl Workspace {
                 .items_center()
                 .justify_center()
                 .child(
-                    div()
-                        .w(px(layout::DIALOG_WIDTH))
-                        .p(px(layout::SPACE_LG))
-                        .flex()
-                        .flex_col()
-                        .gap(px(layout::SPACE_MD))
-                        .bg(t.overlay)
-                        .border_1()
-                        .border_color(t.border_strong)
-                        .rounded(px(layout::RADIUS_PANEL))
-                        .shadow_lg()
+                    dialog(t)
                         .child(section_label(t, "Apply edits"))
                         .child(
                             div()
@@ -3740,9 +4122,10 @@ impl Render for Workspace {
                         .find(|tab| tab.id == id)?;
                     match &tab.body {
                         ObjectBody::Relation { results, .. } => Focus::Grid(results.clone()),
-                        // A routine's tab is read. Nothing in it takes a
-                        // keystroke, so nothing in it takes focus either.
-                        ObjectBody::Routine(_) => return None,
+                        // A routine's tab is read: nothing in it takes a
+                        // keystroke. The window still has to hold focus, or
+                        // the bindings that leave this tab go with it.
+                        ObjectBody::Routine(_) => Focus::Window,
                     }
                 }
             };
@@ -3752,7 +4135,18 @@ impl Render for Workspace {
         match take_focus {
             Some(Focus::Buffer(input)) => input.focus_handle(cx).focus(window),
             Some(Focus::Grid(grid)) => grid.focus_handle(cx).focus(window),
+            Some(Focus::Window) => self.focus.focus(window),
             None => {}
+        }
+
+        // Last, and unconditionally: the palette is modal, and it holds the
+        // keyboard against anything above that just claimed it. One a modal
+        // cannot be typed into is one that cannot be dismissed either.
+        if let Some(list) = &self.palette {
+            let handle = list.focus_handle(cx);
+            if !handle.is_focused(window) {
+                handle.focus(window);
+            }
         }
 
         if self.form.is_some() {
@@ -3811,18 +4205,18 @@ impl Render for Workspace {
             _ => None,
         };
         let notice = profile.session.notice.clone();
-        // Edits waiting to be written back. Read off the grid rather than held
-        // here, so the footer cannot disagree with the cells.
-        let has_pending = profile
-            .session
-            .active_results()
-            .is_some_and(|results| results.read(cx).delegate().has_pending());
+        let has_pending = self.has_pending_edits(cx);
         let apply_workspace = cx.entity().downgrade();
         let discard_workspace = apply_workspace.clone();
 
         div()
             .id("workspace")
             .relative()
+            // The floor under the focus, so a surface with nothing focusable
+            // on it still has a dispatch path for the workspace's own
+            // bindings. An inner element that can take focus claims it first
+            // and stops this one from taking it back.
+            .track_focus(&self.focus)
             .on_action(cx.listener(Self::run_query))
             .on_action(cx.listener(Self::apply_edits))
             .on_action(cx.listener(Self::discard_edits))
@@ -3838,6 +4232,11 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::zoom_editor_in))
             .on_action(cx.listener(Self::zoom_editor_out))
             .on_action(cx.listener(Self::reset_editor_zoom))
+            .on_action(cx.listener(Self::close_tab))
+            .on_action(cx.listener(Self::fuzzy_open))
+            .on_action(cx.listener(Self::command_palette))
+            .on_action(cx.listener(Self::palette_next))
+            .on_action(cx.listener(Self::palette_previous))
             .size_full()
             // The shell is the chrome tone: titlebar, sidebar and status bar
             // paint nothing of their own, they are this. The editor and the
@@ -3936,6 +4335,8 @@ impl Render for Workspace {
                     })),
             )
             .children(self.render_apply_review(cx))
+            .children(self.render_close_confirmation(cx))
+            .children(self.render_palette(cx))
     }
 }
 
@@ -4138,6 +4539,22 @@ fn titlebar(t: Theme, subtitle: Option<String>) -> impl IntoElement {
 
 /// The quietest thing on screen: small, uppercase, and dim enough that the
 /// names under it are what the eye lands on first.
+/// The card every modal is drawn on. Shared so two panels asking the same kind
+/// of question cannot end up looking like two different applications.
+fn dialog(t: Theme) -> gpui::Div {
+    div()
+        .w(px(layout::DIALOG_WIDTH))
+        .p(px(layout::SPACE_LG))
+        .flex()
+        .flex_col()
+        .gap(px(layout::SPACE_MD))
+        .bg(t.overlay)
+        .border_1()
+        .border_color(t.border_strong)
+        .rounded(px(layout::RADIUS_PANEL))
+        .shadow_lg()
+}
+
 fn section_label(t: Theme, label: &str) -> impl IntoElement {
     div()
         .text_size(px(layout::TEXT_XS))
@@ -4310,10 +4727,21 @@ fn main() {
             KeyBinding::new("cmd-s", SaveQuery, None),
             KeyBinding::new("cmd-n", NewQuery, None),
             KeyBinding::new("cmd-shift-n", NewConnection, None),
+            KeyBinding::new("cmd-w", CloseTab, None),
             KeyBinding::new("ctrl-tab", NextProfile, None),
             KeyBinding::new("ctrl-shift-tab", PreviousProfile, None),
             KeyBinding::new("escape", ShowEditor, None),
             KeyBinding::new("cmd-shift-t", CycleTheme, None),
+            KeyBinding::new("cmd-p", FuzzyOpen, None),
+            KeyBinding::new("cmd-shift-p", CommandPalette, None),
+            // A binding wins the keystroke at the deepest context it matches,
+            // and the palette's search field is deeper than the list that binds
+            // the arrows for itself -- a single-line input swallows them and
+            // passes nothing on. `Palette > Input` matches at the field itself,
+            // which is the only depth that takes them back, and it matches
+            // nowhere else, so every other input keeps its arrows.
+            KeyBinding::new("up", PalettePrevious, Some("Palette > Input")),
+            KeyBinding::new("down", PaletteNext, Some("Palette > Input")),
             KeyBinding::new("cmd-+", ZoomEditorIn, None),
             KeyBinding::new("cmd-=", ZoomEditorIn, None),
             KeyBinding::new("cmd--", ZoomEditorOut, None),
@@ -4368,6 +4796,23 @@ mod tests {
                 data_type: None,
             })
             .collect()
+    }
+
+    #[test]
+    fn only_the_tab_that_is_a_file_is_asked_about_before_it_closes() {
+        let saved = |name: &str| Some(CloseTarget::SavedQuery(name.to_string()));
+
+        assert_eq!(close_target(Tab::Object(3), None), Some(CloseTarget::Object(3)));
+        assert_eq!(close_target(Tab::Query, Some("daily")), saved("daily"));
+        // The scratch buffer is always in the strip, so there is nothing here
+        // for `cmd+w` to close and nothing to ask about.
+        assert_eq!(close_target(Tab::Query, None), None);
+        // What the query tab happens to be holding says nothing about an
+        // object tab, which is the one in front.
+        assert_eq!(
+            close_target(Tab::Object(3), Some("daily")),
+            Some(CloseTarget::Object(3))
+        );
     }
 
     #[test]
