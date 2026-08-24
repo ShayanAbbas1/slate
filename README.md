@@ -6,10 +6,7 @@ A SQL editor that shows results — not a database browser with an editor bolted
 on. Keyboard-first, minimal, and built to stay at display refresh rate on real
 data.
 
-> **Status: early development, and there is no TLS yet.** Slate connects in
-> plaintext and refuses any `sslmode` it cannot honour rather than pretending to,
-> so do not point it at a database you would not query over an unencrypted
-> socket. Everything below under "What works" runs today.
+> **Status: early development.** Everything below under "What works" runs today.
 >
 > Design: [`docs/specs/2026-08-17-slate-design.md`](docs/specs/2026-08-17-slate-design.md),
 > amended by [`docs/specs/2026-08-23-in-grid-editing-design.md`](docs/specs/2026-08-23-in-grid-editing-design.md).
@@ -71,10 +68,17 @@ docker compose up -d postgres
 - **`cmd+w`** closes the tab in front. A saved query is listed while its file
   exists, so closing that one is deleting it and it asks first; everything else
   just goes.
+- **TLS, with libpq's five `sslmode` rungs** — `disable`, `prefer`, `require`,
+  `verify-ca`, `verify-full` — selectable per connection and carried in the
+  connection string. `verify-full` checks the certificate against the macOS
+  trust store, or against a root certificate you name, which replaces that store
+  rather than adding to it. A mode is never quietly downgraded: ask for
+  encryption and Slate either gets it or tells you which certificate failed and
+  why.
 
 ## Planned
 
-TLS with an sslmode selector · multiple unsaved buffers · a Homebrew tap.
+Multiple unsaved buffers · a Homebrew tap.
 
 ## Not planned
 

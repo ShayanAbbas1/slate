@@ -28,6 +28,32 @@ tree-sitter-sequel = "=0.3.11"
 # its runtime and runs on the background executor. See AGENTS.md.
 postgres = "0.19"
 
+# TLS. The driver ships none of its own -- `Client::connect` takes a connector,
+# and `NoTls` is a real type that refuses -- so this is what makes `sslmode`
+# something Slate can honour rather than something it has to reject.
+#
+# rustls rather than native-tls because rustls, rustls-native-certs and
+# rustls-pemfile were already in the graph through gpui, and the trust store
+# reader goes through security-framework, which is already a direct dependency
+# for the Keychain. This adds an adapter, not a second TLS stack, and no
+# OpenSSL on any platform.
+#
+# `default-features = false` on rustls is load-bearing: its defaults select the
+# aws-lc-rs provider, which would build a second crypto library from C and
+# assembly beside the `ring` already linked in. Every crate here has to agree
+# on `ring` or both get compiled.
+rustls = { version = "0.23", default-features = false, features = [
+    "ring",
+    "std",
+    "tls12",
+    "logging",
+] }
+rustls-native-certs = "0.8"
+rustls-pemfile = "2"
+tokio-postgres-rustls = { version = "0.14", default-features = false, features = [
+    "ring",
+] }
+
 # The palette's scorer. gpui-component ships the list, the virtualized scroll
 # and the search field, but no fuzzy matching at all -- and ranking that reads
 # as obvious (whole words, word starts, runs of adjacent characters) is not a

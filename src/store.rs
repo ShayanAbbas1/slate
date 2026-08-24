@@ -24,6 +24,14 @@ pub struct StoredProfile {
     pub port: Option<u16>,
     pub database: String,
     pub user: String,
+    /// libpq's spelling, so a profile file stays readable and a mode Slate
+    /// stops supporting reads back as a name rather than a number. Defaulted,
+    /// so profiles written before TLS existed load as `prefer` — which is what
+    /// they were connecting as.
+    #[serde(default)]
+    pub sslmode: Option<String>,
+    #[serde(default)]
+    pub root_certificate: Option<String>,
     #[serde(default)]
     pub open_query: Option<String>,
     #[serde(default)]
@@ -293,6 +301,8 @@ mod tests {
             port: Some(5432),
             database: "slate_dev".into(),
             user: "slate".into(),
+            sslmode: Some("verify-full".into()),
+            root_certificate: Some("/etc/ssl/rds.pem".into()),
             open_query: Some("daily".into()),
             open_objects: vec![
                 StoredObject {

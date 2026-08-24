@@ -57,6 +57,15 @@ require it, stop and raise it instead.
 6. **Errors describe what happened, not what to do about it.** "Connection
    refused: nothing is listening on `host:port`" and stop. No speculation about
    the user's machine, no process-list inspection.
+7. **An `sslmode` is never quietly weakened.** A connection either gets what it
+   asked for or fails saying which certificate check failed. This is a rule
+   because the failure is silent by construction: the driver's default is
+   `prefer`, and `prefer` with a connector that cannot do TLS hands back a
+   plaintext socket without even sending an SSLRequest — a cleartext password
+   under a UI reporting success. That was the bug for as long as `sslmode` was
+   dropped on the way in. If a mode cannot be honoured, refuse it by name;
+   `tls::SslMode::parse` does that for `allow`, which libpq defines in an order
+   the driver cannot express.
 
 ---
 
@@ -68,7 +77,17 @@ gpui-component = { version = "=0.5.1", features = ["tree-sitter-languages"] }
 postgres = "0.19"          # blocking client, NOT tokio-postgres
 nucleo-matcher = "=0.3.1"  # fuzzy scoring; gpui-component ships no scorer
 icondata_lu = "=0.1.0"     # Lucide icon data; gpui-component ships no icon files
+rustls = "0.23"            # TLS; the driver ships none. default-features = false
+tokio-postgres-rustls = "0.14"
 ```
+
+**`default-features = false` on `rustls` is load-bearing.** Its defaults select
+the `aws-lc-rs` provider; `ring` is what is already linked through gpui. Every
+crate in the graph has to agree on one or both get built, and `aws-lc-rs` builds
+C and assembly. `rustls`, `rustls-native-certs` and `rustls-pemfile` were all
+already transitive dependencies, which is why TLS is `rustls` and not
+`native-tls` — see the module header in `src/tls.rs` for the rest of that
+reasoning.
 
 **Pins are exact and the lockfile is committed. Do not bump without being asked.**
 gpui is pre-1.0 and breaks on minor bumps; `main` has declared `0.2.2` for ten
@@ -78,6 +97,12 @@ months, which is a stalled version field rather than parity with the release.
 Dispatch. A tokio future on `cx.background_executor().spawn(...)` _panics_ the
 moment it touches a socket or timer. Database work uses the blocking `postgres`
 client, which owns its runtime internally, spawned onto the background executor.
+
+`tokio-rustls` in the tree is not a breach of that rule, and the rule is why:
+the TLS handshake is a future belonging to the connection, so it runs inside the
+runtime the blocking client already owns, on the same thread as the connect it
+is part of. Nothing tokio-shaped reaches GPUI's executor. Adding a tokio future
+anywhere Slate spawns one still panics.
 
 **Do not fork gpui.** Decided in the spec, §7.1.
 

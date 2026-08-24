@@ -17,6 +17,9 @@ use std::time::{Duration, Instant};
 
 use postgres::{Client, NoTls, SimpleQueryMessage, config::Host};
 
+use crate::tls;
+pub use crate::tls::SslMode;
+
 const RELATIONS_SQL: &str = "
 SELECT
     namespace.nspname AS schema_name,
@@ -170,6 +173,10 @@ pub struct ConnectionConfig {
     /// Blank is valid and must never be warned about — cloud IAM auth issues a
     /// short-lived token as the password, or none at all.
     pub password: String,
+    pub sslmode: SslMode,
+    /// libpq's `sslrootcert`. Replaces the platform's trust store rather than
+    /// adding to it, and only consulted by the two verifying modes.
+    pub root_certificate: Option<String>,
 }
 
 impl ConnectionConfig {
@@ -184,15 +191,34 @@ impl ConnectionConfig {
             || url_parts
                 .query_pairs()
                 .any(|(key, _)| key.as_ref() == "port");
-        // Ahead of the driver's own parser, which accepts only `disable`,
-        // `prefer` and `require`: a `verify-full` URL dies there as "invalid
-        // connection string", naming neither the option nor the reason.
+        // The two keys Slate owns come out of the URL before the driver sees
+        // it. Its parser has a fixed key list and refuses anything outside it,
+        // so `sslrootcert` would die as "invalid connection string" and so
+        // would `sslmode=verify-full` — naming neither the option nor the
+        // reason. Slate carries both itself and re-emits an `sslmode` the
+        // driver does know.
+        let mut sslmode = SslMode::default();
+        let mut root_certificate = None;
+        let mut passed_through = Vec::new();
         for (key, value) in url_parts.query_pairs() {
-            if key.as_ref() == "sslmode" {
-                reject_unsupported_sslmode(value.as_ref())?;
+            match key.as_ref() {
+                "sslmode" => sslmode = SslMode::parse(value.as_ref())?,
+                "sslrootcert" => {
+                    root_certificate = Some(value.trim().to_string()).filter(|p| !p.is_empty());
+                }
+                _ => passed_through.push((key.into_owned(), value.into_owned())),
             }
         }
-        let parsed: postgres::Config = url
+        let mut without_tls_keys = url_parts.clone();
+        without_tls_keys.set_query(None);
+        {
+            let mut query = without_tls_keys.query_pairs_mut();
+            for (key, value) in &passed_through {
+                query.append_pair(key, value);
+            }
+        }
+        let parsed: postgres::Config = without_tls_keys
+            .as_str()
             .parse()
             .map_err(|error| format!("Connection URL is invalid: {error}"))?;
         let host = match parsed.get_hosts() {
@@ -232,6 +258,8 @@ impl ConnectionConfig {
             database,
             user,
             password,
+            sslmode,
+            root_certificate,
         })
     }
 
@@ -252,6 +280,10 @@ impl ConnectionConfig {
         if !self.password.is_empty() {
             parts.push(format!("password={}", quote(&self.password)));
         }
+        // The driver's three rungs, not Slate's five. Verification above
+        // `require` belongs to the connector `tls::connector` builds, and
+        // handing the driver a word it does not know fails the whole parse.
+        parts.push(format!("sslmode={}", self.sslmode.driver_mode()));
         // Without this the driver waits out the OS SYN retry budget, so a host
         // that resolves but drops packets pins the UI in "Connecting…" for
         // minutes with no cancel.
@@ -270,19 +302,6 @@ impl ConnectionConfig {
 fn quote(value: &str) -> String {
     let escaped = value.replace('\\', r"\\").replace('\'', r"\'");
     format!("'{escaped}'")
-}
-
-/// Slate connects with `NoTls`. The driver's default `sslmode` is `prefer`,
-/// which silently falls back to plaintext without even sending an SSLRequest —
-/// so a pasted `?sslmode=require` would put the user's credentials on the wire
-/// in the clear while the UI reported success. Refuse instead, until TLS lands.
-pub fn reject_unsupported_sslmode(mode: &str) -> Result<(), String> {
-    match mode.trim().to_ascii_lowercase().as_str() {
-        "" | "disable" | "prefer" => Ok(()),
-        other => Err(format!(
-            "sslmode={other} requires TLS, which Slate does not support yet."
-        )),
-    }
 }
 
 /// One column of a result set.
@@ -437,8 +456,20 @@ pub struct Connection {
 
 impl Connection {
     pub fn open(config: ConnectionConfig) -> Result<Self, DbError> {
-        let client = Client::connect(&config.connection_string(), NoTls)
-            .map_err(|error| connect_error(&error, &config))?;
+        // Two branches rather than a boxed connector: `Client::connect` is
+        // generic over it, and `NoTls` is a distinct type whose entire purpose
+        // is to refuse. Building one at all is what `disable` means.
+        let connector = tls::connector(config.sslmode, config.root_certificate.as_deref())
+            .map_err(|message| DbError {
+                message,
+                position: None,
+            })?;
+        let string = config.connection_string();
+        let client = match connector {
+            None => Client::connect(&string, NoTls),
+            Some(connector) => Client::connect(&string, connector),
+        }
+        .map_err(|error| connect_error(&error, &config))?;
 
         Ok(Self {
             client: Arc::new(Mutex::new(client)),
@@ -966,7 +997,27 @@ fn describe(error: &postgres::Error) -> String {
         return message;
     }
 
-    error.to_string()
+    // The driver's own words for a transport failure name a category and stop:
+    // "error performing TLS handshake". Which handshake problem is one link
+    // further down the source chain, and without it a certificate issued for
+    // another host and one signed by nobody we trust read identically.
+    let message = error.to_string();
+    match root_cause(error).filter(|cause| !message.contains(cause.as_str())) {
+        Some(cause) => format!("{message}: {cause}"),
+        None => message,
+    }
+}
+
+/// The last link in an error's source chain, which is where the driver's
+/// wrappers finally give way to what actually went wrong.
+fn root_cause(error: &postgres::Error) -> Option<String> {
+    let mut source = std::error::Error::source(error);
+    let mut deepest = None;
+    while let Some(current) = source {
+        deepest = Some(current.to_string());
+        source = current.source();
+    }
+    deepest
 }
 
 fn io_source(error: &postgres::Error) -> Option<&std::io::Error> {
@@ -991,6 +1042,8 @@ mod tests {
             database: "slate_test".into(),
             user: "someone".into(),
             password: String::new(),
+            sslmode: SslMode::default(),
+            root_certificate: None,
         }
     }
 
@@ -1004,6 +1057,10 @@ mod tests {
             database: std::env::var("PGDATABASE").expect("PGDATABASE is required"),
             user: std::env::var("PGUSER").expect("PGUSER is required"),
             password: std::env::var("PGPASSWORD").unwrap_or_default(),
+            // The compose database speaks no TLS, and these tests are the one
+            // place a plaintext connection is the point.
+            sslmode: SslMode::Disable,
+            root_certificate: None,
         }
     }
 
@@ -1055,7 +1112,8 @@ mod tests {
         let config = config();
         assert_eq!(
             config.connection_string(),
-            "host='db.example.test' dbname='slate_test' user='someone' port=8432 connect_timeout=10"
+            "host='db.example.test' dbname='slate_test' user='someone' port=8432 \
+             sslmode=prefer connect_timeout=10"
         );
     }
 
@@ -1129,6 +1187,8 @@ mod tests {
                 database: "slate_test".into(),
                 user: "person@example.com".into(),
                 password: String::new(),
+                sslmode: SslMode::default(),
+                root_certificate: None,
             }
         );
     }
@@ -1293,18 +1353,55 @@ mod tests {
     }
 
     #[test]
-    fn a_url_demanding_tls_is_refused_rather_than_sent_in_the_clear() {
-        // The driver's own parser knows only `disable`, `prefer` and
-        // `require`, so the two `verify-` modes are the ones that prove Slate
-        // speaks before the generic "invalid connection string" can.
-        for mode in ["require", "verify-ca", "verify-full"] {
+    fn a_url_carries_its_sslmode_through_instead_of_losing_it() {
+        // The whole hazard this replaced: the mode used to be dropped on the
+        // way in, so the rebuilt string defaulted to `prefer`, and `prefer`
+        // with a connector that cannot do TLS returns a plaintext socket
+        // without even sending an SSLRequest. A demand for encryption became a
+        // cleartext password and a UI that said Connected.
+        for (mode, expected) in [
+            ("disable", SslMode::Disable),
+            ("prefer", SslMode::Prefer),
+            ("require", SslMode::Require),
+            ("verify-ca", SslMode::VerifyCa),
+            ("verify-full", SslMode::VerifyFull),
+        ] {
             let url = format!("postgresql://someone@db.example.test/slate_test?sslmode={mode}");
-
             assert_eq!(
-                ConnectionConfig::from_url(&url).unwrap_err(),
-                format!("sslmode={mode} requires TLS, which Slate does not support yet.")
+                ConnectionConfig::from_url(&url).unwrap().sslmode,
+                expected,
+                "{url}"
             );
         }
+    }
+
+    #[test]
+    fn the_two_keys_slate_owns_are_kept_away_from_the_drivers_parser() {
+        // The driver knows neither `verify-full` nor `sslrootcert` and refuses
+        // the whole string for either, naming nothing useful. Both have to be
+        // taken out of the URL before it reaches that parser, and everything
+        // else has to survive the round trip.
+        let config = ConnectionConfig::from_url(
+            "postgresql://someone@db.example.test:5433/slate_test\
+             ?sslmode=verify-full&sslrootcert=/tmp/rds.pem&application_name=slate",
+        )
+        .unwrap();
+
+        assert_eq!(config.sslmode, SslMode::VerifyFull);
+        assert_eq!(config.root_certificate.as_deref(), Some("/tmp/rds.pem"));
+        assert_eq!(config.port, Some(5433));
+        assert_eq!(config.user, "someone");
+    }
+
+    #[test]
+    fn a_url_asking_for_a_mode_slate_cannot_honour_says_so() {
+        assert!(
+            ConnectionConfig::from_url(
+                "postgresql://someone@db.example.test/slate_test?sslmode=allow"
+            )
+            .unwrap_err()
+            .contains("allow")
+        );
     }
 
     #[test]
@@ -1336,12 +1433,28 @@ mod tests {
     }
 
     #[test]
-    fn a_url_without_tls_still_parses() {
-        for mode in ["disable", "prefer"] {
-            let url = format!("postgresql://someone@db.example.test/slate_test?sslmode={mode}");
+    fn the_driver_is_only_ever_handed_a_mode_it_knows() {
+        // Slate's five rungs collapse to the driver's three on the wire; the
+        // rest is the verifier's job. A word the driver does not know fails
+        // its parse and takes the whole connection with it.
+        for (mode, expected) in [
+            (SslMode::Disable, "sslmode=disable"),
+            (SslMode::Prefer, "sslmode=prefer"),
+            (SslMode::Require, "sslmode=require"),
+            (SslMode::VerifyCa, "sslmode=require"),
+            (SslMode::VerifyFull, "sslmode=require"),
+        ] {
+            let config = ConnectionConfig {
+                sslmode: mode,
+                ..config()
+            };
+            let string = config.connection_string();
+            assert!(string.contains(expected), "{mode:?} produced {string}");
+            // And it parses: this is the check that would have caught handing
+            // the driver "verify-full".
             assert!(
-                ConnectionConfig::from_url(&url).is_ok(),
-                "sslmode={mode} should be accepted"
+                string.parse::<postgres::Config>().is_ok(),
+                "{mode:?} produced an unparsable string: {string}"
             );
         }
     }
@@ -1474,6 +1587,38 @@ mod tests {
             error.message,
             "Catalog query returned unknown relation kind unknown."
         );
+    }
+
+    /// What each mode does against a server with no TLS configured, which is
+    /// what the compose development database is.
+    ///
+    /// This is the test the old `NoTls` code could not have passed. `prefer`
+    /// now negotiates and falls back, so it still connects; `require` and above
+    /// refuse to be talked down to plaintext and say why. Before, every mode
+    /// silently produced the same cleartext socket.
+    #[test]
+    #[ignore = "requires the repository development database configured through PG*"]
+    fn live_only_the_modes_that_tolerate_plaintext_reach_a_server_without_tls() {
+        let connect = |sslmode| {
+            Connection::open(ConnectionConfig {
+                sslmode,
+                ..live_config()
+            })
+        };
+
+        assert!(connect(SslMode::Disable).is_ok());
+        assert!(connect(SslMode::Prefer).is_ok());
+
+        for mode in [SslMode::Require, SslMode::VerifyCa, SslMode::VerifyFull] {
+            let Err(error) = connect(mode) else {
+                panic!("{mode:?} must not fall back to plaintext");
+            };
+            assert!(
+                error.message.to_lowercase().contains("tls"),
+                "{mode:?} failed without saying TLS was the reason: {}",
+                error.message
+            );
+        }
     }
 
     #[test]

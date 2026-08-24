@@ -7,6 +7,7 @@ mod store;
 
 mod icons;
 mod theme;
+mod tls;
 
 use std::{borrow::Cow, collections::HashMap, sync::Arc};
 
@@ -29,7 +30,8 @@ use gpui_component::{
 };
 
 use db::{
-    Catalog, Connection, ConnectionConfig, DbError, RelationKind, Routine, RoutineKind, Structure,
+    Catalog, Connection, ConnectionConfig, DbError, RelationKind, Routine, RoutineKind, SslMode,
+    Structure,
 };
 use explorer::{
     ExplorerLeaf, ExplorerTarget, ObjectKind, PREVIEW_ROW_LIMIT, ROW_LIMITS, preview_sql,
@@ -146,6 +148,8 @@ impl Profile {
             port: self.config.port,
             database: self.config.database.clone(),
             user: self.config.user.clone(),
+            sslmode: Some(self.config.sslmode.as_str().to_string()),
+            root_certificate: self.config.root_certificate.clone(),
             open_query: self.session.open_query.clone(),
             open_objects,
         }
@@ -595,6 +599,10 @@ struct ConnectionForm {
     database: Entity<InputState>,
     user: Entity<InputState>,
     password: Entity<InputState>,
+    sslmode: SslMode,
+    /// Only reachable while the mode consults one, so the field cannot sit
+    /// there filled in and doing nothing.
+    root_certificate: Entity<InputState>,
     error: Option<String>,
 }
 
@@ -643,6 +651,14 @@ impl ConnectionForm {
                 .masked(true)
         });
 
+        let root_certificate = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Root certificate file (optional)")
+                .default_value(value(
+                    config.and_then(|config| config.root_certificate.as_deref()),
+                ))
+        });
+
         Self {
             url,
             name,
@@ -651,6 +667,8 @@ impl ConnectionForm {
             database,
             user,
             password,
+            sslmode: config.map(|config| config.sslmode).unwrap_or_default(),
+            root_certificate,
             error: None,
         }
     }
@@ -683,6 +701,14 @@ impl ConnectionForm {
             )
         };
 
+        // Kept only where it is consulted. A path left behind by switching down
+        // to `require` would be stored and shown as though it were in force.
+        let root_certificate = self
+            .sslmode
+            .checks_certificate()
+            .then(|| read(&self.root_certificate))
+            .filter(|path| !path.is_empty());
+
         Ok((
             name,
             ConnectionConfig {
@@ -691,6 +717,8 @@ impl ConnectionForm {
                 database,
                 user,
                 password: self.password.read(cx).unmask_value().to_string(),
+                sslmode: self.sslmode,
+                root_certificate,
             },
         ))
     }
@@ -869,20 +897,36 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // No mode at all is a profile written before Slate had TLS, and
+        // `prefer` is exactly what it was connecting as. A mode this build
+        // cannot read is the other case, and it fails closed: whatever was
+        // asked for, it was not something weaker than the strictest rung.
+        let (sslmode, unreadable_mode) = match stored.sslmode.as_deref() {
+            None => (SslMode::default(), None),
+            Some(stored) => match SslMode::parse(stored) {
+                Ok(mode) => (mode, None),
+                Err(message) => (SslMode::VerifyFull, Some(message)),
+            },
+        };
         let config = ConnectionConfig {
             host: stored.host,
             port: stored.port,
             database: stored.database,
             user: stored.user,
             password: String::new(),
+            sslmode,
+            root_certificate: stored.root_certificate,
         };
-        let session = Session::new(
+        let mut session = Session::new(
             stored.id.clone(),
             stored.open_query,
             stored.open_objects,
             window,
             cx,
         );
+        if let Some(message) = unreadable_mode {
+            session.notice = Some(format!("{message} Connecting as verify-full."));
+        }
         self.profiles.push(Profile {
             id: stored.id,
             name: stored.name,
@@ -956,14 +1000,55 @@ impl Workspace {
             (&form.database, config.database),
             (&form.user, config.user),
             (&form.password, config.password),
+            (
+                &form.root_certificate,
+                config.root_certificate.unwrap_or_default(),
+            ),
         ] {
             let input = input.clone();
             input.update(cx, |input, cx| input.set_value(value, window, cx));
         }
         if let Some(form) = &mut self.form {
+            // The URL's own mode, so pasting one that demands verification
+            // cannot land in a form still set to `prefer`.
+            form.sslmode = config.sslmode;
             form.error = None;
         }
         cx.notify();
+    }
+
+    /// One chip per mode, weakest first. A row of five words rather than a
+    /// dropdown: the choice is the security of the connection, and it should be
+    /// legible without opening anything. No keybinding, so no action type —
+    /// this is only reachable while the form is on screen.
+    fn sslmode_chip(&self, mode: SslMode, cx: &mut Context<Self>) -> AnyElement {
+        let t = *theme(cx);
+        let selected = self.form.as_ref().is_some_and(|form| form.sslmode == mode);
+        div()
+            .id(mode.as_str())
+            .flex()
+            .items_center()
+            .h(px(24.))
+            .px(px(layout::SPACE_SM))
+            .rounded(px(layout::RADIUS_CONTROL))
+            .text_size(px(layout::TEXT_SM))
+            .whitespace_nowrap()
+            .map(|chip| {
+                if selected {
+                    chip.bg(t.element_active).text_color(t.text)
+                } else {
+                    chip.text_color(t.text_muted)
+                        .hover(|style| style.bg(t.element_hover))
+                }
+            })
+            .child(mode.label())
+            .on_click(cx.listener(move |workspace, _, _, cx| {
+                if let Some(form) = &mut workspace.form {
+                    form.sslmode = mode;
+                    cx.notify();
+                }
+            }))
+            .into_any_element()
     }
 
     fn connect(&mut self, _: &ClickEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -2637,6 +2722,43 @@ impl Workspace {
                     .child(self.form_field("Database", &form.database, cx))
                     .child(self.form_field("Username", &form.user, cx))
                     .child(self.form_field("Password", &form.password, cx))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(layout::SPACE_XS))
+                            .child(
+                                div()
+                                    .text_size(px(layout::TEXT_SM))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(t.text_muted)
+                                    .child("Encryption"),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .gap(px(layout::SPACE_XS))
+                                    .children(
+                                        SslMode::ALL
+                                            .map(|mode| self.sslmode_chip(mode, cx)),
+                                    ),
+                            )
+                            // Five words do not say which ones check who
+                            // answered, and that is the whole difference
+                            // between them.
+                            .child(
+                                div()
+                                    .text_size(px(layout::TEXT_XS))
+                                    .text_color(t.text_faint)
+                                    .child(form.sslmode.explanation()),
+                            ),
+                    )
+                    // Only where it is consulted: on `require` a certificate
+                    // file changes nothing, and a field that changes nothing
+                    // reads as though it does.
+                    .children(form.sslmode.checks_certificate().then(|| {
+                        self.form_field("Root certificate", &form.root_certificate, cx)
+                    }))
                     .children(message.map(|message| {
                         div()
                             .text_size(px(layout::TEXT_SM))
@@ -4688,9 +4810,14 @@ fn connection_config_from_environment() -> Result<Option<ConnectionConfig>, Stri
         ));
     };
 
-    if let Ok(sslmode) = std::env::var("PGSSLMODE") {
-        db::reject_unsupported_sslmode(&sslmode)?;
-    }
+    let sslmode = match std::env::var("PGSSLMODE") {
+        Ok(sslmode) => SslMode::parse(&sslmode)?,
+        Err(_) => SslMode::default(),
+    };
+    let root_certificate = std::env::var("PGSSLROOTCERT")
+        .ok()
+        .map(|path| path.trim().to_string())
+        .filter(|path| !path.is_empty());
 
     let port = port
         .map(|port| {
@@ -4705,6 +4832,8 @@ fn connection_config_from_environment() -> Result<Option<ConnectionConfig>, Stri
         database,
         user,
         password: std::env::var("PGPASSWORD").unwrap_or_default(),
+        sslmode,
+        root_certificate,
     }))
 }
 
