@@ -4854,7 +4854,7 @@ fn main() {
         cx.bind_keys([
             KeyBinding::new("cmd-enter", RunQuery, None),
             KeyBinding::new("cmd-s", SaveQuery, None),
-            KeyBinding::new("cmd-n", NewQuery, None),
+            KeyBinding::new("cmd-t", NewQuery, None),
             KeyBinding::new("cmd-shift-n", NewConnection, None),
             KeyBinding::new("cmd-w", CloseTab, None),
             KeyBinding::new("ctrl-tab", NextProfile, None),

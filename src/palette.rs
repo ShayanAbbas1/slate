@@ -258,7 +258,7 @@ fn command_items(workspace: &Workspace, profile: &Profile, cx: &App) -> Vec<Item
     let runnable = session.editor(session.active).is_some();
     let mut items = vec![Item::command(
         "New query",
-        "⌘N",
+        "⌘T",
         icon::SCRATCH_QUERY,
         Command::NewQuery,
     )];
