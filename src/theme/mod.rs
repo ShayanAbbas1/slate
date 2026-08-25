@@ -16,6 +16,8 @@
 //! as a hole rather than a surface. Tone steps, not hairlines, are what
 //! separate the planes; borders are reserved for floating overlays. The one
 //! structural seam, the sidebar edge, is drawn by its drag handle.
+//!
+//! The window is vibrant, so every plane is also a glass: see [`Theme::frost`].
 
 pub mod color;
 
@@ -146,6 +148,27 @@ const NEUTRAL_CHROMA: f32 = 0.004;
 const HAIRLINE_DARK: f32 = 0.09;
 const HAIRLINE_LIGHT: f32 = 0.12;
 
+/// The glass, for the themes that ask for it. The window background is the
+/// blurred desktop, so each plane is a tint over it rather than a fill, and the
+/// elevation rule reads a second way: the closer a surface is to the data, the
+/// less it lets through.
+///
+/// The tints stack — [`Theme::frost`] is painted once by the window root and
+/// everything else sits on it — so these are what shows over the frost, not
+/// what reaches the desktop.
+///
+/// They are close together, and that is the whole trick. What a plane
+/// transmits is not a look, it is how much it *moves* — a surface at 22% is
+/// restated by whatever the window happens to be sitting on, so a sidebar that
+/// transmits twice what the editor does is not one step lighter, it is a
+/// shifting bright patch beside a stable dark one. Stacked, the transmissions
+/// multiply: chrome is `1 - FROST`, and the planes over it are that again
+/// times their own. Keeping the three within a few points of each other is
+/// what lets the tone ramp, rather than the desktop, say which plane is which.
+const FROST_ALPHA: f32 = 0.86;
+const PANEL_ALPHA: f32 = 0.35;
+const DATA_ALPHA: f32 = 0.55;
+
 fn neutral(lightness: f32) -> Srgb {
     Oklch::new(lightness, NEUTRAL_CHROMA, NEUTRAL_HUE).to_srgb()
 }
@@ -169,6 +192,10 @@ const TRANSPARENT: Rgba = Rgba {
 pub struct Theme {
     pub name: &'static str,
     pub appearance: Appearance,
+    /// Whether this theme paints on the blurred desktop rather than on itself.
+    /// A glass theme's planes are tints, its window background is vibrant, and
+    /// its palette has to be built for that — see [`Theme::glass`].
+    pub is_glass: bool,
 
     /// The content plane, and the brightest tone: the results. The data is
     /// what Slate exists to show, so it gets the most light.
@@ -228,8 +255,8 @@ pub struct Theme {
 impl Theme {
     /// Every theme Slate ships, in the order the switcher cycles them. The
     /// first is the default.
-    pub fn all() -> [Self; 2] {
-        [Self::dark(), Self::light()]
+    pub fn all() -> [Self; 3] {
+        [Self::glass(), Self::dark(), Self::light()]
     }
 
     /// The theme after this one, by name. Falls back to the default, so a theme
@@ -244,6 +271,43 @@ impl Theme {
         themes[index]
     }
 
+    /// The window frost: the chrome tone over the blurred desktop, and the
+    /// plane every other surface is layered on. Chrome — sidebar, titlebar, tab
+    /// strip, status bar — paints nothing of its own and is this.
+    pub fn frost(self) -> Rgba {
+        self.surface.alpha(self.tint(FROST_ALPHA))
+    }
+
+    /// The editor's page, as a tint over [`Theme::frost`].
+    pub fn panel_glass(self) -> Rgba {
+        self.panel.alpha(self.tint(PANEL_ALPHA))
+    }
+
+    /// The results plane, as a tint over [`Theme::frost`]. The most solid of the
+    /// three: a dense grid read against a moving wallpaper is not read at all.
+    pub fn data_glass(self) -> Rgba {
+        self.bg.alpha(self.tint(DATA_ALPHA))
+    }
+
+    /// An opaque theme has no desktop behind it to let through, so every tint
+    /// collapses to its own fill and the planes paint exactly as they did
+    /// before glass existed. One gate here rather than a branch at each of the
+    /// nine call sites.
+    fn tint(self, alpha: f32) -> f32 {
+        if self.is_glass { alpha } else { 1.0 }
+    }
+
+    /// What the window's own background is. A glass theme sits on the blurred
+    /// desktop; every other theme paints its own chrome and would only show the
+    /// raw desktop through the gaps.
+    pub fn window_background(self) -> gpui::WindowBackgroundAppearance {
+        if self.is_glass {
+            gpui::WindowBackgroundAppearance::Blurred
+        } else {
+            gpui::WindowBackgroundAppearance::Opaque
+        }
+    }
+
     pub fn apply_to_components(self, cx: &mut gpui::App) {
         let component = gpui_component::Theme::global_mut(cx);
         component.shadow = false;
@@ -254,7 +318,10 @@ impl Theme {
         component.font_family = ".ZedSans".into();
         component.mono_font_family = ".ZedMono".into();
 
-        component.colors.background = self.bg.into();
+        // The one plane painted below Slate's own tree, by `Root`. It is the
+        // frost, so removing a `bg` from a chrome element uncovers glass rather
+        // than a hole.
+        component.colors.background = self.frost().into();
         component.colors.foreground = self.text.into();
         component.colors.input = self.border.into();
         component.colors.border = self.border.into();
@@ -298,7 +365,9 @@ impl Theme {
         component.colors.scrollbar = self.panel.into();
         component.colors.scrollbar_thumb = self.border_strong.into();
         component.colors.scrollbar_thumb_hover = self.element_active.into();
-        component.colors.table = self.bg.into();
+        // The results pane already paints `data_glass` behind the grid, and a
+        // second tint over it would only stack toward opaque.
+        component.colors.table = TRANSPARENT.into();
         component.colors.table_active = self.selection.into();
         component.colors.table_active_border = self.accent.into();
         component.colors.table_even = self.element_hover.into();
@@ -369,7 +438,13 @@ impl Theme {
                 Appearance::Light => ThemeMode::Light,
             },
             style: HighlightThemeStyle {
-                editor_background: Some(self.panel.into()),
+                // Transparent, not the editor's tone. The highlighter fills the
+                // gutter and the ghost line with this, and it fills them over a
+                // page that has already painted itself -- so naming a colour
+                // here only repaints the plane, at full opacity, on top of the
+                // tint that was supposed to be showing. That is invisible in an
+                // opaque theme and is the whole editor in a glass one.
+                editor_background: Some(TRANSPARENT.into()),
                 editor_foreground: Some(self.text.into()),
                 editor_active_line: Some(self.element_hover.into()),
                 editor_line_number: Some(self.text_faint.into()),
@@ -380,13 +455,52 @@ impl Theme {
         })
     }
 
+    /// The vibrant theme, and the default: the window background is the blurred
+    /// desktop and every plane is a tint over it rather than a fill.
+    ///
+    /// Near-black where [`Theme::dark`] is deliberately grey, which reverses
+    /// that theme's one rule for a reason. A dark plane reads as a void only
+    /// when there is nothing behind it; over vibrancy there is a whole desktop
+    /// behind it, and near-black is what turns that into smoked glass. A mid
+    /// grey turns it into dirt — the wallpaper's own light lands in the same
+    /// band as the tone and the two never resolve into either one.
+    ///
+    /// The steps between the planes are half of dark's for the same reason:
+    /// they are read through a moving backdrop, and tone that survives on an
+    /// opaque page reads as patchiness on a transparent one. What separates the
+    /// planes here is mostly how much they let through — see [`FROST_ALPHA`].
+    pub fn glass() -> Self {
+        Self {
+            name: "Slate Glass",
+            is_glass: true,
+
+            // Chrome goes near-black and stays there — it is the plane with
+            // nothing to read on it, so it can afford to be mostly desktop.
+            // The two that carry text climb back out, because a tone below the
+            // frost's own composite reads as a hole punched in the window: the
+            // frost carries the desktop's light, and a tint darker than that
+            // subtracts it.
+            bg: neutral(0.275),
+            panel: neutral(0.215),
+            surface: neutral(0.130),
+            overlay: neutral(0.300),
+
+            control: neutral(0.340),
+
+            ..Self::dark()
+        }
+    }
+
     /// The tones run chrome → editor → results, dark grey to lighter grey:
     /// the answer gets the light, the prompt sits a step behind it. Near-black
-    /// is deliberately absent: a plane at 4% lightness reads as a void.
+    /// is deliberately absent: a plane at 4% lightness reads as a void — which
+    /// holds for a page that paints itself, and is exactly what [`Theme::glass`]
+    /// gets to ignore.
     pub fn dark() -> Self {
         Self {
             name: "Slate Dark",
             appearance: Appearance::Dark,
+            is_glass: false,
 
             bg: neutral(0.300),
             panel: neutral(0.260),
@@ -432,6 +546,7 @@ impl Theme {
         Self {
             name: "Slate Light",
             appearance: Appearance::Light,
+            is_glass: false,
 
             bg: WHITE,
             panel: neutral(0.972),
@@ -590,8 +705,22 @@ mod tests {
         // rectangle. Measured in levels rather than contrast ratio, because at
         // near-black the ratio's flare term compresses every step into noise —
         // #0a and #16 differ by 12 levels and score 1.09.
+        //
+        // Opaque themes only, and not for want of trying: a glass theme has no
+        // fixed answer to grade. Its planes are tints over a frost that is
+        // itself transparent, so a plane's step over the one behind it is
+        // `alpha * (tint - frost)` — and `frost` moves with the wallpaper. Over
+        // a dark desktop the planes compress toward each other; over a bright
+        // one the step inverts and the editor lands darker than the sidebar it
+        // is supposed to sit in front of. No palette fixes that, because the
+        // term that flips is the desktop. It is what vibrancy costs.
+        //
+        // What still holds for glass is checked elsewhere: the tone ramp runs
+        // the right way in `elevation_runs_the_right_way_in_every_theme`, and
+        // every text token clears WCAG against its raw tint, with no credit for
+        // whatever light the wallpaper happens to add.
         let level = |c: Srgb| (c.r + c.g + c.b) / 3.0 * 255.0;
-        for t in Theme::all() {
+        for t in Theme::all().into_iter().filter(|t| !t.is_glass) {
             for (name, near, far) in [
                 ("bg to panel", t.bg, t.panel),
                 ("panel to surface", t.panel, t.surface),

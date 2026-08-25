@@ -103,7 +103,6 @@ struct Editing {
 
 /// One row's worth of pending edits, resolved to real column names and ready
 /// for `sql::update_row`. Alias resolution happens here so the caller does none.
-#[allow(dead_code)]
 pub struct PendingRow {
     pub schema: String,
     pub table: String,
@@ -204,9 +203,6 @@ impl ResultGrid {
 /// The editing half of the grid: what the user has changed, and not one
 /// statement of SQL. Generating and running that is the workspace's job, which
 /// is why every one of these is computable without a window.
-// The caller is the UI wiring in `main.rs`, which does not exist yet. Landing
-// the delegate half first means the wiring has nothing left to invent.
-#[allow(dead_code)]
 impl ResultGrid {
     /// The cell `Enter` acts on, if the user has reached one. `None` on a
     /// result set nobody has touched yet, and on every new one.

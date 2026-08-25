@@ -32,6 +32,10 @@ pub struct StoredProfile {
     pub sslmode: Option<String>,
     #[serde(default)]
     pub root_certificate: Option<String>,
+    /// The editor's zoom. Absent is a profile written before zoom was kept, and
+    /// reads back as the default -- which is what it was showing.
+    #[serde(default)]
+    pub editor_font_size: Option<f32>,
     #[serde(default)]
     pub open_query: Option<String>,
     #[serde(default)]
@@ -303,6 +307,7 @@ mod tests {
             user: "slate".into(),
             sslmode: Some("verify-full".into()),
             root_certificate: Some("/etc/ssl/rds.pem".into()),
+            editor_font_size: Some(16.0),
             open_query: Some("daily".into()),
             open_objects: vec![
                 StoredObject {
@@ -327,6 +332,35 @@ mod tests {
         let decoded: ProfileFile = toml::from_str(&text).expect("profiles must decode");
 
         assert_eq!(decoded.profiles, vec![profile]);
+    }
+
+    #[test]
+    fn a_profile_written_before_a_field_existed_still_loads() {
+        // Every field added after the first release is `serde(default)`, and this
+        // is the file already on disk for anyone who has run Slate before. A
+        // decode error here reads as "no profiles", which is what the next save
+        // would then write back.
+        let profiles = decode_profiles(
+            "\
+[[profiles]]
+id = \"slate-dev\"
+name = \"slate_dev\"
+host = \"127.0.0.1\"
+port = 55432
+database = \"slate_dev\"
+user = \"slate\"
+sslmode = \"prefer\"
+open_objects = []
+",
+        )
+        .expect("a profile predating the optional fields must load");
+
+        let [profile] = &profiles[..] else {
+            panic!("expected exactly one profile, got {}", profiles.len());
+        };
+        assert_eq!(profile.editor_font_size, None);
+        assert_eq!(profile.root_certificate, None);
+        assert_eq!(profile.open_query, None);
     }
 
     #[test]

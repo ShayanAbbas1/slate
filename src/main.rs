@@ -4,6 +4,7 @@ mod palette;
 mod result_grid;
 mod sql;
 mod store;
+mod views;
 
 mod icons;
 mod theme;
@@ -24,8 +25,8 @@ use gpui_component::{
     input::{Input, InputEvent, InputState},
     kbd::Kbd,
     list::{List, ListEvent, ListItem, ListState},
-    resizable::{h_resizable, resizable_panel, v_resizable},
-    table::{Table, TableDelegate, TableEvent, TableState},
+    resizable::{h_resizable, resizable_panel},
+    table::{TableEvent, TableState},
     tree::{TreeState, tree as render_tree},
 };
 
@@ -34,7 +35,7 @@ use db::{
     Structure,
 };
 use explorer::{
-    ExplorerLeaf, ExplorerTarget, ObjectKind, PREVIEW_ROW_LIMIT, ROW_LIMITS, preview_sql,
+    ExplorerLeaf, ExplorerTarget, ObjectKind, PREVIEW_ROW_LIMIT, preview_sql,
     tree as build_explorer_tree,
 };
 use icons::{Icons, icon};
@@ -150,6 +151,7 @@ impl Profile {
             user: self.config.user.clone(),
             sslmode: Some(self.config.sslmode.as_str().to_string()),
             root_certificate: self.config.root_certificate.clone(),
+            editor_font_size: Some(self.session.editor_font_size),
             open_query: self.session.open_query.clone(),
             open_objects,
         }
@@ -227,6 +229,7 @@ impl Session {
     fn new(
         id: String,
         open_query: Option<String>,
+        editor_font_size: f32,
         pending_objects: Vec<store::StoredObject>,
         window: &mut Window,
         cx: &mut Context<Workspace>,
@@ -297,7 +300,7 @@ impl Session {
             pending_delete: None,
             pending_close: None,
             notice,
-            editor_font_size: EDITOR_FONT_SIZE_DEFAULT,
+            editor_font_size,
             last_query: None,
             apply_review: None,
         }
@@ -357,6 +360,23 @@ impl Session {
                 }
             }
         }
+    }
+
+    /// Drop every confirmation and half-finished prompt this session is holding.
+    ///
+    /// All four name the buffer or tab they were raised over, so leaving one
+    /// standing across a context change offers to delete one query while another
+    /// is on screen. One method rather than a clear at each site, because the
+    /// two callers had drifted apart: switching profiles left `naming` set with
+    /// `save_name_needs_focus` already spent, which renders the name prompt and
+    /// then hands focus to nothing at all — and a window with nothing focused
+    /// has no dispatch path, so the keyboard goes dead until something is
+    /// clicked.
+    fn clear_prompts(&mut self) {
+        self.pending_delete = None;
+        self.pending_close = None;
+        self.naming = false;
+        self.save_name_needs_focus = false;
     }
 
     fn promote(&mut self, id: u64) -> bool {
@@ -848,6 +868,21 @@ impl Workspace {
             .find(|profile| profile.id == id && profile.generation == generation)
     }
 
+    /// A notice describes what happened to the last thing the user asked for, so
+    /// asking for the next thing takes it down. Otherwise a refusal like "this
+    /// column cannot be edited" sits in the status bar for the rest of the
+    /// session.
+    ///
+    /// Called from the gestures that run SQL rather than from
+    /// `execute_and_then`, because a statement Slate runs on its own — restoring
+    /// a tab at startup — would otherwise clear a notice nobody has read yet,
+    /// and one of those says the connection came up weaker than it asked for.
+    fn clear_notice(&mut self) {
+        if let Some(profile) = self.profile_mut() {
+            profile.session.notice = None;
+        }
+    }
+
     fn note(&mut self, message: String, cx: &mut Context<Self>) {
         if let Some(profile) = self.profile_mut() {
             profile.session.notice = Some(message);
@@ -866,18 +901,31 @@ impl Workspace {
     }
 
     fn reset_editor_zoom(&mut self, _: &ResetEditorZoom, _: &mut Window, cx: &mut Context<Self>) {
-        if let Some(profile) = self.profile_mut() {
-            profile.session.editor_font_size = EDITOR_FONT_SIZE_DEFAULT;
-            cx.notify();
-        }
+        self.set_editor_zoom(EDITOR_FONT_SIZE_DEFAULT, cx);
     }
 
     fn adjust_editor_zoom(&mut self, delta: f32, cx: &mut Context<Self>) {
-        if let Some(profile) = self.profile_mut() {
-            profile.session.editor_font_size =
-                adjusted_editor_font_size(profile.session.editor_font_size, delta);
-            cx.notify();
+        let Some(current) = self
+            .profile()
+            .map(|profile| profile.session.editor_font_size)
+        else {
+            return;
+        };
+        self.set_editor_zoom(adjusted_editor_font_size(current, delta), cx);
+    }
+
+    /// Written through to the profile, because a zoom that resets on relaunch is
+    /// a setting the user has to make again every morning.
+    fn set_editor_zoom(&mut self, font_size: f32, cx: &mut Context<Self>) {
+        let Some(profile) = self.profile_mut() else {
+            return;
+        };
+        if profile.session.editor_font_size == font_size {
+            return;
         }
+        profile.session.editor_font_size = font_size;
+        self.remember_profiles(cx);
+        cx.notify();
     }
 
     fn remember_profiles(&mut self, cx: &mut Context<Self>) {
@@ -920,6 +968,7 @@ impl Workspace {
         let mut session = Session::new(
             stored.id.clone(),
             stored.open_query,
+            restored_editor_font_size(stored.editor_font_size),
             stored.open_objects,
             window,
             cx,
@@ -951,7 +1000,14 @@ impl Workspace {
             .map(|profile| profile.id.clone())
             .collect::<Vec<_>>();
         let id = store::profile_id(&name, &existing);
-        let session = Session::new(id.clone(), None, Vec::new(), window, cx);
+        let session = Session::new(
+            id.clone(),
+            None,
+            EDITOR_FONT_SIZE_DEFAULT,
+            Vec::new(),
+            window,
+            cx,
+        );
         let password = config.password.clone();
         self.profiles.push(Profile {
             id: id.clone(),
@@ -1204,7 +1260,7 @@ impl Workspace {
         self.pending_removal = None;
         if let Some(profile) = self.profile_mut() {
             profile.session.editor_needs_focus = true;
-            profile.session.pending_delete = None;
+            profile.session.clear_prompts();
         }
         self.connect_active(cx);
         cx.notify();
@@ -1386,10 +1442,7 @@ impl Workspace {
         else {
             return;
         };
-        let ObjectBody::Relation {
-            query, sort, limit, ..
-        } = &tab.body
-        else {
+        let ObjectBody::Relation { query, .. } = &tab.body else {
             return;
         };
         if !matches!(query, QueryState::Idle | QueryState::Failed(_)) {
@@ -1397,15 +1450,25 @@ impl Workspace {
         }
 
         let (schema, relation) = (tab.schema.clone(), tab.name.clone());
-        let sql = relation_sql(&schema, &relation, sort, *limit);
         self.load_structure(id, schema, relation, cx);
-        self.execute_sql(sql, Tab::Object(id), cx);
+        self.requery_relation(id, |_, _| true, cx);
     }
 
-    /// The statement behind a relation's tab: Slate's own preview, carrying the
-    /// sort the header clicks asked for. Regenerated rather than edited, so the
-    /// row limit and the quoting cannot drift out of one place.
-    fn relation_sort(&mut self, id: u64, column: usize, cx: &mut Context<Self>) {
+    /// Run a relation tab's statement again, after `change` has had its say
+    /// about the tab's sort and row limit. `false` from `change` means nothing
+    /// moved, and nothing runs.
+    ///
+    /// Every path that re-queries a relation comes through here. The statement
+    /// is Slate's own, so it is regenerated from whatever the tab is now set to
+    /// rather than edited — the row limit and the quoting cannot drift out of
+    /// one place — and `QueryState::Idle` is what makes a preview willing to run
+    /// again, so no caller can forget it.
+    fn requery_relation(
+        &mut self,
+        id: u64,
+        change: impl FnOnce(&mut Vec<SortKey>, &mut usize) -> bool,
+        cx: &mut Context<Self>,
+    ) {
         let Some(profile) = self.profile_mut() else {
             return;
         };
@@ -1414,24 +1477,41 @@ impl Workspace {
         };
         let (schema, relation) = (tab.schema.clone(), tab.name.clone());
         let ObjectBody::Relation {
-            sort,
-            results,
-            query,
-            limit,
-            ..
+            sort, query, limit, ..
         } = &mut tab.body
         else {
             return;
         };
-
-        let Some(expression) = sort_expression(results.read(cx).delegate().columns(), column) else {
+        if !change(sort, limit) {
             return;
-        };
-        cycle(sort, &expression);
+        }
+
         let sql = relation_sql(&schema, &relation, sort, *limit);
         // A preview only re-queries when it is asked to, and this is the ask.
         *query = QueryState::Idle;
         self.execute_sql(sql, Tab::Object(id), cx);
+    }
+
+    /// A header click on a relation tab: move that column through the sort and
+    /// ask the server again.
+    fn relation_sort(&mut self, id: u64, column: usize, cx: &mut Context<Self>) {
+        let Some(profile) = self.profile_mut() else {
+            return;
+        };
+        let Some((_, results)) = profile.session.slot(Tab::Object(id)) else {
+            return;
+        };
+        let Some(expression) = sort_expression(results.read(cx).delegate().columns(), column) else {
+            return;
+        };
+        self.requery_relation(
+            id,
+            move |sort, _| {
+                cycle(sort, &expression);
+                true
+            },
+            cx,
+        );
     }
 
     fn load_structure(
@@ -1497,15 +1577,7 @@ impl Workspace {
     fn activate_tab(&mut self, tab: Tab, cx: &mut Context<Self>) {
         if let Some(profile) = self.profile_mut() {
             profile.session.active = tab;
-            profile.session.pending_delete = None;
-            // Both armed deletes name the buffer they were raised over. Left
-            // standing, the dialog would offer to delete one query while
-            // another is on screen.
-            profile.session.pending_close = None;
-            // A half-finished name belongs to the buffer it was opened over.
-            // Left standing it would name a different one, and it holds the
-            // focus the new surface needs.
-            profile.session.naming = false;
+            profile.session.clear_prompts();
             profile.session.editor_needs_focus = true;
         }
         if let Tab::Object(id) = tab {
@@ -1589,10 +1661,15 @@ impl Workspace {
     /// Swap to the next registered theme. Every colour Slate paints is read
     /// from the global at render time, so repainting is the whole change — and
     /// side-by-side comparison is the only honest way to pick between palettes.
-    fn cycle_theme(&mut self, _: &CycleTheme, _: &mut Window, cx: &mut Context<Self>) {
+    fn cycle_theme(&mut self, _: &CycleTheme, window: &mut Window, cx: &mut Context<Self>) {
         let next = theme(cx).next();
         next.apply_to_components(cx);
         cx.set_global(next);
+        // Only a glass theme wants the desktop behind it, and the platform
+        // tears the vibrant view out of the window the moment this says
+        // otherwise -- so it has to be said again on every switch, not once at
+        // startup.
+        window.set_background_appearance(next.window_background());
         // The titlebar deliberately no longer names the theme -- permanent
         // chrome should not narrate a setting -- so the switch itself says
         // where it landed.
@@ -1817,6 +1894,7 @@ impl Workspace {
     }
 
     fn run_query(&mut self, _: &RunQuery, window: &mut Window, cx: &mut Context<Self>) {
+        self.clear_notice();
         let Some(profile) = self.profile() else {
             return;
         };
@@ -1850,22 +1928,8 @@ impl Workspace {
     /// Run a relation's statement again. The rows are a snapshot, and this is
     /// the only way to ask for a newer one.
     fn refresh_relation(&mut self, id: u64, cx: &mut Context<Self>) {
-        let Some(profile) = self.profile_mut() else {
-            return;
-        };
-        let Some(tab) = profile.session.objects.iter_mut().find(|tab| tab.id == id) else {
-            return;
-        };
-        let (schema, relation) = (tab.schema.clone(), tab.name.clone());
-        let ObjectBody::Relation {
-            sort, query, limit, ..
-        } = &mut tab.body
-        else {
-            return;
-        };
-        let sql = relation_sql(&schema, &relation, sort, *limit);
-        *query = QueryState::Idle;
-        self.execute_sql(sql, Tab::Object(id), cx);
+        self.clear_notice();
+        self.requery_relation(id, |_, _| true, cx);
     }
 
     /// Ask a relation's preview for a different number of rows.
@@ -1875,30 +1939,19 @@ impl Workspace {
     /// for, where the statement is the user's and its cost is theirs to judge.
     fn set_row_limit(&mut self, action: &SetRowLimit, _: &mut Window, cx: &mut Context<Self>) {
         let rows = action.rows;
-        let Some(profile) = self.profile_mut() else {
+        self.clear_notice();
+        let Some(Tab::Object(id)) = self.profile().map(|profile| profile.session.active) else {
             return;
         };
-        let Tab::Object(id) = profile.session.active else {
-            return;
-        };
-        let Some(tab) = profile.session.objects.iter_mut().find(|tab| tab.id == id) else {
-            return;
-        };
-        let (schema, relation) = (tab.schema.clone(), tab.name.clone());
-        let ObjectBody::Relation {
-            sort, query, limit, ..
-        } = &mut tab.body
-        else {
-            return;
-        };
-        if *limit == rows {
-            return;
-        }
-
-        *limit = rows;
-        let sql = relation_sql(&schema, &relation, sort, rows);
-        *query = QueryState::Idle;
-        self.execute_sql(sql, Tab::Object(id), cx);
+        self.requery_relation(
+            id,
+            move |_, limit| {
+                let moved = *limit != rows;
+                *limit = rows;
+                moved
+            },
+            cx,
+        );
     }
 
     /// A column header was clicked: put that column into the statement's
@@ -1913,6 +1966,7 @@ impl Workspace {
     /// out. Several columns therefore build up a compound sort by clicking.
     fn sort_column(&mut self, action: &SortColumn, window: &mut Window, cx: &mut Context<Self>) {
         let column = action.column;
+        self.clear_notice();
         let Some(profile) = self.profile() else {
             return;
         };
@@ -2795,916 +2849,6 @@ impl Workspace {
             .child(Input::new(input).w_full())
     }
 
-    fn render_main_content(profile: &Profile, cx: &mut Context<Self>) -> AnyElement {
-        let t = *theme(cx);
-        let body = match profile.session.active_object() {
-            Some(tab) => Self::render_object(tab, cx),
-            None => Self::render_query_surface(profile, cx),
-        };
-
-        div()
-            .size_full()
-            .flex()
-            .flex_col()
-            // Chrome, so the strip reads as the frame the surfaces sit in.
-            .bg(t.surface)
-            .child(Self::render_tab_strip(profile, cx))
-            .child(div().flex_1().min_h_0().child(body))
-            .into_any_element()
-    }
-
-    /// The editor over the rows it produces. Every runnable surface is this:
-    /// the query buffer and an opened relation differ in where their SQL came
-    /// from, not in what they are.
-    fn render_editor_surface(
-        split: gpui::ElementId,
-        editor: &Entity<InputState>,
-        font_size: f32,
-        query: &QueryState,
-        bottom: AnyElement,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let t = *theme(cx);
-        let mono = gpui_component::Theme::global(cx).mono_font_family.clone();
-
-        // The editor is the prompt, one tone behind its results.
-        let top = div()
-            .size_full()
-            .bg(t.panel)
-            .p(px(layout::SPACE_LG))
-            .font_family(mono)
-            .child(
-                Input::new(editor)
-                    .h_full()
-                    .appearance(false)
-                    .bordered(false)
-                    .focus_bordered(false)
-                    .text_size(px(font_size))
-                    .line_height(px(font_size * 1.55)),
-            );
-
-        let expanded = result_pane_is_expanded(query);
-        let (editor_height, results_height) = if expanded {
-            (layout::EDITOR_DEFAULT_HEIGHT, layout::RESULTS_DEFAULT_HEIGHT)
-        } else {
-            (layout::EDITOR_EMPTY_HEIGHT, layout::RESULTS_EMPTY_HEIGHT)
-        };
-
-        v_resizable((split, if expanded { "expanded" } else { "compact" }))
-            .child(
-                resizable_panel()
-                    .size(px(editor_height))
-                    .size_range(px(layout::EDITOR_MIN_HEIGHT)..px(layout::EDITOR_MAX_HEIGHT))
-                    .child(top),
-            )
-            .child(
-                resizable_panel()
-                    .size(px(results_height))
-                    .size_range(px(layout::RESULTS_MIN_HEIGHT)..gpui::Pixels::MAX)
-                    .child(bottom),
-            )
-            .into_any_element()
-    }
-
-    fn render_query_surface(profile: &Profile, cx: &mut Context<Self>) -> AnyElement {
-        let bottom = Self::render_results(&profile.session.query, &profile.session.results, true, cx);
-        Self::render_editor_surface(
-            gpui::ElementId::from((
-                gpui::ElementId::from("query-result-split"),
-                profile.id.clone(),
-            )),
-            &profile.session.editor,
-            profile.session.editor_font_size,
-            &profile.session.query,
-            bottom,
-            cx,
-        )
-    }
-
-    /// An opened object. A relation's generated `SELECT` is an ordinary buffer
-    /// the user can edit and run; only a routine, which has nothing to run, is
-    /// read-only.
-    fn render_object(tab: &ObjectTab, cx: &mut Context<Self>) -> AnyElement {
-        let t = *theme(cx);
-        let ObjectBody::Relation {
-            showing_structure,
-            structure,
-            results,
-            query,
-            ..
-        } = &tab.body
-        else {
-            return Self::render_routine(tab, cx);
-        };
-
-        if *showing_structure {
-            return div()
-                .size_full()
-                .min_h_0()
-                .bg(t.bg)
-                .child(Self::render_structure(structure, cx))
-                .into_any_element();
-        }
-
-        Self::render_results(query, results, false, cx)
-    }
-
-    fn render_routine(tab: &ObjectTab, cx: &mut Context<Self>) -> AnyElement {
-        let t = *theme(cx);
-        let mono = gpui_component::Theme::global(cx).mono_font_family.clone();
-        let ObjectBody::Routine(routine) = &tab.body else {
-            return div().into_any_element();
-        };
-        let kind = match routine.kind {
-            RoutineKind::Function => "Function",
-            RoutineKind::Procedure => "Procedure",
-        };
-
-        div()
-            .size_full()
-            .flex()
-            .flex_col()
-            .bg(t.panel)
-            .child(
-                div()
-                    .p(px(layout::SPACE_LG))
-                    .flex()
-                    .flex_col()
-                    .gap(px(layout::SPACE_SM))
-                    .child(
-                        div()
-                            .text_size(px(layout::TEXT_LG))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .child(format!("{}.{}", tab.schema, tab.name)),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .gap(px(layout::SPACE_LG))
-                            .text_size(px(layout::TEXT_SM))
-                            .text_color(t.text_muted)
-                            .child(kind)
-                            .child(format!("Language: {}", routine.language))
-                            .children((!routine.result_type.is_empty()).then(|| {
-                                div().child(format!("Returns: {}", routine.result_type))
-                            }))
-                            .child(
-                                div()
-                                    .ml_auto()
-                                    .child(key_hint(t, "escape", "returns to the editor")),
-                            ),
-                    ),
-            )
-            .child(
-                div()
-                    .id("routine-definition")
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_y_scroll()
-                    .p(px(layout::SPACE_LG))
-                    .font_family(mono)
-                    .child(routine.definition.clone()),
-            )
-            .into_any_element()
-    }
-
-    /// The results plane: the brightest tone, because the data is the point.
-    ///
-    /// A short status is centred and set in the app face -- it is a sentence
-    /// about the pane, not query output. An error keeps the editor's monospace
-    /// and the left edge, because it quotes the server and gets read against the
-    /// SQL above it. The grid and every message are alternatives, not layers: a
-    /// full-size message beside a full-size table gets pushed off the pane
-    /// entirely.
-    fn render_results(
-        query: &QueryState,
-        results: &Entity<TableState<ResultGrid>>,
-        is_query: bool,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let t = *theme(cx);
-        let mono = gpui_component::Theme::global(cx).mono_font_family.clone();
-        let centered = |child: AnyElement| {
-            div()
-                .size_full()
-                .p(px(layout::SPACE_LG))
-                .flex()
-                .items_center()
-                .justify_center()
-                .child(child)
-                .into_any_element()
-        };
-        let quiet_line = |line: String| {
-            div()
-                .text_size(px(layout::TEXT_SM))
-                .text_color(t.text_muted)
-                .child(line)
-                .into_any_element()
-        };
-
-        let content = match query {
-            QueryState::Idle if is_query => centered(
-                key_hint(t, "cmd-enter", "runs the selection or statement under the cursor")
-                    .into_any_element(),
-            ),
-            // A preview runs the moment its tab is shown, so an idle one is a
-            // tab that is about to run rather than one waiting to be asked.
-            QueryState::Idle | QueryState::Running => centered(quiet_line("Running query…".into())),
-            QueryState::Failed(error) => {
-                let position = error
-                    .position
-                    .map(|position| format!(" (at byte {position})"))
-                    .unwrap_or_default();
-                div()
-                    .size_full()
-                    .p(px(layout::SPACE_LG))
-                    .font_family(mono)
-                    .text_color(t.danger)
-                    .child(format!("{}{position}", error.message))
-                    .into_any_element()
-            }
-            QueryState::Complete {
-                rows,
-                rows_affected,
-                ..
-            } if *rows == 0 => centered(quiet_line(match rows_affected {
-                Some(rows) => format!("Query completed. Server row count: {rows}."),
-                None => "Query completed.".into(),
-            })),
-            // Values are read by comparing them down a column, which only lines
-            // up in a monospaced face -- and the header inherits it, so the
-            // heading of a column sits in the same rhythm as its values.
-            _ => div()
-                .size_full()
-                .flex()
-                .min_h_0()
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .h_full()
-                        .font_family(mono)
-                        // The grid's own delegate has no key hook and the focused
-                        // element is the table root, so `enter` is caught here on
-                        // its way out of the Table context.
-                        .on_action(cx.listener(Self::edit_cell))
-                        .on_action(cx.listener(Self::copy_cell))
-                        .child(Table::new(results).bordered(false).stripe(true)),
-                )
-                .children(Self::render_row_inspector(results, cx))
-                .into_any_element(),
-        };
-
-        div()
-            .size_full()
-            .min_h_0()
-            .bg(t.bg)
-            .child(content)
-            .into_any_element()
-    }
-
-    /// The selected row, one field per line, beside the grid.
-    ///
-    /// A row read across a grid is a row read against the column headings
-    /// twenty columns away; read down a list it is just a row. The list also
-    /// has room for a value the column had to clip, which is what makes this
-    /// the value inspector the spec asks for in §4.4.
-    ///
-    /// Nothing here is state of Slate's own: the selected row belongs to the
-    /// grid, so the panel cannot disagree with the highlight in the grid, and
-    /// arrow keys move both.
-    fn render_row_inspector(
-        results: &Entity<TableState<ResultGrid>>,
-        cx: &mut Context<Self>,
-    ) -> Option<AnyElement> {
-        let t = *theme(cx);
-        let mono = gpui_component::Theme::global(cx).mono_font_family.clone();
-
-        let (row_ix, rows, fields) = {
-            let table = results.read(cx);
-            let row_ix = table.selected_row()?;
-            (
-                row_ix,
-                table.delegate().rows_count(cx),
-                table.delegate().fields(row_ix),
-            )
-        };
-        // A selection can outlive the rows it was made against.
-        if fields.is_empty() {
-            return None;
-        }
-
-        let table = results.clone();
-        Some(
-            div()
-                .w(px(layout::INSPECTOR_WIDTH))
-                .flex_shrink_0()
-                .h_full()
-                .flex()
-                .flex_col()
-                // One tone behind the results: this describes the data rather
-                // than being it.
-                .bg(t.panel)
-                .child(
-                    div()
-                        .h(px(layout::TAB_HEIGHT))
-                        .px(px(layout::SPACE_SM))
-                        .flex()
-                        .items_center()
-                        .gap(px(layout::SPACE_SM))
-                        .child(
-                            div()
-                                .text_size(px(layout::TEXT_SM))
-                                .text_color(t.text_muted)
-                                .child(format!(
-                                    "Row {} of {}",
-                                    group_thousands(row_ix as u64 + 1),
-                                    group_thousands(rows as u64)
-                                )),
-                        )
-                        .child(
-                            div().ml_auto().child(
-                                Button::new("close-row-inspector")
-                                    .icon(icon(icon::CLOSE))
-                                    .ghost()
-                                    .xsmall()
-                                    .tooltip("Close the row panel")
-                                    .on_click(move |_, _, cx| {
-                                        table.update(cx, |table, cx| table.clear_selection(cx));
-                                    }),
-                            ),
-                        ),
-                )
-                .child(
-                    div()
-                        .id("row-inspector")
-                        .flex_1()
-                        .min_h_0()
-                        .overflow_y_scroll()
-                        .px(px(layout::SPACE_SM))
-                        .pb(px(layout::SPACE_SM))
-                        .flex()
-                        .flex_col()
-                        .gap(px(layout::SPACE_MD))
-                        .children(fields.into_iter().map(|field| {
-                            div()
-                                .flex()
-                                .flex_col()
-                                .gap(px(layout::SPACE_XS))
-                                .child(
-                                    div()
-                                        .flex()
-                                        .items_center()
-                                        .gap(px(layout::SPACE_SM))
-                                        .child(
-                                            div()
-                                                .text_size(px(layout::TEXT_SM))
-                                                .text_color(t.text_muted)
-                                                .child(field.name),
-                                        )
-                                        // Absent rather than guessed: a type
-                                        // Slate could not learn is not shown as
-                                        // one it inferred from the text.
-                                        .children(field.data_type.map(|data_type| {
-                                            div()
-                                                .ml_auto()
-                                                .flex_shrink_0()
-                                                .text_size(px(layout::TEXT_XS))
-                                                .text_color(t.text_faint)
-                                                .child(data_type)
-                                        })),
-                                )
-                                .child(
-                                    div()
-                                        .font_family(mono.clone())
-                                        .text_size(px(layout::TEXT_SM))
-                                        .map(|value| match field.value {
-                                            Some(text) => value.text_color(t.text).child(text),
-                                            // Italic so a NULL cannot be read
-                                            // as the four-letter string.
-                                            None => value
-                                                .text_color(t.text_faint)
-                                                .italic()
-                                                .child(result_grid::NULL_LABEL),
-                                        }),
-                                )
-                        })),
-                )
-                .into_any_element(),
-        )
-    }
-
-    /// One segment of the Data | Structure pair. A quiet chip rather than a
-    /// filled button: it selects a view of the same object, it does not act.
-    fn preview_tab(
-        label: &'static str,
-        path: &'static str,
-        selected: bool,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let t = *theme(cx);
-        div()
-            .id(label)
-            .flex()
-            .items_center()
-            .gap(px(layout::SPACE_XS))
-            .h(px(24.))
-            .px(px(layout::SPACE_SM))
-            .rounded(px(layout::RADIUS_CONTROL))
-            .text_size(px(layout::TEXT_SM))
-            .map(|tab| {
-                if selected {
-                    tab.bg(t.element_active).text_color(t.text)
-                } else {
-                    tab.text_color(t.text_muted)
-                        .hover(|style| style.bg(t.element_hover))
-                }
-            })
-            .child(icon(path).size(px(12.)).text_color(if selected {
-                t.text
-            } else {
-                t.text_faint
-            }))
-            .child(label)
-            .on_click(cx.listener(move |workspace, _: &ClickEvent, _, cx| {
-                workspace.show_structure(label == "Structure", cx);
-            }))
-    }
-
-    /// One row-limit choice. A chip rather than a menu: four numbers fit, and a
-    /// number behind a popover is a number nobody checks.
-    fn row_limit_chip(rows: usize, selected: bool, cx: &mut Context<Self>) -> AnyElement {
-        let t = *theme(cx);
-        div()
-            .id(("row-limit", rows))
-            .flex()
-            .items_center()
-            .h(px(24.))
-            .px(px(layout::SPACE_SM))
-            .rounded(px(layout::RADIUS_CONTROL))
-            .text_size(px(layout::TEXT_SM))
-            .map(|chip| {
-                if selected {
-                    chip.bg(t.element_active).text_color(t.text)
-                } else {
-                    chip.text_color(t.text_muted)
-                        .hover(|style| style.bg(t.element_hover))
-                }
-            })
-            .child(compact_count(rows))
-            .on_click(cx.listener(move |_, _, window, cx| {
-                window.dispatch_action(Box::new(SetRowLimit { rows }), cx);
-            }))
-            .into_any_element()
-    }
-
-    fn render_structure(state: &StructureState, cx: &mut Context<Self>) -> AnyElement {
-        let t = *theme(cx);
-        let mono = gpui_component::Theme::global(cx).mono_font_family.clone();
-
-        let structure = match state {
-            StructureState::Loading => {
-                return div()
-                    .p(px(layout::SPACE_LG))
-                    .text_color(t.text_muted)
-                    .child("Loading structure…")
-                    .into_any_element();
-            }
-            StructureState::Failed(message) => {
-                return div()
-                    .p(px(layout::SPACE_LG))
-                    .text_color(t.danger)
-                    .child(message.clone())
-                    .into_any_element();
-            }
-            StructureState::Loaded(structure) => structure,
-        };
-
-        let heading =
-            |label: &'static str| div().pt(px(layout::SPACE_MD)).child(section_label(t, label));
-        let name_column = |name: String| {
-            div()
-                .w(px(220.))
-                .min_w(px(220.))
-                .font_weight(FontWeight::MEDIUM)
-                .child(name)
-        };
-        let definitions = |definitions: &[db::NamedDefinition]| {
-            definitions
-                .iter()
-                .map(|definition| {
-                    div()
-                        .flex()
-                        .gap(px(layout::SPACE_MD))
-                        .child(name_column(definition.name.clone()))
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .text_color(t.text_muted)
-                                .child(definition.definition.clone()),
-                        )
-                })
-                .collect::<Vec<_>>()
-        };
-
-        div()
-            .id("structure")
-            .size_full()
-            .overflow_y_scroll()
-            .p(px(layout::SPACE_LG))
-            .font_family(mono)
-            .flex()
-            .flex_col()
-            .gap(px(layout::SPACE_XS))
-            .child(heading("Columns"))
-            .children(structure.columns.iter().map(|column| {
-                div()
-                    .flex()
-                    .gap(px(layout::SPACE_MD))
-                    .child(name_column(column.name.clone()))
-                    .child(
-                        div()
-                            .w(px(200.))
-                            .min_w(px(200.))
-                            // The same colour the editor gives a type name, so
-                            // structure and SQL read as one vocabulary.
-                            .text_color(t.syntax_type)
-                            .child(column.data_type.clone()),
-                    )
-                    .child(
-                        div()
-                            .w(px(80.))
-                            .min_w(px(80.))
-                            .text_color(t.text_muted)
-                            .child(if column.nullable { "nullable" } else { "not null" }),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .text_color(t.text_muted)
-                            .child(column.default.clone().unwrap_or_default()),
-                    )
-            }))
-            .children((!structure.indexes.is_empty()).then(|| heading("Indexes")))
-            .children(definitions(&structure.indexes))
-            .children((!structure.constraints.is_empty()).then(|| heading("Constraints")))
-            .children(definitions(&structure.constraints))
-            .into_any_element()
-    }
-
-    /// The tab strip. It sits directly above the editor and starts where the
-    /// editor's text does, so a tab labels the surface under it rather than the
-    /// window: the active one is lifted to the editor's tone, the rest are names
-    /// that reveal a wash on hover. No boxes, no hairlines — tone carries the
-    /// state.
-    fn render_tab_strip(profile: &Profile, cx: &mut Context<Self>) -> AnyElement {
-        let t = *theme(cx);
-        let workspace = cx.entity().downgrade();
-        let session = &profile.session;
-        let on_query_tab = matches!(session.active, Tab::Query);
-        let runnable = session.editor(session.active).is_some();
-
-        let chip = |active: bool| {
-            div()
-                .h(px(layout::TAB_CHIP_HEIGHT))
-                .flex()
-                .flex_shrink_0()
-                .items_center()
-                .gap(px(layout::SPACE_XS))
-                .rounded(px(layout::RADIUS_CONTROL))
-                .map(|tab| {
-                    if active {
-                        tab.bg(t.panel).text_color(t.text)
-                    } else {
-                        tab.text_color(t.text_muted)
-                            .hover(|style| style.bg(t.element_hover))
-                    }
-                })
-        };
-        let name_label = |name: String, transient: bool| {
-            div()
-                .max_w(px(180.))
-                .overflow_hidden()
-                .text_ellipsis()
-                .whitespace_nowrap()
-                // Italic for a tab nobody has asked to keep, the way every
-                // editor marks one.
-                .when(transient, |label| label.italic())
-                .child(name)
-        };
-
-        let scratch_workspace = workspace.clone();
-        let mut tabs = vec![
-            chip(on_query_tab && session.open_query.is_none())
-                .id("scratch-query-tab")
-                .px(px(layout::SPACE_SM))
-                // A pen, not a file: the scratch buffer is a place to write, and
-                // the distinction is what makes the saved tabs read as files.
-                .child(row_icon(t, icon::SCRATCH_QUERY))
-                .child("New Query")
-                .on_click(move |_, window, cx| {
-                    _ = scratch_workspace.update(cx, |workspace, cx| {
-                        workspace.open_scratch_query(window, cx);
-                    });
-                })
-                .into_any_element(),
-        ];
-
-        tabs.extend(session.saved_queries.iter().enumerate().map(|(index, name)| {
-            let open_name = name.clone();
-            let delete_name = name.clone();
-            let open_workspace = workspace.clone();
-            let delete_workspace = workspace.clone();
-            let pending = session.pending_delete.as_deref() == Some(name);
-            let active = on_query_tab && session.open_query.as_deref() == Some(name);
-            chip(active)
-                .id(("saved-query", index))
-                .group(format!("query-tab-{index}"))
-                .pl(px(layout::SPACE_SM))
-                .pr(px(layout::SPACE_XS))
-                .child(row_icon(t, icon::SAVED_QUERY))
-                .child(name_label(name.clone(), false))
-                .child(
-                    // Revealed by its own tab, so the strip reads as names
-                    // rather than a row of delete buttons.
-                    div()
-                        .when(!pending, |delete| {
-                            delete
-                                .opacity(0.)
-                                .group_hover(format!("query-tab-{index}"), |style| style.opacity(1.))
-                        })
-                        .child(
-                            Button::new(("delete-query", index))
-                                .label(if pending { "Delete?" } else { "" })
-                                .icon(icon(icon::DELETE))
-                                .ghost()
-                                .xsmall()
-                                .tooltip("Delete query")
-                                .on_click(move |_, window, cx| {
-                                    // Or the chip underneath opens the query in
-                                    // the same click, and the confirmation this
-                                    // arms is cleared before it can be seen.
-                                    cx.stop_propagation();
-                                    _ = delete_workspace.update(cx, |workspace, cx| {
-                                        workspace.arm_delete_saved_query(
-                                            delete_name.clone(),
-                                            window,
-                                            cx,
-                                        );
-                                    });
-                                }),
-                        ),
-                )
-                .on_click(move |_, window, cx| {
-                    _ = open_workspace.update(cx, |workspace, cx| {
-                        workspace.open_saved_query(open_name.clone(), window, cx);
-                    });
-                })
-                .into_any_element()
-        }));
-
-        // Opened objects sit after the queries, in the order they were opened.
-        // Closing one is not destructive, so it gets a plain × rather than the
-        // saved queries' confirmed delete.
-        tabs.extend(session.objects.iter().map(|object| {
-            let id = object.id;
-            let group = format!("object-tab-{id}");
-            let open_workspace = workspace.clone();
-            let keep_workspace = workspace.clone();
-            let close_workspace = workspace.clone();
-            chip(session.active == Tab::Object(id))
-                .id(("object-tab", id as usize))
-                .group(group.clone())
-                .pl(px(layout::SPACE_SM))
-                .pr(px(layout::SPACE_XS))
-                .child(row_icon(t, object_icon(object.kind)))
-                .child(name_label(object.name.clone(), object.transient))
-                .child(
-                    div()
-                        .opacity(0.)
-                        .group_hover(group, |style| style.opacity(1.))
-                        .child(
-                            Button::new(("close-object", id as usize))
-                                .icon(icon(icon::CLOSE))
-                                .ghost()
-                                .xsmall()
-                                .tooltip("Close tab")
-                                .on_click(move |_, _, cx| {
-                                    // Or the chip underneath activates the tab
-                                    // this just closed, in the same click.
-                                    cx.stop_propagation();
-                                    _ = close_workspace.update(cx, |workspace, cx| {
-                                        workspace.close_object(id, cx);
-                                    });
-                                }),
-                        ),
-                )
-                .on_click(move |_, _, cx| {
-                    _ = open_workspace.update(cx, |workspace, cx| {
-                        workspace.activate_tab(Tab::Object(id), cx);
-                    });
-                })
-                // The other half of the preview gesture: a double click on the
-                // tab keeps it, exactly as it does in the tree.
-                .on_double_click(move |_, _, cx| {
-                    _ = keep_workspace.update(cx, |workspace, cx| {
-                        workspace.keep_object(id, cx);
-                    });
-                })
-                .into_any_element()
-        }));
-
-        let confirm_workspace = workspace.clone();
-        let naming_a_rename = on_query_tab && session.open_query.is_some();
-        let naming = session.naming.then(|| {
-            div()
-                .w(px(240.))
-                .flex_shrink_0()
-                .flex()
-                .items_center()
-                .gap(px(layout::SPACE_XS))
-                // The input and the button share one size so the pair sits on a
-                // single centreline instead of jostling.
-                .child(Input::new(&session.save_name).small().flex_1())
-                .child(
-                    Button::new("confirm-save-query")
-                        .icon(icon(if naming_a_rename {
-                            icon::RENAME
-                        } else {
-                            icon::SAVE
-                        }))
-                        .small()
-                        .tooltip(if naming_a_rename {
-                            "Rename query"
-                        } else {
-                            "Save query"
-                        })
-                        .on_click(move |_, window, cx| {
-                            _ = confirm_workspace.update(cx, |workspace, cx| {
-                                workspace.confirm_save(window, cx);
-                            });
-                        }),
-                )
-        });
-
-        // A relation's tab shows the two views of an object from the strip: a
-        // header of its own would be a second bar saying what this one already
-        // says.
-        let structure_toggle = session
-            .active_object()
-            .and_then(|tab| match &tab.body {
-                ObjectBody::Relation {
-                    showing_structure, ..
-                } => Some(
-                    div()
-                        .flex_shrink_0()
-                        .flex()
-                        .gap(px(layout::SPACE_XS))
-                        .child(Self::preview_tab(
-                            "Data",
-                            icon::TABLE,
-                            !showing_structure,
-                            cx,
-                        ))
-                        .child(Self::preview_tab(
-                            "Structure",
-                            icon::STRUCTURE,
-                            *showing_structure,
-                            cx,
-                        )),
-                ),
-                ObjectBody::Routine(_) => None,
-            });
-
-        // What the preview asked the server for, and the only control over it.
-        // Beside the Data | Structure pair because it belongs to the same view:
-        // it is a property of these rows, not of the window.
-        let showing_rows = session.active_object().and_then(|tab| match &tab.body {
-            ObjectBody::Relation {
-                limit,
-                showing_structure: false,
-                ..
-            } => Some(*limit),
-            _ => None,
-        });
-        let row_limit = showing_rows.map(|limit| {
-            let chips: Vec<_> = ROW_LIMITS
-                .into_iter()
-                .map(|rows| Self::row_limit_chip(rows, rows == limit, cx))
-                .collect();
-            div()
-                .flex_shrink_0()
-                .flex()
-                .items_center()
-                .gap(px(layout::SPACE_XS))
-                .child(
-                    div()
-                        .text_size(px(layout::TEXT_SM))
-                        .text_color(t.text_faint)
-                        .child("Rows"),
-                )
-                .children(chips)
-        });
-
-        let zoom = editor_zoom_percent(session.editor_font_size);
-        let named = on_query_tab && session.open_query.is_some();
-        let new_workspace = workspace.clone();
-        let save_workspace = workspace.clone();
-        let rename_workspace = workspace.clone();
-        let run_workspace = workspace.clone();
-
-        div()
-            .h(px(layout::TAB_HEIGHT))
-            .w_full()
-            .flex_shrink_0()
-            .flex()
-            .items_center()
-            .gap(px(layout::SPACE_SM))
-            // Starts where the editor's text does, so a tab lines up with the
-            // buffer it names.
-            .pl(px(layout::SPACE_LG))
-            .pr(px(layout::SPACE_SM))
-            .text_size(px(layout::TEXT_SM))
-            .child(
-                div()
-                    .id("query-tabs-scroll")
-                    .flex_1()
-                    .min_w_0()
-                    .flex()
-                    .items_center()
-                    .gap(px(layout::SPACE_XS))
-                    .overflow_x_scroll()
-                    .children(tabs)
-                    .child(
-                        // Beside the last tab, where a browser puts it, rather
-                        // than orphaned at the far edge of the window.
-                        Button::new("new-query-tab")
-                            .icon(icon(icon::PLUS))
-                            .ghost()
-                            .xsmall()
-                            .tooltip_with_action("New query", &NewQuery, None)
-                            .on_click(move |_, window, cx| {
-                                _ = new_workspace.update(cx, |workspace, cx| {
-                                    workspace.new_query(&NewQuery, window, cx);
-                                });
-                            }),
-                    ),
-            )
-            .children(structure_toggle)
-            .children(row_limit)
-            // 100% is not information; the readout appears only once the zoom
-            // has somewhere to return to.
-            .children((runnable && zoom != 100).then(|| {
-                div()
-                    .flex_shrink_0()
-                    .text_color(t.text_faint)
-                    .child(format!("{zoom}% · ⌘0 resets"))
-            }))
-            .children(naming)
-            // A named query is already written to disk on every swap, so there
-            // is nothing for a save button to do that has not been done. What
-            // it can still do is change the name.
-            .children((runnable && !session.naming && named).then(|| {
-                Button::new("rename-query")
-                    .icon(icon(icon::RENAME))
-                    .ghost()
-                    .xsmall()
-                    .tooltip("Rename query")
-                    .on_click(move |_, window, cx| {
-                        _ = rename_workspace.update(cx, |workspace, cx| {
-                            workspace.rename_query(window, cx);
-                        });
-                    })
-            }))
-            .children((runnable && !session.naming && !named).then(|| {
-                Button::new("save-query")
-                    .icon(icon(icon::SAVE))
-                    .ghost()
-                    .xsmall()
-                    .tooltip_with_action("Save query", &SaveQuery, None)
-                    .on_click(move |_, window, cx| {
-                        _ = save_workspace.update(cx, |workspace, cx| {
-                            workspace.save_query(&SaveQuery, window, cx);
-                        });
-                    })
-            }))
-            .children(runnable.then(|| {
-                Button::new("run-query")
-                    .icon(icon(icon::RUN))
-                    .ghost()
-                    .xsmall()
-                    .tooltip_with_action("Run", &RunQuery, None)
-                    .on_click(move |_, window, cx| {
-                        _ = run_workspace.update(cx, |workspace, cx| {
-                            workspace.run_query(&RunQuery, window, cx);
-                        });
-                    })
-            }))
-            .into_any_element()
-    }
-
     /// The palette, centred over everything else.
     ///
     /// `key_context` is load-bearing: the arrow keys are bound against
@@ -4276,7 +3420,6 @@ impl Render for Workspace {
                 .id("connection-form")
                 .size_full()
                 // Chrome, so the form's card is the raised plane on it.
-                .bg(t.surface)
                 .text_color(t.text)
                 .text_size(px(layout::TEXT_MD))
                 .flex()
@@ -4360,10 +3503,10 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::palette_next))
             .on_action(cx.listener(Self::palette_previous))
             .size_full()
-            // The shell is the chrome tone: titlebar, sidebar and status bar
-            // paint nothing of their own, they are this. The editor and the
-            // results step forward from it by tone.
-            .bg(t.surface)
+            // The shell is the frost: titlebar, sidebar and status bar paint
+            // nothing of their own, they are the glass the window root already
+            // laid down. The editor and the results step forward from it by
+            // tone, and by letting less of the desktop through.
             .text_color(t.text)
             .text_size(px(layout::TEXT_MD))
             .flex()
@@ -4388,8 +3531,7 @@ impl Render for Workspace {
                                 div()
                                     .size_full()
                                     .min_w_0()
-                                    .bg(t.bg)
-                                    .child(Self::render_main_content(profile, cx)),
+                                    .child(views::render_main_content(profile, cx)),
                             ),
                         ),
                 ),
@@ -4771,6 +3913,17 @@ fn adjusted_editor_font_size(current: f32, delta: f32) -> f32 {
     (current + delta).clamp(EDITOR_FONT_SIZE_MIN, EDITOR_FONT_SIZE_MAX)
 }
 
+/// A zoom read back from disk. Clamped rather than trusted, because
+/// `profiles.toml` is a text file: a size outside the range the controls offer
+/// would otherwise be unreachable by the controls that set it. The finiteness
+/// check is not decoration -- `clamp` on a NaN returns the NaN.
+fn restored_editor_font_size(stored: Option<f32>) -> f32 {
+    stored
+        .filter(|size| size.is_finite())
+        .map(|size| size.clamp(EDITOR_FONT_SIZE_MIN, EDITOR_FONT_SIZE_MAX))
+        .unwrap_or(EDITOR_FONT_SIZE_DEFAULT)
+}
+
 fn editor_zoom_percent(font_size: f32) -> u32 {
     (font_size / EDITOR_FONT_SIZE_DEFAULT * 100.0).round() as u32
 }
@@ -4890,6 +4043,7 @@ fn main() {
         // bar in its own grey above Slate's chrome is the seam every native app
         // avoids. Slate paints that strip itself, and the buttons sit over it.
         let options = WindowOptions {
+            window_background: theme.window_background(),
             titlebar: Some(TitlebarOptions {
                 title: Some("Slate".into()),
                 appears_transparent: true,
@@ -5042,7 +4196,7 @@ mod tests {
         assert_eq!(compact_count(100_000), "100K");
         // Every offered limit has to be labelled by this, so none can come out
         // as something like `1500`.
-        for rows in ROW_LIMITS {
+        for rows in explorer::ROW_LIMITS {
             assert!(compact_count(rows).len() <= 4, "{rows} is a wide label");
         }
     }
@@ -5082,6 +4236,28 @@ mod tests {
         );
         assert_eq!(
             adjusted_editor_font_size(EDITOR_FONT_SIZE_DEFAULT, EDITOR_FONT_SIZE_STEP),
+            EDITOR_FONT_SIZE_DEFAULT + EDITOR_FONT_SIZE_STEP
+        );
+    }
+
+    #[test]
+    fn a_restored_zoom_is_clamped_rather_than_trusted() {
+        // `profiles.toml` is a text file. A size outside the range the controls
+        // offer would be a zoom the zoom controls cannot undo, and a NaN would
+        // survive `clamp` and reach the text system.
+        assert_eq!(restored_editor_font_size(None), EDITOR_FONT_SIZE_DEFAULT);
+        assert_eq!(
+            restored_editor_font_size(Some(f32::NAN)),
+            EDITOR_FONT_SIZE_DEFAULT
+        );
+        assert_eq!(
+            restored_editor_font_size(Some(f32::INFINITY)),
+            EDITOR_FONT_SIZE_DEFAULT
+        );
+        assert_eq!(restored_editor_font_size(Some(900.0)), EDITOR_FONT_SIZE_MAX);
+        assert_eq!(restored_editor_font_size(Some(0.0)), EDITOR_FONT_SIZE_MIN);
+        assert_eq!(
+            restored_editor_font_size(Some(EDITOR_FONT_SIZE_DEFAULT + EDITOR_FONT_SIZE_STEP)),
             EDITOR_FONT_SIZE_DEFAULT + EDITOR_FONT_SIZE_STEP
         );
     }
