@@ -28,6 +28,12 @@ tree-sitter-sequel = "=0.3.11"
 # its runtime and runs on the background executor. See AGENTS.md.
 postgres = "0.19"
 
+# PostGIS sends geometry through the simple query protocol as hex EWKB. Decode
+# that server value at the database boundary so the UI still receives strings,
+# but receives readable WKT rather than binary rendered as hexadecimal.
+geozero = { version = "=0.15.1", default-features = false, features = ["with-wkb"] }
+hex = "=0.4.3"
+
 # TLS. The driver ships none of its own -- `Client::connect` takes a connector,
 # and `NoTls` is a real type that refuses -- so this is what makes `sslmode`
 # something Slate can honour rather than something it has to reject.

@@ -6,15 +6,17 @@
 //! later (see the spec, §4.1).
 //!
 //! **Results come back via the simple query protocol**, which returns every
-//! value already formatted as text by the server. That removes the whole
+//! value already formatted as text by the server. That removes almost the whole
 //! per-type decoding layer a generic SQL client would otherwise need: numerics
-//! keep their exact precision, `jsonb` arrives as JSON, geometry arrives as the
-//! hex WKB the server would print, and unknown or extension types format
-//! themselves correctly instead of falling through a match arm we forgot.
+//! keep their exact precision, `jsonb` arrives as JSON, and unknown or extension
+//! types format themselves correctly instead of falling through a match arm we
+//! forgot. PostGIS geometry is the exception: its text output is hex EWKB, which
+//! this boundary renders as WKT after learning the result's column types.
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use geozero::{CoordDimensions, ToWkt, wkb::Ewkb};
 use postgres::{Client, NoTls, SimpleQueryMessage, config::Host};
 
 use crate::tls;
@@ -532,6 +534,7 @@ impl Connection {
             probed.clear();
         }
         apply_types(&mut result.columns, &probed);
+        format_spatial_cells(&mut result);
 
         // The client mutex is not reentrant and `edit_target` runs its catalog
         // query through it, so the lock has to go before the question is asked.
@@ -804,6 +807,51 @@ fn apply_types(columns: &mut [Column], probed: &[ProbedColumn]) {
     for (column, described) in columns.iter_mut().zip(probed) {
         column.data_type = Some(described.type_name.clone());
     }
+}
+
+fn format_spatial_cells(result: &mut QueryResult) {
+    let spatial_columns = result
+        .columns
+        .iter()
+        .map(|column| matches!(column.data_type.as_deref(), Some("geometry" | "geography")))
+        .collect::<Vec<_>>();
+
+    for row in &mut result.rows {
+        for (cell, spatial) in row.iter_mut().zip(&spatial_columns) {
+            if !spatial {
+                continue;
+            }
+            let Some(value) = cell else {
+                continue;
+            };
+            let Ok(bytes) = hex::decode(&*value) else {
+                continue;
+            };
+            let Ok(wkt) = Ewkb(bytes).to_wkt_ndim(CoordDimensions::xyzm()) else {
+                continue;
+            };
+            *value = readable_wkt(&wkt);
+        }
+    }
+}
+
+fn readable_wkt(wkt: &str) -> String {
+    let mut readable = String::with_capacity(wkt.len() + 8);
+    for character in wkt.chars() {
+        if character == '('
+            && readable
+                .chars()
+                .next_back()
+                .is_some_and(char::is_alphabetic)
+        {
+            readable.push(' ');
+        }
+        readable.push(character);
+        if character == ',' {
+            readable.push(' ');
+        }
+    }
+    readable
 }
 
 fn assemble_catalog(relations: QueryResult, routines: QueryResult) -> Result<Catalog, DbError> {
@@ -1219,6 +1267,51 @@ mod tests {
     fn invalid_server_character_positions_are_rejected() {
         assert_eq!(character_position_to_byte_offset("SELECT 1", 0), None);
         assert_eq!(character_position_to_byte_offset("SELECT 1", 100), None);
+    }
+
+    #[test]
+    fn postgis_ewkb_is_rendered_as_wkt_only_for_spatial_columns() {
+        let ewkb = "0103000020E610000001000000040000003B6F63B323A258C0A4AA09A2EE833D40A29BFD8172A158C0C153C8957A823D4026FDBD141EA258C045A165DD3F823D403B6F63B323A258C0A4AA09A2EE833D40";
+        let mut result = QueryResult {
+            columns: vec![
+                Column {
+                    name: "shape".into(),
+                    data_type: Some("geometry".into()),
+                },
+                Column {
+                    name: "raw".into(),
+                    data_type: Some("text".into()),
+                },
+            ],
+            rows: vec![vec![Some(ewkb.into()), Some(ewkb.into())]],
+            ..Default::default()
+        };
+
+        format_spatial_cells(&mut result);
+
+        assert_eq!(
+            result.rows[0][0].as_deref(),
+            Some(
+                "POLYGON ((-98.533429 29.51536, -98.522614 29.509683, -98.533086 29.508787, -98.533429 29.51536))"
+            )
+        );
+        assert_eq!(result.rows[0][1].as_deref(), Some(ewkb));
+    }
+
+    #[test]
+    fn invalid_spatial_text_is_left_visible() {
+        let mut result = QueryResult {
+            columns: vec![Column {
+                name: "shape".into(),
+                data_type: Some("geometry".into()),
+            }],
+            rows: vec![vec![Some("not ewkb".into())]],
+            ..Default::default()
+        };
+
+        format_spatial_cells(&mut result);
+
+        assert_eq!(result.rows[0][0].as_deref(), Some("not ewkb"));
     }
 
     fn result(columns: &[&str], rows: &[&[Option<&str>]]) -> QueryResult {
