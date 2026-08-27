@@ -32,6 +32,14 @@ pub struct StoredProfile {
     pub sslmode: Option<String>,
     #[serde(default)]
     pub root_certificate: Option<String>,
+    /// `db::Engine::as_str()`. Absent is a profile written before a second
+    /// engine existed, and reads back as Postgres -- which is what it was
+    /// connecting as.
+    #[serde(default)]
+    pub engine: Option<String>,
+    /// The database file, for SQLite. Absent for a server engine.
+    #[serde(default)]
+    pub path: Option<String>,
     /// The editor's zoom. Absent is a profile written before zoom was kept, and
     /// reads back as the default -- which is what it was showing.
     #[serde(default)]
@@ -179,7 +187,11 @@ pub fn saved_queries(profile_id: &str) -> Vec<String> {
     let mut names = entries
         .flatten()
         .filter_map(|entry| {
-            let name = entry.file_name().to_str()?.strip_suffix(".sql")?.to_string();
+            let name = entry
+                .file_name()
+                .to_str()?
+                .strip_suffix(".sql")?
+                .to_string();
             validate_query_name(&name).ok()?;
             Some(name)
         })
@@ -307,6 +319,8 @@ mod tests {
             user: "slate".into(),
             sslmode: Some("verify-full".into()),
             root_certificate: Some("/etc/ssl/rds.pem".into()),
+            engine: Some("postgres".into()),
+            path: None,
             editor_font_size: Some(16.0),
             open_query: Some("daily".into()),
             open_objects: vec![
@@ -364,6 +378,114 @@ open_objects = []
     }
 
     #[test]
+    fn a_sqlite_profile_survives_the_round_trip_through_toml() {
+        // SQLite has no host, port, user or TLS -- a profile for it writes
+        // those fields blank rather than omitting them, since `StoredProfile`
+        // stays one shape for every engine.
+        let profile = StoredProfile {
+            id: "local".into(),
+            name: "Local".into(),
+            host: String::new(),
+            port: None,
+            database: String::new(),
+            user: String::new(),
+            sslmode: None,
+            root_certificate: None,
+            engine: Some("sqlite".into()),
+            path: Some("/Users/dev/slate_dev.db".into()),
+            editor_font_size: Some(14.0),
+            open_query: None,
+            open_objects: vec![StoredObject {
+                schema: "main".into(),
+                name: "accounts".into(),
+                routine: false,
+                active: true,
+            }],
+        };
+        let file = ProfileFile {
+            profiles: vec![profile.clone()],
+        };
+
+        let text = toml::to_string_pretty(&file).expect("profiles must encode");
+        let decoded: ProfileFile = toml::from_str(&text).expect("profiles must decode");
+
+        assert_eq!(decoded.profiles, vec![profile]);
+    }
+
+    #[test]
+    fn a_profile_written_before_engine_existed_still_loads() {
+        // Every profile on disk before a second engine existed has no `engine`
+        // key at all, and must load as Postgres -- which is what it was
+        // connecting as -- rather than fail to decode.
+        let profiles = decode_profiles(
+            "\
+[[profiles]]
+id = \"slate-dev\"
+name = \"slate_dev\"
+host = \"127.0.0.1\"
+port = 55432
+database = \"slate_dev\"
+user = \"slate\"
+sslmode = \"prefer\"
+open_objects = []
+",
+        )
+        .expect("a profile predating engine must load");
+
+        let [profile] = &profiles[..] else {
+            panic!("expected exactly one profile, got {}", profiles.len());
+        };
+        assert_eq!(profile.engine, None);
+        assert_eq!(profile.path, None);
+    }
+
+    #[test]
+    fn engine_and_path_precede_the_open_objects_table() {
+        // TOML cannot emit a scalar after a table, so `engine` and `path` have
+        // to sit before `open_objects` in the struct. This is the check that
+        // would actually fail if someone reordered it.
+        let profile = StoredProfile {
+            id: "local".into(),
+            name: "Local".into(),
+            host: String::new(),
+            port: None,
+            database: String::new(),
+            user: String::new(),
+            sslmode: None,
+            root_certificate: None,
+            engine: Some("sqlite".into()),
+            path: Some("/tmp/dev.sqlite".into()),
+            editor_font_size: None,
+            open_query: None,
+            open_objects: vec![StoredObject {
+                schema: "main".into(),
+                name: "accounts".into(),
+                routine: false,
+                active: true,
+            }],
+        };
+        let text = toml::to_string_pretty(&ProfileFile {
+            profiles: vec![profile],
+        })
+        .expect("profile must encode");
+
+        let engine_at = text.find("engine = ").expect("engine must be written");
+        let path_at = text.find("path = ").expect("path must be written");
+        let open_objects_at = text
+            .find("[[profiles.open_objects]]")
+            .expect("open_objects must be written as a table");
+
+        assert!(
+            engine_at < open_objects_at,
+            "engine after open_objects:\n{text}"
+        );
+        assert!(
+            path_at < open_objects_at,
+            "path after open_objects:\n{text}"
+        );
+    }
+
+    #[test]
     fn an_unparsable_profile_file_is_an_error_rather_than_an_empty_list() {
         // The empty list is what the next save writes back, so a parse error
         // that reads as "no profiles" is a parse error that deletes them.
@@ -380,7 +502,17 @@ open_objects = []
 
     #[test]
     fn unsafe_query_names_are_rejected() {
-        for name in ["", "   ", ".", "..", ".scratch", "../secrets", "a/b", "a\\b", "a\0b"] {
+        for name in [
+            "",
+            "   ",
+            ".",
+            "..",
+            ".scratch",
+            "../secrets",
+            "a/b",
+            "a\\b",
+            "a\0b",
+        ] {
             assert!(validate_query_name(name).is_err(), "{name:?}");
         }
     }

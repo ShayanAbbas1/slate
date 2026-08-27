@@ -666,7 +666,13 @@ mod tests {
             check(t, "text on control", t.text, t.control, AA_TEXT);
             // A changed cell is still a cell in the dense grid: the wash marks
             // it, it does not get to make the value harder to read.
-            check(t, "text on an edited cell", t.text, t.edited.flatten(t.bg), AAA_TEXT);
+            check(
+                t,
+                "text on an edited cell",
+                t.text,
+                t.edited.flatten(t.bg),
+                AAA_TEXT,
+            );
         }
     }
 

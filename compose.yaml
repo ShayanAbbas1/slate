@@ -17,5 +17,24 @@ services:
       timeout: 3s
       retries: 30
 
+  mysql:
+    image: mysql:8.4
+    environment:
+      MYSQL_DATABASE: slate_dev
+      MYSQL_USER: slate
+      MYSQL_PASSWORD: slate
+      MYSQL_ROOT_PASSWORD: slate
+    ports:
+      - "${SLATE_MYSQL_PORT:-53306}:3306"
+    volumes:
+      - slate-mysql-data:/var/lib/mysql
+      - ./dev/mysql/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -pslate"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
 volumes:
   slate-postgres-data:
+  slate-mysql-data:

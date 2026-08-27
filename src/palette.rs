@@ -9,9 +9,7 @@
 //! runs it through the same methods the buttons and keystrokes call, and the
 //! palette is gone by the time it happens.
 
-use gpui::{
-    App, Context, IntoElement, ParentElement, SharedString, Styled, Task, Window, div, px,
-};
+use gpui::{App, Context, IntoElement, ParentElement, SharedString, Styled, Task, Window, div, px};
 use gpui_component::{
     IndexPath,
     list::{ListDelegate, ListItem, ListState},
@@ -189,14 +187,24 @@ impl ListDelegate for Palette {
         )
     }
 
-    fn render_empty(&mut self, _: &mut Window, cx: &mut Context<ListState<Self>>) -> impl IntoElement {
+    fn render_empty(
+        &mut self,
+        _: &mut Window,
+        cx: &mut Context<ListState<Self>>,
+    ) -> impl IntoElement {
         div()
             .p(px(layout::SPACE_MD))
             .text_color(theme(cx).text_muted)
             .child("No matches.")
     }
 
-    fn set_selected_index(&mut self, _: Option<IndexPath>, _: &mut Window, _: &mut Context<ListState<Self>>) {}
+    fn set_selected_index(
+        &mut self,
+        _: Option<IndexPath>,
+        _: &mut Window,
+        _: &mut Context<ListState<Self>>,
+    ) {
+    }
 }
 
 /// Everything the active profile can open: its buffers first, because they are
@@ -221,32 +229,44 @@ fn jump_items(profile: &Profile) -> Vec<Item> {
         return items;
     };
     for (schema_index, schema) in catalog.schemas.iter().enumerate() {
-        items.extend(schema.relations.iter().enumerate().map(|(relation_index, relation)| {
-            let kind = ObjectKind::Relation(relation.kind);
-            Item {
-                // Qualified, so a name that appears in three schemas is three
-                // rows that can be told apart, and "pub acc" reaches one of them.
-                label: format!("{}.{}", schema.name, relation.name),
-                hint: kind_label(kind).into(),
-                icon: object_icon(kind),
-                command: Command::OpenObject(ExplorerTarget::Relation {
-                    schema_index,
-                    relation_index,
+        items.extend(
+            schema
+                .relations
+                .iter()
+                .enumerate()
+                .map(|(relation_index, relation)| {
+                    let kind = ObjectKind::Relation(relation.kind);
+                    Item {
+                        // Qualified, so a name that appears in three schemas is three
+                        // rows that can be told apart, and "pub acc" reaches one of them.
+                        label: format!("{}.{}", schema.name, relation.name),
+                        hint: kind_label(kind).into(),
+                        icon: object_icon(kind),
+                        command: Command::OpenObject(ExplorerTarget::Relation {
+                            schema_index,
+                            relation_index,
+                        }),
+                    }
                 }),
-            }
-        }));
-        items.extend(schema.routines.iter().enumerate().map(|(routine_index, routine)| {
-            let kind = ObjectKind::Routine(routine.kind);
-            Item {
-                label: format!("{}.{}", schema.name, routine_name(routine)),
-                hint: kind_label(kind).into(),
-                icon: object_icon(kind),
-                command: Command::OpenObject(ExplorerTarget::Routine {
-                    schema_index,
-                    routine_index,
+        );
+        items.extend(
+            schema
+                .routines
+                .iter()
+                .enumerate()
+                .map(|(routine_index, routine)| {
+                    let kind = ObjectKind::Routine(routine.kind);
+                    Item {
+                        label: format!("{}.{}", schema.name, routine_name(routine)),
+                        hint: kind_label(kind).into(),
+                        icon: object_icon(kind),
+                        command: Command::OpenObject(ExplorerTarget::Routine {
+                            schema_index,
+                            routine_index,
+                        }),
+                    }
                 }),
-            }
-        }));
+        );
     }
     items
 }
@@ -264,7 +284,12 @@ fn command_items(workspace: &Workspace, profile: &Profile, cx: &App) -> Vec<Item
     )];
 
     if runnable {
-        items.push(Item::command("Run query", "⌘↩", icon::RUN, Command::RunQuery));
+        items.push(Item::command(
+            "Run query",
+            "⌘↩",
+            icon::RUN,
+            Command::RunQuery,
+        ));
         if session.open_query.is_some() {
             items.push(Item::command(
                 "Rename query",
@@ -273,7 +298,12 @@ fn command_items(workspace: &Workspace, profile: &Profile, cx: &App) -> Vec<Item
                 Command::RenameQuery,
             ));
         } else {
-            items.push(Item::command("Save query", "⌘S", icon::SAVE, Command::SaveQuery));
+            items.push(Item::command(
+                "Save query",
+                "⌘S",
+                icon::SAVE,
+                Command::SaveQuery,
+            ));
         }
     }
 
@@ -310,7 +340,12 @@ fn command_items(workspace: &Workspace, profile: &Profile, cx: &App) -> Vec<Item
     // Only while there is something to write back, for the reason the footer's
     // pair of buttons is conditional too.
     if workspace.has_pending_edits(cx) {
-        items.push(Item::command("Apply edits", "", icon::SAVE, Command::ApplyEdits));
+        items.push(Item::command(
+            "Apply edits",
+            "",
+            icon::SAVE,
+            Command::ApplyEdits,
+        ));
         items.push(Item::command(
             "Discard edits",
             "",

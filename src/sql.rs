@@ -15,9 +15,9 @@
 
 use std::ops::Range;
 
-use tree_sitter::{Parser, Tree};
+use tree_sitter::{Node, Parser, Tree};
 
-use crate::{db::quote_literal, explorer::quote_identifier};
+use crate::db::Engine;
 
 /// The runnable statements of a query buffer, as byte ranges into it.
 pub struct Buffer {
@@ -181,15 +181,16 @@ pub fn with_order_by(statement: &str, keys: &[SortKey]) -> Option<String> {
 ///
 /// Values go in as literals and are never cast. Postgres applies the target
 /// column's assignment cast, so `'123'` lands in an `int4` exactly as `123`
-/// would, and a cast Slate chose for itself could only ever be the wrong one.
-/// A cleared cell is therefore the empty string; writing a NULL is not
-/// expressible here.
+/// would, and SQLite applies the column's type affinity to the same effect. A
+/// cast Slate chose for itself could only ever be the wrong one. A cleared cell
+/// is therefore the empty string; writing a NULL is not expressible here.
 ///
 /// `None` when either list is empty. A statement with no `WHERE` rewrites every
 /// row in the table and one with no `SET` is not a statement at all, so a caller
 /// that has lost the row's key gets nothing to run rather than something that
 /// runs.
 pub fn update_row(
+    engine: Engine,
     schema: &str,
     table: &str,
     sets: &[(&str, &str)],
@@ -200,11 +201,10 @@ pub fn update_row(
     }
 
     Some(format!(
-        "UPDATE {}.{} SET {} WHERE {}",
-        quote_identifier(schema),
-        quote_identifier(table),
-        assignments(sets, ", "),
-        assignments(keys, " AND ")
+        "UPDATE {} SET {} WHERE {}",
+        engine.qualified(schema, table),
+        assignments(engine, sets, ", "),
+        assignments(engine, keys, " AND ")
     ))
 }
 
@@ -220,8 +220,9 @@ pub fn is_generated_update(sql: &str) -> bool {
         return false;
     };
     let root = tree.root_node();
-    let mut cursor = root.walk();
-    let statements: Vec<_> = root.named_children(&mut cursor).collect();
+    let Some(statements) = generated_statements(&root) else {
+        return false;
+    };
 
     // Comments are tree-sitter extras and land at the root too, so anything
     // that is not a statement here is something Slate did not generate.
@@ -235,10 +236,46 @@ pub fn is_generated_update(sql: &str) -> bool {
         && !destructive(root)
 }
 
-fn assignments(columns: &[(&str, &str)], separator: &str) -> String {
+/// The statements to check, seeing through the transaction that brackets a
+/// batch on an engine which does not make one submission atomic by itself.
+///
+/// The brackets are verified rather than assumed. A `BEGIN` without its
+/// `COMMIT` would leave the session in an open transaction, and putting a user
+/// in that state without them having written it is exactly what this gate
+/// exists to prevent.
+fn generated_statements<'tree>(root: &Node<'tree>) -> Option<Vec<Node<'tree>>> {
+    let mut cursor = root.walk();
+    let children: Vec<_> = root.named_children(&mut cursor).collect();
+
+    let [transaction] = children.as_slice() else {
+        return Some(children);
+    };
+    if transaction.kind() != "transaction" {
+        return Some(children);
+    }
+
+    let mut cursor = transaction.walk();
+    let bracketed: Vec<_> = transaction.named_children(&mut cursor).collect();
+    match bracketed.as_slice() {
+        [begin, statements @ .., commit]
+            if begin.kind() == "keyword_begin" && commit.kind() == "keyword_commit" =>
+        {
+            Some(statements.to_vec())
+        }
+        _ => None,
+    }
+}
+
+fn assignments(engine: Engine, columns: &[(&str, &str)], separator: &str) -> String {
     columns
         .iter()
-        .map(|(column, value)| format!("{} = {}", quote_identifier(column), quote_literal(value)))
+        .map(|(column, value)| {
+            format!(
+                "{} = {}",
+                engine.quote_identifier(column),
+                engine.quote_literal(value)
+            )
+        })
         .collect::<Vec<_>>()
         .join(separator)
 }
@@ -277,10 +314,7 @@ fn parse(sql: &str) -> Option<Tree> {
 /// The node whose children carry `ORDER BY` and `LIMIT`: the query's outermost
 /// `FROM`. A subquery's own clauses hang under its `subquery` node instead, so
 /// looking only at this node's children cannot reach into one by accident.
-fn clause_anchor<'tree>(
-    tree: &'tree Tree,
-    sql: &str,
-) -> Option<tree_sitter::Node<'tree>> {
+fn clause_anchor<'tree>(tree: &'tree Tree, sql: &str) -> Option<tree_sitter::Node<'tree>> {
     let root = tree.root_node();
     let mut cursor = root.walk();
     let statements: Vec<_> = root
@@ -300,10 +334,7 @@ fn clause_anchor<'tree>(
     let children: Vec<_> = statement.named_children(&mut cursor).collect();
     // A `UNION` puts the whole query's `ORDER BY` after its last branch, so its
     // clauses hang under the set operation rather than the statement.
-    if let Some(set_operation) = children
-        .iter()
-        .find(|node| node.kind() == "set_operation")
-    {
+    if let Some(set_operation) = children.iter().find(|node| node.kind() == "set_operation") {
         let mut cursor = set_operation.walk();
         let branches: Vec<_> = set_operation.named_children(&mut cursor).collect();
         return select_anchor(&branches);
@@ -622,7 +653,10 @@ mod tests {
         let sql = "SELECT 1;\nSELECT 2;";
         let buffer = Buffer::parse(sql);
         let inside_second = sql.find("SELECT 2").unwrap() + 3;
-        assert_eq!(&sql[buffer.statement_at(inside_second).unwrap()], "SELECT 2");
+        assert_eq!(
+            &sql[buffer.statement_at(inside_second).unwrap()],
+            "SELECT 2"
+        );
     }
 
     #[test]
@@ -657,7 +691,10 @@ mod tests {
         let buffer = Buffer::parse(sql);
 
         assert!(buffer.statement_at(3).is_some());
-        assert_eq!(&sql[buffer.statement_at(sql.len()).unwrap()], "SELECT * FROM");
+        assert_eq!(
+            &sql[buffer.statement_at(sql.len()).unwrap()],
+            "SELECT * FROM"
+        );
     }
 
     #[test]
@@ -741,11 +778,19 @@ mod tests {
         // statement the server rejects; a missing one in the WHERE would be a
         // statement it accepts and applies to the wrong rows.
         assert_eq!(
-            update_row("public", "measurements", &[("note", "ok")], &[("id", "7")]).unwrap(),
+            update_row(
+                Engine::Postgres,
+                "public",
+                "measurements",
+                &[("note", "ok")],
+                &[("id", "7")]
+            )
+            .unwrap(),
             r#"UPDATE "public"."measurements" SET "note" = 'ok' WHERE "id" = '7'"#
         );
         assert_eq!(
             update_row(
+                Engine::Postgres,
                 "public",
                 "measurements",
                 &[("note", "ok"), ("depth", "12")],
@@ -762,6 +807,7 @@ mod tests {
         // never edited.
         assert_eq!(
             update_row(
+                Engine::Postgres,
                 "app",
                 "memberships",
                 &[("role", "owner")],
@@ -777,11 +823,25 @@ mod tests {
         // An apostrophe in a value and a double quote in a column name are the
         // two ways a cell's contents become SQL of its own.
         assert_eq!(
-            update_row("s", "t", &[("a", "it's")], &[("id", "o'hara")]).unwrap(),
+            update_row(
+                Engine::Postgres,
+                "s",
+                "t",
+                &[("a", "it's")],
+                &[("id", "o'hara")]
+            )
+            .unwrap(),
             r#"UPDATE "s"."t" SET "a" = 'it''s' WHERE "id" = 'o''hara'"#
         );
         assert_eq!(
-            update_row("s", r#"od"d"#, &[(r#"we"ird"#, "x")], &[("id", "1")]).unwrap(),
+            update_row(
+                Engine::Postgres,
+                "s",
+                r#"od"d"#,
+                &[(r#"we"ird"#, "x")],
+                &[("id", "1")]
+            )
+            .unwrap(),
             r#"UPDATE "s"."od""d" SET "we""ird" = 'x' WHERE "id" = '1'"#
         );
     }
@@ -790,8 +850,8 @@ mod tests {
     fn an_update_with_nothing_to_match_on_is_refused() {
         // No WHERE rewrites every row in the table. It must not be possible to
         // produce that statement, so a caller with no key gets nothing.
-        assert!(update_row("s", "t", &[("a", "1")], &[]).is_none());
-        assert!(update_row("s", "t", &[], &[("id", "1")]).is_none());
+        assert!(update_row(Engine::Postgres, "s", "t", &[("a", "1")], &[]).is_none());
+        assert!(update_row(Engine::Postgres, "s", "t", &[], &[("id", "1")]).is_none());
     }
 
     #[test]
@@ -799,6 +859,38 @@ mod tests {
         assert!(is_generated_update("UPDATE t SET a = '1' WHERE id = '2'"));
         assert!(is_generated_update(
             "UPDATE t SET a = '1' WHERE id = '2'; UPDATE t SET a = '3' WHERE id = '4'"
+        ));
+    }
+
+    #[test]
+    fn the_gate_accepts_a_batch_bracketed_by_a_transaction() {
+        // What Slate writes for an engine that commits each statement on its
+        // own. The brackets are part of the generated statement, so the gate
+        // has to know the shape or it would refuse Slate's own output.
+        assert!(is_generated_update(
+            "BEGIN;\nUPDATE t SET a = '1' WHERE id = '2';\n\
+             UPDATE t SET a = '3' WHERE id = '4';\nCOMMIT;"
+        ));
+    }
+
+    #[test]
+    fn the_gate_refuses_a_transaction_it_does_not_see_closed() {
+        // A BEGIN whose COMMIT went missing leaves the session holding an open
+        // transaction the user never wrote, which is worse than not applying
+        // the edit at all.
+        for sql in [
+            "BEGIN;\nUPDATE t SET a = '1' WHERE id = '2';",
+            "BEGIN;\nUPDATE t SET a = '1' WHERE id = '2';\nROLLBACK;",
+        ] {
+            assert!(!is_generated_update(sql), "{sql:?} passed the gate");
+        }
+    }
+
+    #[test]
+    fn the_gate_refuses_a_destructive_statement_inside_the_brackets() {
+        // Seeing through the transaction must not mean trusting what is in it.
+        assert!(!is_generated_update(
+            "BEGIN;\nUPDATE t SET a = '1' WHERE id = '2';\nDELETE FROM t;\nCOMMIT;"
         ));
     }
 
@@ -861,6 +953,7 @@ mod tests {
         // apart: whatever quoting or clause order changes here, the statement
         // Slate builds is still one the gate can read as an UPDATE.
         let statement = update_row(
+            Engine::Postgres,
             "public",
             "measurements",
             &[("note", "it's fine"), ("depth", "12")],

@@ -1,6 +1,7 @@
 # Slate
 
-A native macOS Postgres client. Rust, GPUI, no Electron.
+A native macOS SQL client, speaking Postgres and SQLite. Rust, GPUI, no
+Electron.
 
 A SQL editor that shows results — not a database browser with an editor bolted
 on. Keyboard-first, minimal, and built to stay at display refresh rate on real
@@ -9,7 +10,8 @@ data.
 > **Status: early development.** Everything below under "What works" runs today.
 >
 > Design: [`docs/specs/2026-08-17-slate-design.md`](docs/specs/2026-08-17-slate-design.md),
-> amended by [`docs/specs/2026-08-23-in-grid-editing-design.md`](docs/specs/2026-08-23-in-grid-editing-design.md).
+> amended by [`docs/specs/2026-08-23-in-grid-editing-design.md`](docs/specs/2026-08-23-in-grid-editing-design.md)
+> and [`docs/specs/2026-08-26-multi-engine-design.md`](docs/specs/2026-08-26-multi-engine-design.md).
 
 ## Development database
 
@@ -41,6 +43,27 @@ changing a seed file:
 docker compose down --volumes
 docker compose up -d postgres
 ```
+
+MySQL and SQLite carry the same demo objects, minus anything PostGIS-specific.
+MySQL runs the same way, on its own container:
+
+```sh
+docker compose up -d mysql
+```
+
+```text
+mysql://slate:slate@127.0.0.1:53306/slate_dev
+```
+
+SQLite is a file, not a service — build it once with the system `sqlite3`:
+
+```sh
+sqlite3 dev/slate_dev.db < dev/sqlite/001-slate-demo.sql
+```
+
+Paste a URL, or the SQLite file path, into the connection form. `PG*`
+environment variables remain Postgres-only; the other two engines connect
+through the form.
 
 ## What works
 

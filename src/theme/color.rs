@@ -112,7 +112,9 @@ impl Srgb {
 
     /// WCAG 2.1 relative luminance.
     pub fn relative_luminance(self) -> f32 {
-        0.2126 * gamma_decode(self.r) + 0.7152 * gamma_decode(self.g) + 0.0722 * gamma_decode(self.b)
+        0.2126 * gamma_decode(self.r)
+            + 0.7152 * gamma_decode(self.g)
+            + 0.0722 * gamma_decode(self.b)
     }
 
     /// Composite `self` over `backdrop` at `alpha`, in gamma-encoded space.

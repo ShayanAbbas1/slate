@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use gpui_component::tree::TreeItem;
 
-use crate::db::{Catalog, Relation, RelationKind, Routine, RoutineKind};
+use crate::db::{Catalog, Engine, Relation, RelationKind, Routine, RoutineKind};
 
 /// The row counts a preview can be asked for, and the one it opens with. Every
 /// result set is capped (spec §4.3); this is the part of the cap the user gets
@@ -106,7 +106,8 @@ pub fn tree(catalog: &Catalog, filter: &str) -> ExplorerTree {
                     .iter()
                     .enumerate()
                     .filter(|(_, routine)| {
-                        routine.kind == kind && (schema_matches || routine_matches(routine, &filter))
+                        routine.kind == kind
+                            && (schema_matches || routine_matches(routine, &filter))
                     })
                     .map(|(routine_index, routine)| {
                         let id = format!("routine-{schema_index}-{routine_index}");
@@ -153,16 +154,11 @@ fn category(label: &'static str, schema_index: usize, children: Vec<TreeItem>) -
         .children(children)
 }
 
-pub fn preview_sql(schema: &str, relation: &str, limit: usize) -> String {
+pub fn preview_sql(engine: Engine, schema: &str, relation: &str, limit: usize) -> String {
     format!(
-        "SELECT * FROM {}.{} LIMIT {limit}",
-        quote_identifier(schema),
-        quote_identifier(relation)
+        "SELECT * FROM {} LIMIT {limit}",
+        engine.qualified(schema, relation)
     )
-}
-
-pub(crate) fn quote_identifier(identifier: &str) -> String {
-    format!("\"{}\"", identifier.replace('"', "\"\""))
 }
 
 fn relation_matches(relation: &Relation, filter: &str) -> bool {
@@ -253,7 +249,10 @@ mod tests {
         let categories = &explorer.items[0].children;
 
         assert_eq!(
-            categories.iter().map(|c| c.label.as_ref()).collect::<Vec<_>>(),
+            categories
+                .iter()
+                .map(|c| c.label.as_ref())
+                .collect::<Vec<_>>(),
             ["Tables", "Views", "Functions", "Procedures"]
         );
         assert_eq!(categories[0].children[0].label, "accounts");
@@ -306,7 +305,12 @@ mod tests {
     #[test]
     fn preview_sql_quotes_every_identifier_and_exposes_the_limit() {
         assert_eq!(
-            preview_sql(r#"odd"schema"#, r#"table"name"#, PREVIEW_ROW_LIMIT),
+            preview_sql(
+                Engine::Postgres,
+                r#"odd"schema"#,
+                r#"table"name"#,
+                PREVIEW_ROW_LIMIT
+            ),
             r#"SELECT * FROM "odd""schema"."table""name" LIMIT 1000"#
         );
     }

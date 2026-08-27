@@ -4,6 +4,9 @@
 
 .DS_Store
 
+# Build product of dev/sqlite/001-slate-demo.sql, not a source file.
+dev/slate_dev.db
+
 # Private working notes live in the Claude project directory, not here.
 # See AGENTS.md. Anything matching these belongs outside the repo entirely.
 WORKLOG.md

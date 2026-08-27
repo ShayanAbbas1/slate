@@ -86,8 +86,12 @@ impl SslMode {
             Self::Disable => "Never encrypted.",
             Self::Prefer => "Encrypted when the server offers it. The certificate is not checked.",
             Self::Require => "Always encrypted. The certificate is not checked.",
-            Self::VerifyCa => "The certificate must be signed by a trusted authority. Its host name is not checked.",
-            Self::VerifyFull => "The certificate must be signed by a trusted authority and issued for this host.",
+            Self::VerifyCa => {
+                "The certificate must be signed by a trusted authority. Its host name is not checked."
+            }
+            Self::VerifyFull => {
+                "The certificate must be signed by a trusted authority and issued for this host."
+            }
         }
     }
 
@@ -202,11 +206,11 @@ fn roots(root_certificate: Option<&str>) -> Result<RootCertStore, String> {
         return Ok(store);
     };
 
-    let file = std::fs::File::open(path).map_err(|error| format!("Could not read {path}: {error}"))?;
+    let file =
+        std::fs::File::open(path).map_err(|error| format!("Could not read {path}: {error}"))?;
     let mut reader = std::io::BufReader::new(file);
     for certificate in rustls_pemfile::certs(&mut reader) {
-        let certificate =
-            certificate.map_err(|error| format!("Could not read {path}: {error}"))?;
+        let certificate = certificate.map_err(|error| format!("Could not read {path}: {error}"))?;
         store
             .add(certificate)
             .map_err(|error| format!("{path} does not hold a usable certificate: {error}"))?;
@@ -412,8 +416,6 @@ mod tests {
         // prevent.
         let missing = connector(SslMode::VerifyFull, Some("/nonexistent/ca.pem"));
         assert!(missing.is_err());
-        assert!(
-            connector(SslMode::VerifyCa, Some("/nonexistent/ca.pem")).is_err()
-        );
+        assert!(connector(SslMode::VerifyCa, Some("/nonexistent/ca.pem")).is_err());
     }
 }
