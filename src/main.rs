@@ -632,6 +632,14 @@ struct ConnectionForm {
     /// Only reachable while the mode consults one, so the field cannot sit
     /// there filled in and doing nothing.
     root_certificate: Entity<InputState>,
+    /// An input to focus once it has been mounted.
+    ///
+    /// A chip can unmount the field the user was typing in, and a window with
+    /// nothing focused has no dispatch path — every keybinding in the app goes
+    /// dead until something is clicked. So whichever chip takes a field away
+    /// names the one that replaces it, and `Workspace::render` hands focus over
+    /// on the next frame, once it exists to receive it.
+    needs_focus: Option<Entity<InputState>>,
     error: Option<String>,
 }
 
@@ -716,6 +724,7 @@ impl ConnectionForm {
             password,
             sslmode: server.map(|server| server.sslmode).unwrap_or_default(),
             root_certificate,
+            needs_focus: None,
             error: None,
         }
     }
@@ -1229,6 +1238,15 @@ impl Workspace {
             .child(engine.label())
             .on_click(cx.listener(move |workspace, _, _, cx| {
                 if let Some(form) = &mut workspace.form {
+                    // Only when the field set actually changes: Postgres and
+                    // MySQL show the same fields, so switching between them
+                    // takes nothing away and must not take focus either.
+                    if form.engine.is_server() != engine.is_server() {
+                        form.needs_focus = Some(match engine.is_server() {
+                            true => form.host.clone(),
+                            false => form.path.clone(),
+                        });
+                    }
                     form.engine = engine;
                     // The error belonged to the fields that just left the
                     // screen, so it would be reporting something invisible.
@@ -1262,6 +1280,11 @@ impl Workspace {
             .child(mode.label())
             .on_click(cx.listener(move |workspace, _, _, cx| {
                 if let Some(form) = &mut workspace.form {
+                    // Stepping down from a verifying mode unmounts the
+                    // certificate field, which may be the one holding focus.
+                    if form.sslmode.checks_certificate() && !mode.checks_certificate() {
+                        form.needs_focus = Some(form.password.clone());
+                    }
                     form.sslmode = mode;
                     cx.notify();
                 }
@@ -3610,6 +3633,13 @@ impl Render for Workspace {
             profile.session.editor_needs_focus = false;
             Some(focus)
         });
+        // Before the tab's own focus, and separately: the form is a surface of
+        // its own, and a field it just unmounted took the window's only
+        // dispatch path with it.
+        if let Some(input) = self.form.as_mut().and_then(|form| form.needs_focus.take()) {
+            input.focus_handle(cx).focus(window);
+        }
+
         match take_focus {
             Some(Focus::Buffer(input)) => input.focus_handle(cx).focus(window),
             Some(Focus::Grid(grid)) => grid.focus_handle(cx).focus(window),
