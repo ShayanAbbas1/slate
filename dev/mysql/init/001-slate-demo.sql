@@ -78,6 +78,86 @@ INSERT INTO accounts (
         '2024-05-05 05:05:05'
     );
 
+-- Five thousand rows, so scrolling, sorting and the row-count chip have
+-- something to work against rather than a grid that fits on screen.
+--
+-- The recursive CTE needs its ceiling raised first: `cte_max_recursion_depth`
+-- defaults to 1,000, and the failure is an error rather than a short table.
+SET SESSION cte_max_recursion_depth = 10000;
+
+CREATE TABLE measurements (
+    id BIGINT PRIMARY KEY,
+    recorded_at DATETIME(6) NOT NULL,
+    sensor VARCHAR(32) NOT NULL,
+    temperature_c DOUBLE,
+    pressure_kpa DECIMAL(8, 3),
+    healthy BOOLEAN NOT NULL,
+    samples JSON NOT NULL,
+    payload JSON NOT NULL
+);
+
+-- The `WITH` goes after `INSERT INTO`, which is the only place MySQL
+-- accepts one on an `INSERT ... SELECT`.
+INSERT INTO measurements
+WITH RECURSIVE series (sample) AS (
+    SELECT 1
+    UNION ALL
+    SELECT sample + 1 FROM series WHERE sample < 5000
+)
+SELECT
+    sample,
+    TIMESTAMPADD(SECOND, sample * 15, '2025-01-01 00:00:00'),
+    CONCAT('sensor-', LPAD((sample - 1) % 24 + 1, 2, '0')),
+    -- A null every 97th row, so the grid's null rendering is reachable by
+    -- scrolling rather than only by writing a query for it.
+    CASE WHEN sample % 97 = 0 THEN NULL ELSE 18.0 + (sample % 150) / 10.0 END,
+    98.000 + (sample % 700) / 1000.0,
+    sample % 113 <> 0,
+    JSON_ARRAY(sample % 10, sample % 20, sample % 30),
+    JSON_OBJECT(
+        'sequence', sample,
+        'firmware', CONCAT('v', 1 + sample % 3, '.', sample % 10),
+        'flags', JSON_ARRAY(sample % 2 = 0, sample % 5 = 0)
+    )
+FROM series;
+
+-- Values far larger than a cell can show, and values a cell would misread:
+-- embedded newlines, an embedded semicolon, a JSON null, and raw bytes.
+CREATE TABLE documents (
+    id INT PRIMARY KEY,
+    title TEXT NOT NULL,
+    body LONGTEXT,
+    document JSON,
+    binary_value LONGBLOB
+);
+
+INSERT INTO documents VALUES (
+    1,
+    'Multiline text',
+    'first line\nsecond line\nthird line; with a semicolon',
+    JSON_OBJECT('kind', 'short', 'nested', JSON_OBJECT('null_value', CAST('null' AS JSON))),
+    UNHEX('00010203feff')
+);
+
+-- The `WITH` goes after `INSERT INTO`, which is the only place MySQL
+-- accepts one on an `INSERT ... SELECT`.
+INSERT INTO documents
+WITH RECURSIVE series (value) AS (
+    SELECT 1
+    UNION ALL
+    SELECT value + 1 FROM series WHERE value < 500
+)
+SELECT
+    2,
+    'Large values',
+    REPEAT('Slate keeps the complete value while the grid clips visually. ', 2048),
+    JSON_OBJECT(
+        'kind', 'large',
+        'values', JSON_ARRAYAGG(JSON_OBJECT('index', value, 'square', value * value))
+    ),
+    UNHEX(REPEAT('deadbeef', 4096))
+FROM series;
+
 -- Geometry columns (`point`, `boundary`) are PostGIS-only; MySQL geometry
 -- support is out of scope (see docs/specs/2026-08-26-multi-engine-design.md §10).
 CREATE TABLE locations (
@@ -112,6 +192,12 @@ BEGIN
     FROM accounts
     WHERE id = account_id;
     RETURN label;
+END$$
+
+CREATE PROCEDURE deactivate_account(account_id BIGINT)
+MODIFIES SQL DATA
+BEGIN
+    UPDATE accounts SET active = FALSE WHERE id = account_id;
 END$$
 
 DELIMITER ;

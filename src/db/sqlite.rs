@@ -1086,6 +1086,20 @@ mod tests {
 
     #[test]
     #[ignore = "requires the repository development database configured through SLATE_SQLITE_PATH"]
+    fn live_the_development_database_is_fully_seeded() {
+        // The seed is applied by a tool outside this test suite, and a seed that
+        // half-applied still leaves something to connect to -- the MySQL
+        // container reports itself healthy either way. So the volume table is
+        // checked by count rather than assumed.
+        let result = live()
+            .query("SELECT count(*) AS rows_seeded FROM measurements")
+            .expect("query should succeed");
+
+        assert_eq!(result.rows[0][0].as_deref(), Some("5000"));
+    }
+
+    #[test]
+    #[ignore = "requires the repository development database configured through SLATE_SQLITE_PATH"]
     fn live_query_round_trip() {
         let result = live()
             .query("SELECT id, name FROM accounts ORDER BY id")
