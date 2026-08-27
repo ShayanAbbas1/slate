@@ -7,6 +7,10 @@ A native macOS Postgres client written in Rust on GPUI. Fast, minimal, and
 keyboard-first — a SQL editor that shows results, not a database browser with an
 editor bolted on.
 
+> Slate now speaks MySQL and SQLite as well. §4.1 and the two non-goal rows
+> about a second engine are superseded by
+> `2026-08-26-multi-engine-design.md`; everything else here still holds.
+
 ---
 
 ## 1. What Slate is
@@ -38,7 +42,7 @@ Explicitly out of scope for v1. Each is a deliberate cut, not an oversight.
 | Visual filter and join builders | Users who reach for a SQL client write SQL. |
 | Foreign-key navigation | Depends on the browser-first model Slate rejects. |
 | SSH tunneling | Additive later; the config is shaped for it. |
-| Engines other than Postgres | See §4.1 — no driver abstraction until there is a second driver. |
+| ~~Engines other than Postgres~~ | Superseded — see `2026-08-26-multi-engine-design.md`. The rule §4.1 was protecting held and is why the change was a refactor: engine dispatch is a closed enum in `src/db/`, still not a trait. |
 | Multiple windows | Single window, single root entity. |
 | CSV / Parquet export | Clipboard copy covers the common case. Cheap to add on demand. |
 | Configurable keybindings | Hardcoded in v1. |
@@ -129,6 +133,11 @@ searchable input, but **no fuzzy scoring** — that is ours.
 ## 4. Data layer
 
 ### 4.1 No driver abstraction
+
+Superseded by `2026-08-26-multi-engine-design.md`, and the prediction in its last
+sentence held: the second and third engines were a refactor, not a rewrite,
+because the discipline below had been kept. Dispatch is a closed enum in
+`src/db/` — still not a trait, for the reason given here.
 
 Postgres only, with no trait boundary. A trait with one implementation is a lie
 about the code's generality and it makes every call site harder to read.
@@ -433,7 +442,8 @@ and a syntax error shows up under the editor instead of crashing.
 
 Animation and transitions · SSH tunneling · cloud IAM authentication · CSV export
 · configurable keybindings · views and functions in the schema inspector ·
-server-side cursors for unbounded result sets · a second database engine ·
+server-side cursors for unbounded result sets · ~~a second database engine~~
+(landed — `2026-08-26-multi-engine-design.md`) ·
 ~~row editing~~ (no longer deferred — `2026-08-23-in-grid-editing-design.md`).
 
 ---
