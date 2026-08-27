@@ -75,14 +75,37 @@ impl Engine {
 
     /// Postgres and SQLite take the standard's double quote. MySQL takes a
     /// backtick, which it accepts whether or not `ANSI_QUOTES` is set — a double
-    /// quote there is a string literal unless the server was configured
-    /// otherwise, and Slate does not configure servers.
-    pub fn quote_identifier(self, identifier: &str) -> String {
+    /// quote there is a *string literal*, so quoting a MySQL identifier the
+    /// standard way produces a statement that runs and means something else.
+    fn identifier_quote(self) -> char {
         match self {
-            Self::Postgres | Self::Sqlite => {
-                format!("\"{}\"", identifier.replace('"', "\"\""))
-            }
-            Self::MySql => format!("`{}`", identifier.replace('`', "``")),
+            Self::Postgres | Self::Sqlite => '"',
+            Self::MySql => '`',
+        }
+    }
+
+    pub fn quote_identifier(self, identifier: &str) -> String {
+        let quote = self.identifier_quote();
+        format!(
+            "{quote}{}{quote}",
+            identifier.replace(quote, &format!("{quote}{quote}"))
+        )
+    }
+
+    /// The inverse, for reading back a name Slate wrote — matching a sort key in
+    /// a statement to the column header it belongs to, say.
+    ///
+    /// Anything that is not a quoted identifier comes back unchanged: a bare
+    /// position or a function call names no column, and pretending otherwise
+    /// would light up the wrong header.
+    pub fn unquote_identifier(self, expression: &str) -> String {
+        let quote = self.identifier_quote();
+        match expression
+            .strip_prefix(quote)
+            .and_then(|rest| rest.strip_suffix(quote))
+        {
+            Some(inner) => inner.replace(&format!("{quote}{quote}"), &quote.to_string()),
+            None => expression.to_string(),
         }
     }
 
@@ -695,6 +718,26 @@ mod tests {
             Engine::MySql.qualified("slate_dev", "table"),
             "`slate_dev`.`table`"
         );
+    }
+
+    #[test]
+    fn a_quoted_identifier_reads_back_as_the_name_it_was() {
+        // The two halves have to agree or Slate cannot recognise its own
+        // output: a sort key it wrote would not match the header it came from.
+        for engine in Engine::ALL {
+            for name in ["id", "odd\"name", "odd`name", "spaced name", ""] {
+                assert_eq!(
+                    engine.unquote_identifier(&engine.quote_identifier(name)),
+                    name,
+                    "{engine:?} {name}"
+                );
+            }
+
+            // Not a quoted identifier, so not a name. A bare position and a
+            // function call both have to survive untouched.
+            assert_eq!(engine.unquote_identifier("3"), "3");
+            assert_eq!(engine.unquote_identifier("lower(name)"), "lower(name)");
+        }
     }
 
     #[test]

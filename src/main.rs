@@ -1685,13 +1685,15 @@ impl Workspace {
     /// A header click on a relation tab: move that column through the sort and
     /// ask the server again.
     fn relation_sort(&mut self, id: u64, column: usize, cx: &mut Context<Self>) {
+        let engine = self.engine();
         let Some(profile) = self.profile_mut() else {
             return;
         };
         let Some((_, results)) = profile.session.slot(Tab::Object(id)) else {
             return;
         };
-        let Some(expression) = sort_expression(results.read(cx).delegate().columns(), column)
+        let Some(expression) =
+            sort_expression(engine, results.read(cx).delegate().columns(), column)
         else {
             return;
         };
@@ -2179,13 +2181,15 @@ impl Workspace {
     /// where they can see it, edit it and undo it. Slate changes SQL only when
     /// asked, and a header click is the ask (`AGENTS.md`, rule 1).
     fn query_sort(&mut self, column: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let engine = self.engine();
         let Some(profile) = self.profile() else {
             return;
         };
         let editor = profile.session.editor.clone();
         let results = profile.session.results.clone();
 
-        let Some(expression) = sort_expression(results.read(cx).delegate().columns(), column)
+        let Some(expression) =
+            sort_expression(engine, results.read(cx).delegate().columns(), column)
         else {
             return;
         };
@@ -2726,6 +2730,8 @@ impl Workspace {
         refresh: Option<Refresh>,
         cx: &mut Context<Self>,
     ) {
+        // Read before the task, which outlives the borrow of `self`.
+        let engine = self.engine();
         let Some(profile) = self.profile_mut() else {
             return;
         };
@@ -2798,7 +2804,7 @@ impl Workspace {
                                 };
                                 let produced_grid = !result.columns.is_empty();
                                 results.update(cx, |table, cx| {
-                                    let sort = sort_columns(&keys, &result.columns);
+                                    let sort = sort_columns(engine, &keys, &result.columns);
                                     *table.delegate_mut() =
                                         ResultGrid::new(result).with_sort(sort, sortable);
                                     table.refresh(cx);
@@ -3934,12 +3940,12 @@ fn appended_statement(buffer: &str, statement: &str) -> String {
 /// By name, so the statement reads as something a person would have written --
 /// except where a name cannot identify one column, and then by position, which
 /// always can. Duplicate names come back from any join written with `*`.
-fn sort_expression(columns: &[db::Column], column: usize) -> Option<String> {
+fn sort_expression(engine: Engine, columns: &[db::Column], column: usize) -> Option<String> {
     let name = &columns.get(column)?.name;
     let unique = columns.iter().filter(|other| &other.name == name).count() == 1;
 
     Some(match unique && !name.is_empty() {
-        true => format!("\"{}\"", name.replace('"', "\"\"")),
+        true => engine.quote_identifier(name),
         false => (column + 1).to_string(),
     })
 }
@@ -3959,11 +3965,11 @@ fn cycle(keys: &mut Vec<SortKey>, expression: &str) {
 /// show. A key naming something other than a column of the result -- an
 /// expression, or a column that is not in the select list -- lights nothing up,
 /// because there is no header for it.
-fn sort_columns(keys: &[SortKey], columns: &[db::Column]) -> Vec<(usize, bool)> {
+fn sort_columns(engine: Engine, keys: &[SortKey], columns: &[db::Column]) -> Vec<(usize, bool)> {
     keys.iter()
         .filter_map(|key| {
             let expression = key.expression.trim();
-            let named = unquote(expression);
+            let named = engine.unquote_identifier(expression);
             let column = columns
                 .iter()
                 .position(|column| column.name == named)
@@ -3977,16 +3983,6 @@ fn sort_columns(keys: &[SortKey], columns: &[db::Column]) -> Vec<(usize, bool)> 
             Some((column, key.ascending))
         })
         .collect()
-}
-
-fn unquote(expression: &str) -> String {
-    match expression
-        .strip_prefix('"')
-        .and_then(|rest| rest.strip_suffix('"'))
-    {
-        Some(inner) => inner.replace("\"\"", "\""),
-        None => expression.to_string(),
-    }
 }
 
 fn object_icon(kind: ObjectKind) -> &'static str {
@@ -4411,17 +4407,55 @@ mod tests {
     #[test]
     fn a_column_is_named_in_the_order_by_unless_a_name_cannot_identify_it() {
         let unique = columns(&["id", "name"]);
-        assert_eq!(sort_expression(&unique, 1), Some(r#""name""#.into()));
+        assert_eq!(
+            sort_expression(Engine::Postgres, &unique, 1),
+            Some(r#""name""#.into())
+        );
 
         // `SELECT *` across a join returns the same name twice, and ordering by
         // it would be ambiguous -- so the position, which never is.
         let duplicated = columns(&["id", "id"]);
-        assert_eq!(sort_expression(&duplicated, 1), Some("2".into()));
-        assert_eq!(sort_expression(&unique, 7), None);
+        assert_eq!(
+            sort_expression(Engine::Postgres, &duplicated, 1),
+            Some("2".into())
+        );
+        assert_eq!(sort_expression(Engine::Postgres, &unique, 7), None);
+
+        // MySQL reads a double-quoted name as a *string literal*, so ordering
+        // by one is ordering by a constant: every row compares equal, the
+        // server raises nothing, and the grid comes back in the same order it
+        // went out. This is the assertion that catches that.
+        assert_eq!(
+            sort_expression(Engine::MySql, &unique, 1),
+            Some("`name`".into())
+        );
+        assert_eq!(
+            sort_expression(Engine::Sqlite, &unique, 1),
+            Some(r#""name""#.into())
+        );
 
         // A quote in a column name would otherwise end the identifier early.
         let odd = columns(&["we\"ird"]);
-        assert_eq!(sort_expression(&odd, 0), Some("\"we\"\"ird\"".into()));
+        assert_eq!(
+            sort_expression(Engine::Postgres, &odd, 0),
+            Some("\"we\"\"ird\"".into())
+        );
+    }
+
+    #[test]
+    fn a_sort_key_finds_its_way_back_to_the_header_it_came_from() {
+        // The round trip every engine has to survive: the expression written
+        // into the statement is the one read back out to light the header up,
+        // and the quoting in between is the engine's own.
+        let result = columns(&["id", "name"]);
+        for engine in Engine::ALL {
+            let expression = sort_expression(engine, &result, 1).expect("a unique name");
+            assert_eq!(
+                sort_columns(engine, &[SortKey::new(expression, false)], &result),
+                vec![(1, false)],
+                "{engine:?}"
+            );
+        }
     }
 
     #[test]
@@ -4435,7 +4469,10 @@ mod tests {
             SortKey::new("9", true),
         ];
 
-        assert_eq!(sort_columns(&keys, &result), vec![(1, false), (0, true)]);
+        assert_eq!(
+            sort_columns(Engine::Postgres, &keys, &result),
+            vec![(1, false), (0, true)]
+        );
     }
 
     #[test]
@@ -4486,7 +4523,11 @@ mod tests {
         );
         // And the sort Slate wrote is the sort its headers show.
         assert_eq!(
-            sort_columns(&sql::order_by(&sorted).unwrap(), &columns(&["id", "email"])),
+            sort_columns(
+                Engine::Postgres,
+                &sql::order_by(&sorted).unwrap(),
+                &columns(&["id", "email"])
+            ),
             vec![(0, false)]
         );
     }
