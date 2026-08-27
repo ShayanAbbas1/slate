@@ -83,7 +83,10 @@ fn render_editor_surface(
 
     let expanded = result_pane_is_expanded(query);
     let (editor_height, results_height) = if expanded {
-        (layout::EDITOR_DEFAULT_HEIGHT, layout::RESULTS_DEFAULT_HEIGHT)
+        (
+            layout::EDITOR_DEFAULT_HEIGHT,
+            layout::RESULTS_DEFAULT_HEIGHT,
+        )
     } else {
         (layout::EDITOR_EMPTY_HEIGHT, layout::RESULTS_EMPTY_HEIGHT)
     };
@@ -183,14 +186,15 @@ fn render_routine(tab: &ObjectTab, cx: &mut Context<Workspace>) -> AnyElement {
                         .text_color(t.text_muted)
                         .child(kind)
                         .child(format!("Language: {}", routine.language))
-                        .children((!routine.result_type.is_empty()).then(|| {
-                            div().child(format!("Returns: {}", routine.result_type))
-                        }))
-                        .child(
-                            div()
-                                .ml_auto()
-                                .child(key_hint(t, "escape", "returns to the editor")),
-                        ),
+                        .children(
+                            (!routine.result_type.is_empty())
+                                .then(|| div().child(format!("Returns: {}", routine.result_type))),
+                        )
+                        .child(div().ml_auto().child(key_hint(
+                            t,
+                            "escape",
+                            "returns to the editor",
+                        ))),
                 ),
         )
         .child(
@@ -242,8 +246,12 @@ fn render_results(
 
     let content = match query {
         QueryState::Idle if is_query => centered(
-            key_hint(t, "cmd-enter", "runs the selection or statement under the cursor")
-                .into_any_element(),
+            key_hint(
+                t,
+                "cmd-enter",
+                "runs the selection or statement under the cursor",
+            )
+            .into_any_element(),
         ),
         // A preview runs the moment its tab is shown, so an idle one is a
         // tab that is about to run rather than one waiting to be asked.
@@ -458,11 +466,11 @@ fn preview_tab(
                     .hover(|style| style.bg(t.element_hover))
             }
         })
-        .child(icon(path).size(px(12.)).text_color(if selected {
-            t.text
-        } else {
-            t.text_faint
-        }))
+        .child(
+            icon(path)
+                .size(px(12.))
+                .text_color(if selected { t.text } else { t.text_faint }),
+        )
         .child(label)
         .on_click(cx.listener(move |workspace, _: &ClickEvent, _, cx| {
             workspace.show_structure(label == "Structure", cx);
@@ -518,8 +526,11 @@ fn render_structure(state: &StructureState, cx: &mut Context<Workspace>) -> AnyE
         StructureState::Loaded(structure) => structure,
     };
 
-    let heading =
-        |label: &'static str| div().pt(px(layout::SPACE_MD)).child(section_label(t, label));
+    let heading = |label: &'static str| {
+        div()
+            .pt(px(layout::SPACE_MD))
+            .child(section_label(t, label))
+    };
     let name_column = |name: String| {
         div()
             .w(px(220.))
@@ -575,7 +586,11 @@ fn render_structure(state: &StructureState, cx: &mut Context<Workspace>) -> AnyE
                         .w(px(80.))
                         .min_w(px(80.))
                         .text_color(t.text_muted)
-                        .child(if column.nullable { "nullable" } else { "not null" }),
+                        .child(if column.nullable {
+                            "nullable"
+                        } else {
+                            "not null"
+                        }),
                 )
                 .child(
                     div()
@@ -650,58 +665,66 @@ fn render_tab_strip(profile: &Profile, cx: &mut Context<Workspace>) -> AnyElemen
             .into_any_element(),
     ];
 
-    tabs.extend(session.saved_queries.iter().enumerate().map(|(index, name)| {
-        let open_name = name.clone();
-        let delete_name = name.clone();
-        let open_workspace = workspace.clone();
-        let delete_workspace = workspace.clone();
-        let pending = session.pending_delete.as_deref() == Some(name);
-        let active = on_query_tab && session.open_query.as_deref() == Some(name);
-        chip(active)
-            .id(("saved-query", index))
-            .group(format!("query-tab-{index}"))
-            .pl(px(layout::SPACE_SM))
-            .pr(px(layout::SPACE_XS))
-            .child(row_icon(t, icon::SAVED_QUERY))
-            .child(name_label(name.clone(), false))
-            .child(
-                // Revealed by its own tab, so the strip reads as names
-                // rather than a row of delete buttons.
-                div()
-                    .when(!pending, |delete| {
-                        delete
-                            .opacity(0.)
-                            .group_hover(format!("query-tab-{index}"), |style| style.opacity(1.))
-                    })
+    tabs.extend(
+        session
+            .saved_queries
+            .iter()
+            .enumerate()
+            .map(|(index, name)| {
+                let open_name = name.clone();
+                let delete_name = name.clone();
+                let open_workspace = workspace.clone();
+                let delete_workspace = workspace.clone();
+                let pending = session.pending_delete.as_deref() == Some(name);
+                let active = on_query_tab && session.open_query.as_deref() == Some(name);
+                chip(active)
+                    .id(("saved-query", index))
+                    .group(format!("query-tab-{index}"))
+                    .pl(px(layout::SPACE_SM))
+                    .pr(px(layout::SPACE_XS))
+                    .child(row_icon(t, icon::SAVED_QUERY))
+                    .child(name_label(name.clone(), false))
                     .child(
-                        Button::new(("delete-query", index))
-                            .label(if pending { "Delete?" } else { "" })
-                            .icon(icon(icon::DELETE))
-                            .ghost()
-                            .xsmall()
-                            .tooltip("Delete query")
-                            .on_click(move |_, window, cx| {
-                                // Or the chip underneath opens the query in
-                                // the same click, and the confirmation this
-                                // arms is cleared before it can be seen.
-                                cx.stop_propagation();
-                                _ = delete_workspace.update(cx, |workspace, cx| {
-                                    workspace.arm_delete_saved_query(
-                                        delete_name.clone(),
-                                        window,
-                                        cx,
-                                    );
-                                });
-                            }),
-                    ),
-            )
-            .on_click(move |_, window, cx| {
-                _ = open_workspace.update(cx, |workspace, cx| {
-                    workspace.open_saved_query(open_name.clone(), window, cx);
-                });
-            })
-            .into_any_element()
-    }));
+                        // Revealed by its own tab, so the strip reads as names
+                        // rather than a row of delete buttons.
+                        div()
+                            .when(!pending, |delete| {
+                                delete
+                                    .opacity(0.)
+                                    .group_hover(format!("query-tab-{index}"), |style| {
+                                        style.opacity(1.)
+                                    })
+                            })
+                            .child(
+                                Button::new(("delete-query", index))
+                                    .label(if pending { "Delete?" } else { "" })
+                                    .icon(icon(icon::DELETE))
+                                    .ghost()
+                                    .xsmall()
+                                    .tooltip("Delete query")
+                                    .on_click(move |_, window, cx| {
+                                        // Or the chip underneath opens the query in
+                                        // the same click, and the confirmation this
+                                        // arms is cleared before it can be seen.
+                                        cx.stop_propagation();
+                                        _ = delete_workspace.update(cx, |workspace, cx| {
+                                            workspace.arm_delete_saved_query(
+                                                delete_name.clone(),
+                                                window,
+                                                cx,
+                                            );
+                                        });
+                                    }),
+                            ),
+                    )
+                    .on_click(move |_, window, cx| {
+                        _ = open_workspace.update(cx, |workspace, cx| {
+                            workspace.open_saved_query(open_name.clone(), window, cx);
+                        });
+                    })
+                    .into_any_element()
+            }),
+    );
 
     // Opened objects sit after the queries, in the order they were opened.
     // Closing one is not destructive, so it gets a plain × rather than the
@@ -790,31 +813,24 @@ fn render_tab_strip(profile: &Profile, cx: &mut Context<Workspace>) -> AnyElemen
     // A relation's tab shows the two views of an object from the strip: a
     // header of its own would be a second bar saying what this one already
     // says.
-    let structure_toggle = session
-        .active_object()
-        .and_then(|tab| match &tab.body {
-            ObjectBody::Relation {
-                showing_structure, ..
-            } => Some(
-                div()
-                    .flex_shrink_0()
-                    .flex()
-                    .gap(px(layout::SPACE_XS))
-                    .child(preview_tab(
-                        "Data",
-                        icon::TABLE,
-                        !showing_structure,
-                        cx,
-                    ))
-                    .child(preview_tab(
-                        "Structure",
-                        icon::STRUCTURE,
-                        *showing_structure,
-                        cx,
-                    )),
-            ),
-            ObjectBody::Routine(_) => None,
-        });
+    let structure_toggle = session.active_object().and_then(|tab| match &tab.body {
+        ObjectBody::Relation {
+            showing_structure, ..
+        } => Some(
+            div()
+                .flex_shrink_0()
+                .flex()
+                .gap(px(layout::SPACE_XS))
+                .child(preview_tab("Data", icon::TABLE, !showing_structure, cx))
+                .child(preview_tab(
+                    "Structure",
+                    icon::STRUCTURE,
+                    *showing_structure,
+                    cx,
+                )),
+        ),
+        ObjectBody::Routine(_) => None,
+    });
 
     // What the preview asked the server for, and the only control over it.
     // Beside the Data | Structure pair because it belongs to the same view:

@@ -14,11 +14,10 @@ use std::{borrow::Cow, collections::HashMap, sync::Arc};
 
 use gpui::{
     Action, AnyElement, App, AppContext, Application, ClickEvent, ClipboardItem, Context, Entity,
-    EntityInputHandler, FocusHandle, Focusable, FontWeight, InteractiveElement, IntoElement, KeyBinding,
-    Keystroke, ParentElement, Render, StatefulInteractiveElement, Styled, TitlebarOptions, Window,
-    WindowOptions, actions, div, point, prelude::FluentBuilder, px,
+    EntityInputHandler, FocusHandle, Focusable, FontWeight, InteractiveElement, IntoElement,
+    KeyBinding, Keystroke, ParentElement, Render, StatefulInteractiveElement, Styled,
+    TitlebarOptions, Window, WindowOptions, actions, div, point, prelude::FluentBuilder, px,
 };
-use serde::Deserialize;
 use gpui_component::{
     Disableable, IndexPath, InteractiveElementExt, Root, Sizable,
     button::{Button, ButtonVariants},
@@ -29,10 +28,11 @@ use gpui_component::{
     table::{TableEvent, TableState},
     tree::{TreeState, tree as render_tree},
 };
+use serde::Deserialize;
 
 use db::{
-    Catalog, Connection, ConnectionConfig, DbError, RelationKind, Routine, RoutineKind, SslMode,
-    Structure,
+    Catalog, Connection, ConnectionConfig, DbError, Engine, RelationKind, Routine, RoutineKind,
+    ServerConfig, SslMode, Structure,
 };
 use explorer::{
     ExplorerLeaf, ExplorerTarget, ObjectKind, PREVIEW_ROW_LIMIT, preview_sql,
@@ -142,15 +142,26 @@ impl Profile {
             self.session.pending_objects.clone()
         };
 
+        // A file engine writes no server fields and a server engine writes no
+        // path, rather than either writing a blank the loader would have to
+        // decide the meaning of.
+        let server = self.config.server();
         store::StoredProfile {
             id: self.id.clone(),
             name: self.name.clone(),
-            host: self.config.host.clone(),
-            port: self.config.port,
-            database: self.config.database.clone(),
-            user: self.config.user.clone(),
-            sslmode: Some(self.config.sslmode.as_str().to_string()),
-            root_certificate: self.config.root_certificate.clone(),
+            host: server.map(|server| server.host.clone()).unwrap_or_default(),
+            port: server.and_then(|server| server.port),
+            database: server
+                .map(|server| server.database.clone())
+                .unwrap_or_default(),
+            user: server.map(|server| server.user.clone()).unwrap_or_default(),
+            sslmode: server.map(|server| server.sslmode.as_str().to_string()),
+            root_certificate: server.and_then(|server| server.root_certificate.clone()),
+            engine: Some(self.config.engine().as_str().to_string()),
+            path: match &self.config {
+                ConnectionConfig::Sqlite { path } => Some(path.clone()),
+                _ => None,
+            },
             editor_font_size: Some(self.session.editor_font_size),
             open_query: self.session.open_query.clone(),
             open_objects,
@@ -351,14 +362,10 @@ impl Session {
     fn slot(&mut self, tab: Tab) -> Option<(&mut QueryState, Entity<TableState<ResultGrid>>)> {
         match tab {
             Tab::Query => Some((&mut self.query, self.results.clone())),
-            Tab::Object(id) => {
-                match &mut self.objects.iter_mut().find(|tab| tab.id == id)?.body {
-                    ObjectBody::Relation {
-                        query, results, ..
-                    } => Some((query, results.clone())),
-                    ObjectBody::Routine(_) => None,
-                }
-            }
+            Tab::Object(id) => match &mut self.objects.iter_mut().find(|tab| tab.id == id)?.body {
+                ObjectBody::Relation { query, results, .. } => Some((query, results.clone())),
+                ObjectBody::Routine(_) => None,
+            },
         }
     }
 
@@ -388,7 +395,6 @@ impl Session {
             _ => false,
         }
     }
-
 }
 
 /// What takes focus when a surface comes to the front. A buffer and a grid are
@@ -565,10 +571,7 @@ enum StructureState {
     Failed(String),
 }
 
-fn result_grid(
-    window: &mut Window,
-    cx: &mut Context<Workspace>,
-) -> Entity<TableState<ResultGrid>> {
+fn result_grid(window: &mut Window, cx: &mut Context<Workspace>) -> Entity<TableState<ResultGrid>> {
     let grid = cx.new(|cx| {
         TableState::new(ResultGrid::empty(), window, cx)
             // Sorting is the grid's own, over the rows it already holds. It
@@ -613,7 +616,13 @@ fn result_grid(
 
 struct ConnectionForm {
     url: Entity<InputState>,
+    /// Which set of fields below is the connection. Every input is built once
+    /// and kept; the engine decides which are drawn and which are read, so
+    /// switching engine and switching back does not lose what was typed.
+    engine: Engine,
     name: Entity<InputState>,
+    /// SQLite's entire connection. No host, no credentials, no transport.
+    path: Entity<InputState>,
     host: Entity<InputState>,
     port: Entity<InputState>,
     database: Entity<InputState>,
@@ -623,6 +632,14 @@ struct ConnectionForm {
     /// Only reachable while the mode consults one, so the field cannot sit
     /// there filled in and doing nothing.
     root_certificate: Entity<InputState>,
+    /// An input to focus once it has been mounted.
+    ///
+    /// A chip can unmount the field the user was typing in, and a window with
+    /// nothing focused has no dispatch path — every keybinding in the app goes
+    /// dead until something is clicked. So whichever chip takes a field away
+    /// names the one that replaces it, and `Workspace::render` hands focus over
+    /// on the next frame, once it exists to receive it.
+    needs_focus: Option<Entity<InputState>>,
     error: Option<String>,
 }
 
@@ -633,23 +650,39 @@ impl ConnectionForm {
         cx: &mut Context<Workspace>,
     ) -> Self {
         let value = |value: Option<&str>| value.unwrap_or_default().to_string();
-        let url = cx.new(|cx| InputState::new(window, cx).placeholder("postgresql://…"));
+        let server = config.and_then(ConnectionConfig::server);
+        let file = match config {
+            Some(ConnectionConfig::Sqlite { path }) => Some(path.as_str()),
+            _ => None,
+        };
+
+        let url =
+            cx.new(|cx| InputState::new(window, cx).placeholder("postgresql://…  or  sqlite://…"));
         let name = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder("Display name")
-                .default_value(value(config.map(|config| config.database.as_str())))
+                .default_value(value(
+                    server
+                        .map(|server| server.database.as_str())
+                        .or_else(|| file.map(file_stem)),
+                ))
+        });
+        let path = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Database file")
+                .default_value(value(file))
         });
         let host = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder("Host")
-                .default_value(value(config.map(|config| config.host.as_str())))
+                .default_value(value(server.map(|server| server.host.as_str())))
         });
         let port = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder("Port (optional)")
                 .default_value(
-                    config
-                        .and_then(|config| config.port)
+                    server
+                        .and_then(|server| server.port)
                         .map(|port| port.to_string())
                         .unwrap_or_default(),
                 )
@@ -657,17 +690,17 @@ impl ConnectionForm {
         let database = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder("Database")
-                .default_value(value(config.map(|config| config.database.as_str())))
+                .default_value(value(server.map(|server| server.database.as_str())))
         });
         let user = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder("Username")
-                .default_value(value(config.map(|config| config.user.as_str())))
+                .default_value(value(server.map(|server| server.user.as_str())))
         });
         let password = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder("Password (optional)")
-                .default_value(value(config.map(|config| config.password.as_str())))
+                .default_value(value(server.map(|server| server.password.as_str())))
                 .masked(true)
         });
 
@@ -675,20 +708,23 @@ impl ConnectionForm {
             InputState::new(window, cx)
                 .placeholder("Root certificate file (optional)")
                 .default_value(value(
-                    config.and_then(|config| config.root_certificate.as_deref()),
+                    server.and_then(|server| server.root_certificate.as_deref()),
                 ))
         });
 
         Self {
             url,
+            engine: config.map(ConnectionConfig::engine).unwrap_or_default(),
             name,
+            path,
             host,
             port,
             database,
             user,
             password,
-            sslmode: config.map(|config| config.sslmode).unwrap_or_default(),
+            sslmode: server.map(|server| server.sslmode).unwrap_or_default(),
             root_certificate,
+            needs_focus: None,
             error: None,
         }
     }
@@ -696,13 +732,33 @@ impl ConnectionForm {
     fn config(&self, cx: &App) -> Result<(String, ConnectionConfig), String> {
         let read = |input: &Entity<InputState>| input.read(cx).value().trim().to_string();
         let name = read(&self.name);
+        if name.is_empty() {
+            return Err("Display name is required.".into());
+        }
+
+        let config = match self.engine {
+            Engine::Sqlite => {
+                let path = read(&self.path);
+                if path.is_empty() {
+                    return Err("Database file is required.".into());
+                }
+                ConnectionConfig::Sqlite { path }
+            }
+            Engine::Postgres => ConnectionConfig::Postgres(self.server(cx)?),
+            Engine::MySql => ConnectionConfig::MySql(self.server(cx)?),
+        };
+
+        Ok((name, config))
+    }
+
+    fn server(&self, cx: &App) -> Result<ServerConfig, String> {
+        let read = |input: &Entity<InputState>| input.read(cx).value().trim().to_string();
         let host = read(&self.host);
         let database = read(&self.database);
         let user = read(&self.user);
         let port = read(&self.port);
 
         for (label, value) in [
-            ("Display name", &name),
             ("Host", &host),
             ("Database", &database),
             ("Username", &user),
@@ -729,19 +785,35 @@ impl ConnectionForm {
             .then(|| read(&self.root_certificate))
             .filter(|path| !path.is_empty());
 
-        Ok((
-            name,
-            ConnectionConfig {
-                host,
-                port,
-                database,
-                user,
-                password: self.password.read(cx).unmask_value().to_string(),
-                sslmode: self.sslmode,
-                root_certificate,
-            },
-        ))
+        Ok(ServerConfig {
+            host,
+            port,
+            database,
+            user,
+            password: self.password.read(cx).unmask_value().to_string(),
+            sslmode: self.sslmode,
+            root_certificate,
+        })
     }
+}
+
+/// What a profile is called when nobody has named it: the database for an
+/// engine that has one, and the file for an engine that is one.
+fn default_profile_name(config: &ConnectionConfig) -> String {
+    match config {
+        ConnectionConfig::Postgres(server) | ConnectionConfig::MySql(server) => {
+            server.database.clone()
+        }
+        ConnectionConfig::Sqlite { path } => file_stem(path).to_string(),
+    }
+}
+
+/// A database file's name without its directory or extension.
+fn file_stem(path: &str) -> &str {
+    std::path::Path::new(path)
+        .file_stem()
+        .and_then(std::ffi::OsStr::to_str)
+        .unwrap_or(path)
 }
 
 /// What runs once a generated batch has succeeded.
@@ -808,13 +880,15 @@ impl Workspace {
         match connection_config_from_environment() {
             Ok(Some(config)) => {
                 let existing = workspace.profiles.iter().position(|profile| {
-                    profile.config.endpoint() == config.endpoint()
-                        && profile.config.user == config.user
+                    profile.config.engine() == config.engine()
+                        && profile.config.endpoint() == config.endpoint()
+                        && profile.config.server().map(|server| server.user.as_str())
+                            == config.server().map(|server| server.user.as_str())
                 });
                 workspace.active = match existing {
                     Some(index) => index,
                     None => {
-                        let name = config.database.clone();
+                        let name = default_profile_name(&config);
                         workspace.create_profile(name, config, window, cx)
                     }
                 };
@@ -860,6 +934,15 @@ impl Workspace {
 
     fn profile_mut(&mut self) -> Option<&mut Profile> {
         self.profiles.get_mut(self.active)
+    }
+
+    /// The engine every statement Slate generates is written for. With no
+    /// profile there is nothing to run it against, so the default is only ever
+    /// used to build a string nobody sends.
+    fn engine(&self) -> Engine {
+        self.profile()
+            .map(|profile| profile.config.engine())
+            .unwrap_or_default()
     }
 
     fn issued_to(&mut self, id: &str, generation: u64) -> Option<&mut Profile> {
@@ -956,14 +1039,38 @@ impl Workspace {
                 Err(message) => (SslMode::VerifyFull, Some(message)),
             },
         };
-        let config = ConnectionConfig {
-            host: stored.host,
-            port: stored.port,
-            database: stored.database,
-            user: stored.user,
-            password: String::new(),
-            sslmode,
-            root_certificate: stored.root_certificate,
+        // No engine at all is a profile written before Slate had a second one,
+        // and Postgres is what it was. An engine this build cannot read is a
+        // profile written by a build that has one this one does not, so it is
+        // read as Postgres and says so rather than connecting somewhere the
+        // user did not ask for without mentioning it.
+        let (engine, unreadable_engine) = match stored.engine.as_deref() {
+            None => (Engine::Postgres, None),
+            Some(stored) => match Engine::parse(stored) {
+                Ok(engine) => (engine, None),
+                Err(message) => (Engine::Postgres, Some(message)),
+            },
+        };
+        let config = match engine {
+            Engine::Sqlite => ConnectionConfig::Sqlite {
+                path: stored.path.unwrap_or_default(),
+            },
+            Engine::Postgres | Engine::MySql => {
+                let server = ServerConfig {
+                    host: stored.host,
+                    port: stored.port,
+                    database: stored.database,
+                    user: stored.user,
+                    // Never on disk. Read from the Keychain when connecting.
+                    password: String::new(),
+                    sslmode,
+                    root_certificate: stored.root_certificate,
+                };
+                match engine {
+                    Engine::MySql => ConnectionConfig::MySql(server),
+                    _ => ConnectionConfig::Postgres(server),
+                }
+            }
         };
         let mut session = Session::new(
             stored.id.clone(),
@@ -973,8 +1080,16 @@ impl Workspace {
             window,
             cx,
         );
-        if let Some(message) = unreadable_mode {
-            session.notice = Some(format!("{message} Connecting as verify-full."));
+        // An unreadable sslmode only means anything to an engine that has one.
+        let notice = unreadable_engine
+            .map(|message| format!("{message} Reading it as Postgres."))
+            .or_else(|| {
+                unreadable_mode
+                    .filter(|_| config.server().is_some())
+                    .map(|message| format!("{message} Connecting as verify-full."))
+            });
+        if let Some(message) = notice {
+            session.notice = Some(message);
         }
         self.profiles.push(Profile {
             id: stored.id,
@@ -1008,7 +1123,9 @@ impl Workspace {
             window,
             cx,
         );
-        let password = config.password.clone();
+        // A file engine has no password, so it gets no Keychain entry at all
+        // rather than an empty one nothing will ever read.
+        let password = config.server().map(|server| server.password.clone());
         self.profiles.push(Profile {
             id: id.clone(),
             name,
@@ -1018,7 +1135,9 @@ impl Workspace {
             catalog: CatalogState::Loading,
             session,
         });
-        if let Err(message) = store::set_password(&id, &password) {
+        if let Some(password) = password
+            && let Err(message) = store::set_password(&id, &password)
+        {
             self.note(message, cx);
         }
         self.remember_profiles(cx);
@@ -1046,28 +1165,44 @@ impl Workspace {
             }
         };
 
-        for (input, value) in [
-            (&form.name, config.database.clone()),
-            (&form.host, config.host),
-            (
-                &form.port,
-                config.port.map(|port| port.to_string()).unwrap_or_default(),
-            ),
-            (&form.database, config.database),
-            (&form.user, config.user),
-            (&form.password, config.password),
-            (
-                &form.root_certificate,
-                config.root_certificate.unwrap_or_default(),
-            ),
-        ] {
+        // Only the fields the URL's own engine has. Blanking the others would
+        // throw away a half-typed connection to a different database, which the
+        // user never asked to lose by pasting a URL.
+        let filled = match &config {
+            ConnectionConfig::Sqlite { path } => vec![
+                (&form.name, default_profile_name(&config)),
+                (&form.path, path.clone()),
+            ],
+            ConnectionConfig::Postgres(server) | ConnectionConfig::MySql(server) => vec![
+                (&form.name, server.database.clone()),
+                (&form.host, server.host.clone()),
+                (
+                    &form.port,
+                    server.port.map(|port| port.to_string()).unwrap_or_default(),
+                ),
+                (&form.database, server.database.clone()),
+                (&form.user, server.user.clone()),
+                (&form.password, server.password.clone()),
+                (
+                    &form.root_certificate,
+                    server.root_certificate.clone().unwrap_or_default(),
+                ),
+            ],
+        };
+        for (input, value) in filled {
             let input = input.clone();
             input.update(cx, |input, cx| input.set_value(value, window, cx));
         }
+
+        let engine = config.engine();
+        let sslmode = config.server().map(|server| server.sslmode);
         if let Some(form) = &mut self.form {
-            // The URL's own mode, so pasting one that demands verification
-            // cannot land in a form still set to `prefer`.
-            form.sslmode = config.sslmode;
+            form.engine = engine;
+            if let Some(sslmode) = sslmode {
+                // The URL's own mode, so pasting one that demands verification
+                // cannot land in a form still set to `prefer`.
+                form.sslmode = sslmode;
+            }
             form.error = None;
         }
         cx.notify();
@@ -1077,6 +1212,51 @@ impl Workspace {
     /// dropdown: the choice is the security of the connection, and it should be
     /// legible without opening anything. No keybinding, so no action type —
     /// this is only reachable while the form is on screen.
+    /// One chip per engine, in the same shape as the `sslmode` row below it.
+    /// The engine decides which fields the form even has, so it is the first
+    /// thing on it and not a dropdown two clicks away.
+    fn engine_chip(&self, engine: Engine, cx: &mut Context<Self>) -> AnyElement {
+        let t = *theme(cx);
+        let selected = self.form.as_ref().is_some_and(|form| form.engine == engine);
+        div()
+            .id(engine.as_str())
+            .flex()
+            .items_center()
+            .h(px(24.))
+            .px(px(layout::SPACE_SM))
+            .rounded(px(layout::RADIUS_CONTROL))
+            .text_size(px(layout::TEXT_SM))
+            .whitespace_nowrap()
+            .map(|chip| {
+                if selected {
+                    chip.bg(t.element_active).text_color(t.text)
+                } else {
+                    chip.text_color(t.text_muted)
+                        .hover(|style| style.bg(t.element_hover))
+                }
+            })
+            .child(engine.label())
+            .on_click(cx.listener(move |workspace, _, _, cx| {
+                if let Some(form) = &mut workspace.form {
+                    // Only when the field set actually changes: Postgres and
+                    // MySQL show the same fields, so switching between them
+                    // takes nothing away and must not take focus either.
+                    if form.engine.is_server() != engine.is_server() {
+                        form.needs_focus = Some(match engine.is_server() {
+                            true => form.host.clone(),
+                            false => form.path.clone(),
+                        });
+                    }
+                    form.engine = engine;
+                    // The error belonged to the fields that just left the
+                    // screen, so it would be reporting something invisible.
+                    form.error = None;
+                    cx.notify();
+                }
+            }))
+            .into_any_element()
+    }
+
     fn sslmode_chip(&self, mode: SslMode, cx: &mut Context<Self>) -> AnyElement {
         let t = *theme(cx);
         let selected = self.form.as_ref().is_some_and(|form| form.sslmode == mode);
@@ -1100,6 +1280,11 @@ impl Workspace {
             .child(mode.label())
             .on_click(cx.listener(move |workspace, _, _, cx| {
                 if let Some(form) = &mut workspace.form {
+                    // Stepping down from a verifying mode unmounts the
+                    // certificate field, which may be the one holding focus.
+                    if form.sslmode.checks_certificate() && !mode.checks_certificate() {
+                        form.needs_focus = Some(form.password.clone());
+                    }
                     form.sslmode = mode;
                     cx.notify();
                 }
@@ -1164,9 +1349,13 @@ impl Workspace {
         let connection_task = cx.background_executor().spawn({
             let id = id.clone();
             async move {
-                if config.password.is_empty() {
+                // A file engine has nothing to authenticate to, so it never
+                // reaches the Keychain — and never triggers its prompt.
+                if let Some(server) = config.server_mut()
+                    && server.password.is_empty()
+                {
                     match store::password(&id) {
-                        Ok(Some(password)) => config.password = password,
+                        Ok(Some(password)) => server.password = password,
                         // No keychain item is not a missing password: a blank
                         // one is valid, so this connects with what it has.
                         Ok(None) => {}
@@ -1469,6 +1658,7 @@ impl Workspace {
         change: impl FnOnce(&mut Vec<SortKey>, &mut usize) -> bool,
         cx: &mut Context<Self>,
     ) {
+        let engine = self.engine();
         let Some(profile) = self.profile_mut() else {
             return;
         };
@@ -1486,7 +1676,7 @@ impl Workspace {
             return;
         }
 
-        let sql = relation_sql(&schema, &relation, sort, *limit);
+        let sql = relation_sql(engine, &schema, &relation, sort, *limit);
         // A preview only re-queries when it is asked to, and this is the ask.
         *query = QueryState::Idle;
         self.execute_sql(sql, Tab::Object(id), cx);
@@ -1495,13 +1685,16 @@ impl Workspace {
     /// A header click on a relation tab: move that column through the sort and
     /// ask the server again.
     fn relation_sort(&mut self, id: u64, column: usize, cx: &mut Context<Self>) {
+        let engine = self.engine();
         let Some(profile) = self.profile_mut() else {
             return;
         };
         let Some((_, results)) = profile.session.slot(Tab::Object(id)) else {
             return;
         };
-        let Some(expression) = sort_expression(results.read(cx).delegate().columns(), column) else {
+        let Some(expression) =
+            sort_expression(engine, results.read(cx).delegate().columns(), column)
+        else {
             return;
         };
         self.requery_relation(
@@ -1567,7 +1760,10 @@ impl Workspace {
             return;
         };
         if let Some(tab) = profile.session.objects.iter_mut().find(|tab| tab.id == id)
-            && let ObjectBody::Relation { showing_structure: showing, .. } = &mut tab.body
+            && let ObjectBody::Relation {
+                showing_structure: showing,
+                ..
+            } = &mut tab.body
         {
             *showing = showing_structure;
             cx.notify();
@@ -1628,9 +1824,7 @@ impl Workspace {
             .session
             .pending_objects
             .iter()
-            .filter_map(|stored| {
-                Some((OpenedObject::resolve(catalog, stored)?, stored.active))
-            })
+            .filter_map(|stored| Some((OpenedObject::resolve(catalog, stored)?, stored.active)))
             .collect::<Vec<_>>();
 
         if let Some(profile) = self.profile_mut() {
@@ -1783,7 +1977,8 @@ impl Workspace {
         list.update(cx, |list, cx| {
             list.set_selected_index(Some(IndexPath::default()), window, cx);
         });
-        cx.subscribe_in(&list, window, Self::on_palette_event).detach();
+        cx.subscribe_in(&list, window, Self::on_palette_event)
+            .detach();
         self.palette = Some(list);
         cx.notify();
     }
@@ -1856,7 +2051,12 @@ impl Workspace {
         self.move_palette_selection(1, window, cx);
     }
 
-    fn palette_previous(&mut self, _: &PalettePrevious, window: &mut Window, cx: &mut Context<Self>) {
+    fn palette_previous(
+        &mut self,
+        _: &PalettePrevious,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.move_palette_selection(-1, window, cx);
     }
 
@@ -1981,13 +2181,16 @@ impl Workspace {
     /// where they can see it, edit it and undo it. Slate changes SQL only when
     /// asked, and a header click is the ask (`AGENTS.md`, rule 1).
     fn query_sort(&mut self, column: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let engine = self.engine();
         let Some(profile) = self.profile() else {
             return;
         };
         let editor = profile.session.editor.clone();
         let results = profile.session.results.clone();
 
-        let Some(expression) = sort_expression(results.read(cx).delegate().columns(), column) else {
+        let Some(expression) =
+            sort_expression(engine, results.read(cx).delegate().columns(), column)
+        else {
             return;
         };
 
@@ -2082,7 +2285,12 @@ impl Workspace {
         let Some(results) = profile.session.active_results() else {
             return;
         };
-        let Some(value) = results.read(cx).delegate().active_value().map(str::to_string) else {
+        let Some(value) = results
+            .read(cx)
+            .delegate()
+            .active_value()
+            .map(str::to_string)
+        else {
             return;
         };
         cx.write_to_clipboard(ClipboardItem::new_string(value));
@@ -2103,7 +2311,7 @@ impl Workspace {
             return;
         };
         let pending = results.read(cx).delegate().pending_updates();
-        let Some(batch) = update_batch(&pending) else {
+        let Some(batch) = update_batch(self.engine(), &pending) else {
             self.note(
                 match pending.is_empty() {
                     true => "There are no edits to apply.".into(),
@@ -2278,7 +2486,13 @@ impl Workspace {
         let Some(profile) = self.profile() else {
             return;
         };
-        let name = profile.session.save_name.read(cx).value().trim().to_string();
+        let name = profile
+            .session
+            .save_name
+            .read(cx)
+            .value()
+            .trim()
+            .to_string();
         if let Err(message) = store::validate_query_name(&name) {
             self.note(message, cx);
             return;
@@ -2516,6 +2730,8 @@ impl Workspace {
         refresh: Option<Refresh>,
         cx: &mut Context<Self>,
     ) {
+        // Read before the task, which outlives the borrow of `self`.
+        let engine = self.engine();
         let Some(profile) = self.profile_mut() else {
             return;
         };
@@ -2588,7 +2804,7 @@ impl Workspace {
                                 };
                                 let produced_grid = !result.columns.is_empty();
                                 results.update(cx, |table, cx| {
-                                    let sort = sort_columns(&keys, &result.columns);
+                                    let sort = sort_columns(engine, &keys, &result.columns);
                                     *table.delegate_mut() =
                                         ResultGrid::new(result).with_sort(sort, sortable);
                                     table.refresh(cx);
@@ -2658,7 +2874,10 @@ impl Workspace {
 
     fn render_connection_form(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let t = *theme(cx);
-        let form = self.form.as_ref().expect("form is rendered only while open");
+        let form = self
+            .form
+            .as_ref()
+            .expect("form is rendered only while open");
         let message = form.error.clone();
         let hairline = || div().h(px(1.)).flex_1().bg(t.border);
 
@@ -2707,7 +2926,7 @@ impl Workspace {
                                         div()
                                             .text_size(px(layout::TEXT_LG))
                                             .font_weight(FontWeight::SEMIBOLD)
-                                            .child("Connect to Postgres"),
+                                            .child("Connect to a database"),
                                     )
                                     .child(
                                         div()
@@ -2715,6 +2934,24 @@ impl Workspace {
                                             .text_color(t.text_muted)
                                             .child("Paste a URL, or fill in the fields."),
                                     ),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(layout::SPACE_XS))
+                            .child(
+                                div()
+                                    .text_size(px(layout::TEXT_SM))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(t.text_muted)
+                                    .child("Engine"),
+                            )
+                            .child(
+                                div().flex().gap(px(layout::SPACE_XS)).children(
+                                    Engine::ALL.map(|engine| self.engine_chip(engine, cx)),
+                                ),
                             ),
                     )
                     .child(
@@ -2762,56 +2999,68 @@ impl Workspace {
                             .child(hairline()),
                     )
                     .child(self.form_field("Display name", &form.name, cx))
-                    .child(
-                        div()
-                            .flex()
-                            .gap(px(layout::SPACE_SM))
-                            .child(div().flex_1().child(self.form_field("Host", &form.host, cx)))
-                            .child(div().w(px(96.)).child(self.form_field(
-                                "Port",
-                                &form.port,
-                                cx,
-                            ))),
+                    // An engine that is a file has no host, no credentials and
+                    // no transport, so those fields are absent rather than
+                    // present and inert. A disabled field still reads as
+                    // something the connection has.
+                    .children(
+                        (!form.engine.is_server())
+                            .then(|| self.form_field("Database file", &form.path, cx)),
                     )
-                    .child(self.form_field("Database", &form.database, cx))
-                    .child(self.form_field("Username", &form.user, cx))
-                    .child(self.form_field("Password", &form.password, cx))
-                    .child(
+                    .children(form.engine.is_server().then(|| {
                         div()
                             .flex()
                             .flex_col()
-                            .gap(px(layout::SPACE_XS))
-                            .child(
-                                div()
-                                    .text_size(px(layout::TEXT_SM))
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .text_color(t.text_muted)
-                                    .child("Encryption"),
-                            )
+                            .gap(px(layout::SPACE_MD))
                             .child(
                                 div()
                                     .flex()
-                                    .gap(px(layout::SPACE_XS))
-                                    .children(
-                                        SslMode::ALL
-                                            .map(|mode| self.sslmode_chip(mode, cx)),
+                                    .gap(px(layout::SPACE_SM))
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .child(self.form_field("Host", &form.host, cx)),
+                                    )
+                                    .child(
+                                        div()
+                                            .w(px(96.))
+                                            .child(self.form_field("Port", &form.port, cx)),
                                     ),
                             )
-                            // Five words do not say which ones check who
-                            // answered, and that is the whole difference
-                            // between them.
+                            .child(self.form_field("Database", &form.database, cx))
+                            .child(self.form_field("Username", &form.user, cx))
+                            .child(self.form_field("Password", &form.password, cx))
                             .child(
                                 div()
-                                    .text_size(px(layout::TEXT_XS))
-                                    .text_color(t.text_faint)
-                                    .child(form.sslmode.explanation()),
-                            ),
-                    )
-                    // Only where it is consulted: on `require` a certificate
-                    // file changes nothing, and a field that changes nothing
-                    // reads as though it does.
-                    .children(form.sslmode.checks_certificate().then(|| {
-                        self.form_field("Root certificate", &form.root_certificate, cx)
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(layout::SPACE_XS))
+                                    .child(
+                                        div()
+                                            .text_size(px(layout::TEXT_SM))
+                                            .font_weight(FontWeight::MEDIUM)
+                                            .text_color(t.text_muted)
+                                            .child("Encryption"),
+                                    )
+                                    .child(div().flex().gap(px(layout::SPACE_XS)).children(
+                                        SslMode::ALL.map(|mode| self.sslmode_chip(mode, cx)),
+                                    ))
+                                    // Five words do not say which ones check who
+                                    // answered, and that is the whole difference
+                                    // between them.
+                                    .child(
+                                        div()
+                                            .text_size(px(layout::TEXT_XS))
+                                            .text_color(t.text_faint)
+                                            .child(form.sslmode.explanation()),
+                                    ),
+                            )
+                            // Only where it is consulted: on `require` a
+                            // certificate file changes nothing, and a field that
+                            // changes nothing reads as though it does.
+                            .children(form.sslmode.checks_certificate().then(|| {
+                                self.form_field("Root certificate", &form.root_certificate, cx)
+                            }))
                     }))
                     .children(message.map(|message| {
                         div()
@@ -3092,10 +3341,11 @@ impl Workspace {
                         .child(
                             div()
                                 .when(!pending, |remove| {
-                                    remove.opacity(0.).group_hover(
-                                        format!("profile-row-{index}"),
-                                        |style| style.opacity(1.),
-                                    )
+                                    remove
+                                        .opacity(0.)
+                                        .group_hover(format!("profile-row-{index}"), |style| {
+                                            style.opacity(1.)
+                                        })
                                 })
                                 .child(
                                     Button::new(("remove-profile", index))
@@ -3147,12 +3397,7 @@ impl Workspace {
                         .child(section_label(t, "Connections")),
                 )
                 .children(profile_rows)
-                .child(
-                    div()
-                        .my(px(layout::SPACE_XS))
-                        .h(px(1.))
-                        .bg(t.border),
-                )
+                .child(div().my(px(layout::SPACE_XS)).h(px(1.)).bg(t.border))
                 .child(
                     div()
                         .id("new-connection")
@@ -3381,11 +3626,7 @@ impl Render for Workspace {
             let focus = match profile.session.active {
                 Tab::Query => Focus::Buffer(profile.session.editor.clone()),
                 Tab::Object(id) => {
-                    let tab = profile
-                        .session
-                        .objects
-                        .iter()
-                        .find(|tab| tab.id == id)?;
+                    let tab = profile.session.objects.iter().find(|tab| tab.id == id)?;
                     match &tab.body {
                         ObjectBody::Relation { results, .. } => Focus::Grid(results.clone()),
                         // A routine's tab is read: nothing in it takes a
@@ -3398,6 +3639,13 @@ impl Render for Workspace {
             profile.session.editor_needs_focus = false;
             Some(focus)
         });
+        // Before the tab's own focus, and separately: the form is a surface of
+        // its own, and a field it just unmounted took the window's only
+        // dispatch path with it.
+        if let Some(input) = self.form.as_mut().and_then(|form| form.needs_focus.take()) {
+            input.focus_handle(cx).focus(window);
+        }
+
         match take_focus {
             Some(Focus::Buffer(input)) => input.focus_handle(cx).focus(window),
             Some(Focus::Grid(grid)) => grid.focus_handle(cx).focus(window),
@@ -3559,9 +3807,7 @@ impl Render for Workspace {
                             .text_color(if failed { t.danger } else { t.text_muted })
                             .child(status),
                     )
-                    .children(notice.map(|notice| {
-                        div().text_color(t.text_muted).child(notice)
-                    }))
+                    .children(notice.map(|notice| div().text_color(t.text_muted).child(notice)))
                     .children(query_status.map(|query_status| {
                         div().ml_auto().text_color(t.text_faint).child(query_status)
                     }))
@@ -3611,20 +3857,29 @@ impl Render for Workspace {
 /// Slate's statement for a relation's tab, carrying the sort the headers asked
 /// for. Regenerated rather than edited, so the row limit and the quoting stay
 /// in one place.
-fn relation_sql(schema: &str, relation: &str, sort: &[SortKey], limit: usize) -> String {
-    let preview = preview_sql(schema, relation, limit);
+fn relation_sql(
+    engine: Engine,
+    schema: &str,
+    relation: &str,
+    sort: &[SortKey],
+    limit: usize,
+) -> String {
+    let preview = preview_sql(engine, schema, relation, limit);
     sql::with_order_by(&preview, sort).unwrap_or(preview)
 }
 
 /// Every pending row as one `UPDATE`, joined into a single string.
 ///
-/// One `simple_query` round trip is one implicit transaction, so a batch sent
-/// this way is all-or-nothing with no transaction code at all.
+/// All-or-nothing, which each engine reaches differently. Postgres runs one
+/// submission as a single implicit transaction and needs nothing. SQLite commits
+/// every statement on its own, so a batch of more than one is bracketed — in the
+/// statement text itself, where the user can read, edit and undo it, because
+/// Slate does not open a transaction behind anyone's back.
 ///
 /// `None` when there is nothing to apply, and `None` — rather than a shorter
 /// batch — when any one row cannot be written: a partial apply is not the change
 /// the user made, and Slate would have no way to say which part of it ran.
-fn update_batch(rows: &[PendingRow]) -> Option<String> {
+fn update_batch(engine: Engine, rows: &[PendingRow]) -> Option<String> {
     if rows.is_empty() {
         return None;
     }
@@ -3639,6 +3894,7 @@ fn update_batch(rows: &[PendingRow]) -> Option<String> {
         .iter()
         .map(|row| {
             sql::update_row(
+                engine,
                 &row.schema,
                 &row.table,
                 &borrowed(&row.sets),
@@ -3651,7 +3907,13 @@ fn update_batch(rows: &[PendingRow]) -> Option<String> {
         })
         .collect();
 
-    Some(statements?.join("\n"))
+    let statements = statements?;
+    Some(match engine {
+        Engine::Sqlite if statements.len() > 1 => {
+            format!("BEGIN;\n{}\nCOMMIT;", statements.join("\n"))
+        }
+        _ => statements.join("\n"),
+    })
 }
 
 /// Slate's statement appended to the buffer the user is writing in.
@@ -3678,16 +3940,12 @@ fn appended_statement(buffer: &str, statement: &str) -> String {
 /// By name, so the statement reads as something a person would have written --
 /// except where a name cannot identify one column, and then by position, which
 /// always can. Duplicate names come back from any join written with `*`.
-fn sort_expression(columns: &[db::Column], column: usize) -> Option<String> {
+fn sort_expression(engine: Engine, columns: &[db::Column], column: usize) -> Option<String> {
     let name = &columns.get(column)?.name;
-    let unique = columns
-        .iter()
-        .filter(|other| &other.name == name)
-        .count()
-        == 1;
+    let unique = columns.iter().filter(|other| &other.name == name).count() == 1;
 
     Some(match unique && !name.is_empty() {
-        true => format!("\"{}\"", name.replace('"', "\"\"")),
+        true => engine.quote_identifier(name),
         false => (column + 1).to_string(),
     })
 }
@@ -3707,11 +3965,11 @@ fn cycle(keys: &mut Vec<SortKey>, expression: &str) {
 /// show. A key naming something other than a column of the result -- an
 /// expression, or a column that is not in the select list -- lights nothing up,
 /// because there is no header for it.
-fn sort_columns(keys: &[SortKey], columns: &[db::Column]) -> Vec<(usize, bool)> {
+fn sort_columns(engine: Engine, keys: &[SortKey], columns: &[db::Column]) -> Vec<(usize, bool)> {
     keys.iter()
         .filter_map(|key| {
             let expression = key.expression.trim();
-            let named = unquote(expression);
+            let named = engine.unquote_identifier(expression);
             let column = columns
                 .iter()
                 .position(|column| column.name == named)
@@ -3725,13 +3983,6 @@ fn sort_columns(keys: &[SortKey], columns: &[db::Column]) -> Vec<(usize, bool)> 
             Some((column, key.ascending))
         })
         .collect()
-}
-
-fn unquote(expression: &str) -> String {
-    match expression.strip_prefix('"').and_then(|rest| rest.strip_suffix('"')) {
-        Some(inner) => inner.replace("\"\"", "\""),
-        None => expression.to_string(),
-    }
 }
 
 fn object_icon(kind: ObjectKind) -> &'static str {
@@ -3758,7 +4009,9 @@ fn write_buffer(profile: &Profile, cx: &App) -> Result<(), String> {
 /// One column of icons down the sidebar, so every label starts at the same x
 /// whether its row is a folder or an object.
 fn row_icon(t: Theme, path: &'static str) -> impl IntoElement {
-    icon(path).size(px(layout::ICON_SIZE)).text_color(t.text_faint)
+    icon(path)
+        .size(px(layout::ICON_SIZE))
+        .text_color(t.text_faint)
 }
 
 /// Slate's own titlebar, drawn where the platform's would be.
@@ -3979,7 +4232,10 @@ fn connection_config_from_environment() -> Result<Option<ConnectionConfig>, Stri
         })
         .transpose()?;
 
-    Ok(Some(ConnectionConfig {
+    // The `PG*` variables configure a Postgres profile and are not generalised.
+    // Slate is a generic client, not a generic environment reader, and there is
+    // no convention for the other engines to read.
+    Ok(Some(ConnectionConfig::Postgres(ServerConfig {
         host,
         port,
         database,
@@ -3987,7 +4243,7 @@ fn connection_config_from_environment() -> Result<Option<ConnectionConfig>, Stri
         password: std::env::var("PGPASSWORD").unwrap_or_default(),
         sslmode,
         root_certificate,
-    }))
+    })))
 }
 
 fn main() {
@@ -4085,7 +4341,10 @@ mod tests {
     fn only_the_tab_that_is_a_file_is_asked_about_before_it_closes() {
         let saved = |name: &str| Some(CloseTarget::SavedQuery(name.to_string()));
 
-        assert_eq!(close_target(Tab::Object(3), None), Some(CloseTarget::Object(3)));
+        assert_eq!(
+            close_target(Tab::Object(3), None),
+            Some(CloseTarget::Object(3))
+        );
         assert_eq!(close_target(Tab::Query, Some("daily")), saved("daily"));
         // The scratch buffer is always in the strip, so there is nothing here
         // for `cmd+w` to close and nothing to ask about.
@@ -4148,17 +4407,55 @@ mod tests {
     #[test]
     fn a_column_is_named_in_the_order_by_unless_a_name_cannot_identify_it() {
         let unique = columns(&["id", "name"]);
-        assert_eq!(sort_expression(&unique, 1), Some(r#""name""#.into()));
+        assert_eq!(
+            sort_expression(Engine::Postgres, &unique, 1),
+            Some(r#""name""#.into())
+        );
 
         // `SELECT *` across a join returns the same name twice, and ordering by
         // it would be ambiguous -- so the position, which never is.
         let duplicated = columns(&["id", "id"]);
-        assert_eq!(sort_expression(&duplicated, 1), Some("2".into()));
-        assert_eq!(sort_expression(&unique, 7), None);
+        assert_eq!(
+            sort_expression(Engine::Postgres, &duplicated, 1),
+            Some("2".into())
+        );
+        assert_eq!(sort_expression(Engine::Postgres, &unique, 7), None);
+
+        // MySQL reads a double-quoted name as a *string literal*, so ordering
+        // by one is ordering by a constant: every row compares equal, the
+        // server raises nothing, and the grid comes back in the same order it
+        // went out. This is the assertion that catches that.
+        assert_eq!(
+            sort_expression(Engine::MySql, &unique, 1),
+            Some("`name`".into())
+        );
+        assert_eq!(
+            sort_expression(Engine::Sqlite, &unique, 1),
+            Some(r#""name""#.into())
+        );
 
         // A quote in a column name would otherwise end the identifier early.
         let odd = columns(&["we\"ird"]);
-        assert_eq!(sort_expression(&odd, 0), Some("\"we\"\"ird\"".into()));
+        assert_eq!(
+            sort_expression(Engine::Postgres, &odd, 0),
+            Some("\"we\"\"ird\"".into())
+        );
+    }
+
+    #[test]
+    fn a_sort_key_finds_its_way_back_to_the_header_it_came_from() {
+        // The round trip every engine has to survive: the expression written
+        // into the statement is the one read back out to light the header up,
+        // and the quoting in between is the engine's own.
+        let result = columns(&["id", "name"]);
+        for engine in Engine::ALL {
+            let expression = sort_expression(engine, &result, 1).expect("a unique name");
+            assert_eq!(
+                sort_columns(engine, &[SortKey::new(expression, false)], &result),
+                vec![(1, false)],
+                "{engine:?}"
+            );
+        }
     }
 
     #[test]
@@ -4172,19 +4469,28 @@ mod tests {
             SortKey::new("9", true),
         ];
 
-        assert_eq!(sort_columns(&keys, &result), vec![(1, false), (0, true)]);
+        assert_eq!(
+            sort_columns(Engine::Postgres, &keys, &result),
+            vec![(1, false), (0, true)]
+        );
     }
 
     #[test]
     fn a_preview_asks_for_the_rows_its_tab_was_set_to() {
         assert_eq!(
-            relation_sql("public", "accounts", &[], 100),
+            relation_sql(Engine::Postgres, "public", "accounts", &[], 100),
             r#"SELECT * FROM "public"."accounts" LIMIT 100"#
         );
         // A raised limit still keeps the sort ahead of it, or the rows would be
         // ordered after being cut.
         assert_eq!(
-            relation_sql("public", "accounts", &[SortKey::new(r#""id""#, true)], 100_000),
+            relation_sql(
+                Engine::Postgres,
+                "public",
+                "accounts",
+                &[SortKey::new(r#""id""#, true)],
+                100_000
+            ),
             r#"SELECT * FROM "public"."accounts" ORDER BY "id" ASC LIMIT 100000"#
         );
     }
@@ -4204,6 +4510,7 @@ mod tests {
     #[test]
     fn a_relations_statement_carries_its_sort_before_the_limit() {
         let sorted = relation_sql(
+            Engine::Postgres,
             "public",
             "accounts",
             &[SortKey::new(r#""id""#, false)],
@@ -4217,6 +4524,7 @@ mod tests {
         // And the sort Slate wrote is the sort its headers show.
         assert_eq!(
             sort_columns(
+                Engine::Postgres,
                 &sql::order_by(&sorted).unwrap(),
                 &columns(&["id", "email"])
             ),
@@ -4311,7 +4619,7 @@ mod tests {
             pending_row(&[("name", "Bo")], &[("id", "2")]),
         ];
 
-        let batch = update_batch(&rows).unwrap();
+        let batch = update_batch(Engine::Postgres, &rows).unwrap();
         assert_eq!(
             batch,
             "UPDATE \"public\".\"accounts\" SET \"name\" = 'Ada' WHERE \"id\" = '1';\n\
@@ -4324,6 +4632,27 @@ mod tests {
     }
 
     #[test]
+    fn an_engine_without_an_implicit_transaction_gets_explicit_brackets() {
+        // SQLite commits each statement on its own, so an unbracketed batch
+        // could apply half the user's edits and report the failure of the rest.
+        let rows = vec![
+            pending_row(&[("name", "Ada")], &[("id", "1")]),
+            pending_row(&[("name", "Bo")], &[("id", "2")]),
+        ];
+
+        let batch = update_batch(Engine::Sqlite, &rows).unwrap();
+        assert!(batch.starts_with("BEGIN;\n"), "{batch}");
+        assert!(batch.ends_with("\nCOMMIT;"), "{batch}");
+        assert!(sql::is_generated_update(&batch));
+
+        // One statement is already atomic, so brackets round it would be
+        // ceremony the user has to read past.
+        let single = update_batch(Engine::Sqlite, &rows[..1]).unwrap();
+        assert!(!single.contains("BEGIN"), "{single}");
+        assert!(sql::is_generated_update(&single));
+    }
+
+    #[test]
     fn a_row_with_no_key_to_find_it_by_refuses_the_whole_batch() {
         let rows = vec![
             pending_row(&[("name", "Ada")], &[("id", "1")]),
@@ -4332,13 +4661,22 @@ mod tests {
             pending_row(&[("name", "Bo")], &[]),
         ];
 
-        assert!(sql::update_row("public", "accounts", &[("name", "Bo")], &[]).is_none());
-        assert_eq!(update_batch(&rows), None);
+        assert!(
+            sql::update_row(
+                Engine::Postgres,
+                "public",
+                "accounts",
+                &[("name", "Bo")],
+                &[]
+            )
+            .is_none()
+        );
+        assert_eq!(update_batch(Engine::Postgres, &rows), None);
     }
 
     #[test]
     fn an_empty_batch_of_rows_has_nothing_to_send() {
-        assert_eq!(update_batch(&[]), None);
+        assert_eq!(update_batch(Engine::Postgres, &[]), None);
     }
 
     #[test]
@@ -4361,7 +4699,10 @@ mod tests {
 
     #[test]
     fn an_empty_buffer_yields_just_the_statement() {
-        assert_eq!(appended_statement("", "UPDATE t SET a = 1"), "UPDATE t SET a = 1");
+        assert_eq!(
+            appended_statement("", "UPDATE t SET a = 1"),
+            "UPDATE t SET a = 1"
+        );
     }
 
     #[test]

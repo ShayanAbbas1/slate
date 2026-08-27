@@ -1,18 +1,3 @@
-//! The Postgres boundary.
-//!
-//! Everything crossing out of this module is a rendered `String`. No
-//! `postgres::Row`, no `Type`, no OIDs — the UI layer never learns which engine
-//! it is talking to, which is the one concession made toward a second driver
-//! later (see the spec, §4.1).
-//!
-//! **Results come back via the simple query protocol**, which returns every
-//! value already formatted as text by the server. That removes almost the whole
-//! per-type decoding layer a generic SQL client would otherwise need: numerics
-//! keep their exact precision, `jsonb` arrives as JSON, and unknown or extension
-//! types format themselves correctly instead of falling through a match arm we
-//! forgot. PostGIS geometry is the exception: its text output is hex EWKB, which
-//! this boundary renders as WKT after learning the result's column types.
-
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -20,7 +5,11 @@ use geozero::{CoordDimensions, ToWkt, wkb::Ewkb};
 use postgres::{Client, NoTls, SimpleQueryMessage, config::Host};
 
 use crate::tls;
-pub use crate::tls::SslMode;
+
+use super::{
+    Catalog, Cell, Column, DbError, EditTarget, QueryResult, ServerConfig, Structure,
+    assemble_catalog, assemble_structure, non_utf8_error, required_cell,
+};
 
 const RELATIONS_SQL: &str = "
 SELECT
@@ -166,284 +155,117 @@ ORDER BY attribute.attnum
 
 const CONNECT_TIMEOUT_SECONDS: u64 = 10;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ConnectionConfig {
-    pub host: String,
-    pub port: Option<u16>,
-    pub database: String,
-    pub user: String,
-    /// Blank is valid and must never be warned about — cloud IAM auth issues a
-    /// short-lived token as the password, or none at all.
-    pub password: String,
-    pub sslmode: SslMode,
-    /// libpq's `sslrootcert`. Replaces the platform's trust store rather than
-    /// adding to it, and only consulted by the two verifying modes.
-    pub root_certificate: Option<String>,
+pub fn config_from_url(url: &str) -> Result<ServerConfig, String> {
+    let url_parts =
+        url::Url::parse(url).map_err(|error| format!("Connection URL is invalid: {error}"))?;
+    let has_explicit_port = url_parts.port().is_some()
+        || url_parts
+            .query_pairs()
+            .any(|(key, _)| key.as_ref() == "port");
+    // The two keys Slate owns come out of the URL before the driver sees
+    // it. Its parser has a fixed key list and refuses anything outside it,
+    // so `sslrootcert` would die as "invalid connection string" and so
+    // would `sslmode=verify-full` — naming neither the option nor the
+    // reason. Slate carries both itself and re-emits an `sslmode` the
+    // driver does know.
+    let mut sslmode = tls::SslMode::default();
+    let mut root_certificate = None;
+    let mut passed_through = Vec::new();
+    for (key, value) in url_parts.query_pairs() {
+        match key.as_ref() {
+            "sslmode" => sslmode = tls::SslMode::parse(value.as_ref())?,
+            "sslrootcert" => {
+                root_certificate = Some(value.trim().to_string()).filter(|p| !p.is_empty());
+            }
+            _ => passed_through.push((key.into_owned(), value.into_owned())),
+        }
+    }
+    let mut without_tls_keys = url_parts.clone();
+    without_tls_keys.set_query(None);
+    {
+        let mut query = without_tls_keys.query_pairs_mut();
+        for (key, value) in &passed_through {
+            query.append_pair(key, value);
+        }
+    }
+    let parsed: postgres::Config = without_tls_keys
+        .as_str()
+        .parse()
+        .map_err(|error| format!("Connection URL is invalid: {error}"))?;
+    let host = match parsed.get_hosts() {
+        [Host::Tcp(host)] => host.clone(),
+        [] => return Err("Connection URL does not contain a host.".into()),
+        [_] => return Err("Connection URL contains a Unix socket host.".into()),
+        _ => return Err("Connection URL contains more than one host.".into()),
+    };
+    let database = parsed
+        .get_dbname()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "Connection URL does not contain a database.".to_string())?
+        .to_string();
+    let user = parsed
+        .get_user()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "Connection URL does not contain a username.".to_string())?
+        .to_string();
+    let password = parsed
+        .get_password()
+        .map(|password| {
+            std::str::from_utf8(password)
+                .map(str::to_string)
+                .map_err(|_| "Connection URL password is not valid UTF-8.".to_string())
+        })
+        .transpose()?
+        .unwrap_or_default();
+
+    Ok(ServerConfig {
+        host,
+        // Last wins, as in libpq: the driver's URL parser takes a port
+        // from the host section first -- 5432 when there is none -- and
+        // then pushes any `?port=` value after it.
+        port: has_explicit_port
+            .then(|| parsed.get_ports().last().copied())
+            .flatten(),
+        database,
+        user,
+        password,
+        sslmode,
+        root_certificate,
+    })
 }
 
-impl ConnectionConfig {
-    pub fn from_url(url: &str) -> Result<Self, String> {
-        if !url.starts_with("postgres://") && !url.starts_with("postgresql://") {
-            return Err("Connection URL must start with postgres:// or postgresql://.".into());
-        }
-
-        let url_parts =
-            url::Url::parse(url).map_err(|error| format!("Connection URL is invalid: {error}"))?;
-        let has_explicit_port = url_parts.port().is_some()
-            || url_parts
-                .query_pairs()
-                .any(|(key, _)| key.as_ref() == "port");
-        // The two keys Slate owns come out of the URL before the driver sees
-        // it. Its parser has a fixed key list and refuses anything outside it,
-        // so `sslrootcert` would die as "invalid connection string" and so
-        // would `sslmode=verify-full` — naming neither the option nor the
-        // reason. Slate carries both itself and re-emits an `sslmode` the
-        // driver does know.
-        let mut sslmode = SslMode::default();
-        let mut root_certificate = None;
-        let mut passed_through = Vec::new();
-        for (key, value) in url_parts.query_pairs() {
-            match key.as_ref() {
-                "sslmode" => sslmode = SslMode::parse(value.as_ref())?,
-                "sslrootcert" => {
-                    root_certificate = Some(value.trim().to_string()).filter(|p| !p.is_empty());
-                }
-                _ => passed_through.push((key.into_owned(), value.into_owned())),
-            }
-        }
-        let mut without_tls_keys = url_parts.clone();
-        without_tls_keys.set_query(None);
-        {
-            let mut query = without_tls_keys.query_pairs_mut();
-            for (key, value) in &passed_through {
-                query.append_pair(key, value);
-            }
-        }
-        let parsed: postgres::Config = without_tls_keys
-            .as_str()
-            .parse()
-            .map_err(|error| format!("Connection URL is invalid: {error}"))?;
-        let host = match parsed.get_hosts() {
-            [Host::Tcp(host)] => host.clone(),
-            [] => return Err("Connection URL does not contain a host.".into()),
-            [_] => return Err("Connection URL contains a Unix socket host.".into()),
-            _ => return Err("Connection URL contains more than one host.".into()),
-        };
-        let database = parsed
-            .get_dbname()
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| "Connection URL does not contain a database.".to_string())?
-            .to_string();
-        let user = parsed
-            .get_user()
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| "Connection URL does not contain a username.".to_string())?
-            .to_string();
-        let password = parsed
-            .get_password()
-            .map(|password| {
-                std::str::from_utf8(password)
-                    .map(str::to_string)
-                    .map_err(|_| "Connection URL password is not valid UTF-8.".to_string())
-            })
-            .transpose()?
-            .unwrap_or_default();
-
-        Ok(Self {
-            host,
-            // Last wins, as in libpq: the driver's URL parser takes a port
-            // from the host section first -- 5432 when there is none -- and
-            // then pushes any `?port=` value after it.
-            port: has_explicit_port
-                .then(|| parsed.get_ports().last().copied())
-                .flatten(),
-            database,
-            user,
-            password,
-            sslmode,
-            root_certificate,
-        })
+/// libpq key/value connection string.
+///
+/// Values are single-quoted and escaped rather than interpolated bare, so
+/// that a username containing `@` or a password containing a space is
+/// passed through intact instead of truncating the string.
+fn connection_string(server: &ServerConfig) -> String {
+    let mut parts = vec![
+        format!("host={}", quote(&server.host)),
+        format!("dbname={}", quote(&server.database)),
+        format!("user={}", quote(&server.user)),
+    ];
+    if let Some(port) = server.port {
+        parts.push(format!("port={port}"));
     }
-
-    /// libpq key/value connection string.
-    ///
-    /// Values are single-quoted and escaped rather than interpolated bare, so
-    /// that a username containing `@` or a password containing a space is
-    /// passed through intact instead of truncating the string.
-    pub fn connection_string(&self) -> String {
-        let mut parts = vec![
-            format!("host={}", quote(&self.host)),
-            format!("dbname={}", quote(&self.database)),
-            format!("user={}", quote(&self.user)),
-        ];
-        if let Some(port) = self.port {
-            parts.push(format!("port={port}"));
-        }
-        if !self.password.is_empty() {
-            parts.push(format!("password={}", quote(&self.password)));
-        }
-        // The driver's three rungs, not Slate's five. Verification above
-        // `require` belongs to the connector `tls::connector` builds, and
-        // handing the driver a word it does not know fails the whole parse.
-        parts.push(format!("sslmode={}", self.sslmode.driver_mode()));
-        // Without this the driver waits out the OS SYN retry budget, so a host
-        // that resolves but drops packets pins the UI in "Connecting…" for
-        // minutes with no cancel.
-        parts.push(format!("connect_timeout={CONNECT_TIMEOUT_SECONDS}"));
-        parts.join(" ")
+    if !server.password.is_empty() {
+        parts.push(format!("password={}", quote(&server.password)));
     }
-
-    pub fn endpoint(&self) -> String {
-        match self.port {
-            Some(port) => format!("{}:{port}", self.host),
-            None => self.host.clone(),
-        }
-    }
+    // The driver's three rungs, not Slate's five. Verification above
+    // `require` belongs to the connector `tls::connector` builds, and
+    // handing the driver a word it does not know fails the whole parse.
+    parts.push(format!("sslmode={}", server.sslmode.driver_mode()));
+    // Without this the driver waits out the OS SYN retry budget, so a host
+    // that resolves but drops packets pins the UI in "Connecting…" for
+    // minutes with no cancel.
+    parts.push(format!("connect_timeout={CONNECT_TIMEOUT_SECONDS}"));
+    parts.join(" ")
 }
 
 fn quote(value: &str) -> String {
     let escaped = value.replace('\\', r"\\").replace('\'', r"\'");
     format!("'{escaped}'")
 }
-
-/// One column of a result set.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Column {
-    pub name: String,
-    /// The server's own name for the column's type — `int4`, `jsonb`,
-    /// `timestamptz` — as a Slate-owned string, never a driver type.
-    ///
-    /// Absent rather than guessed. The simple query protocol carries no type
-    /// information at all, so this is learned by describing the statement, and
-    /// Postgres will not describe everything (see [`column_types`]).
-    pub data_type: Option<String>,
-}
-
-/// A cell value, already formatted by the server. `None` is SQL NULL, which is
-/// distinct from an empty string and must stay distinguishable in the grid.
-pub type Cell = Option<String>;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RelationKind {
-    Table,
-    PartitionedTable,
-    View,
-    MaterializedView,
-    ForeignTable,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Relation {
-    pub name: String,
-    pub kind: RelationKind,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RoutineKind {
-    Function,
-    Procedure,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Routine {
-    pub name: String,
-    pub kind: RoutineKind,
-    pub identity_arguments: String,
-    pub result_type: String,
-    pub language: String,
-    pub definition: String,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Schema {
-    pub name: String,
-    pub relations: Vec<Relation>,
-    pub routines: Vec<Routine>,
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Catalog {
-    pub schemas: Vec<Schema>,
-}
-
-/// One relation's definition. Loaded when the relation is opened rather than at
-/// connect: a database with thousands of relations would pay for every one of
-/// them to show the columns of the one that was clicked.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Structure {
-    pub columns: Vec<ColumnDefinition>,
-    pub indexes: Vec<NamedDefinition>,
-    pub constraints: Vec<NamedDefinition>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ColumnDefinition {
-    pub name: String,
-    pub data_type: String,
-    pub nullable: bool,
-    pub default: Option<String>,
-}
-
-/// An index or a constraint, as the name plus the server's own rendering of it.
-/// Postgres already prints both as readable DDL, so parsing them into fields
-/// would only lose information.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct NamedDefinition {
-    pub name: String,
-    pub definition: String,
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct QueryResult {
-    pub columns: Vec<Column>,
-    pub rows: Vec<Vec<Cell>>,
-    /// Total bytes of returned cell text. Shown in the status bar so the cost
-    /// of a wide or geometry-heavy result is visible rather than mysterious.
-    pub bytes: usize,
-    pub elapsed: Duration,
-    /// The command's server-reported row count. The simple protocol reports
-    /// zero both for commands that affected no rows and commands without a row
-    /// count, so callers must not infer the command kind from this value.
-    pub rows_affected: Option<u64>,
-    /// Where these rows can be written back to, when they can be at all.
-    /// `None` is the answer for every result set Slate cannot address a single
-    /// row of, and it is not an error — see [`Connection::edit_target`].
-    pub edit: Option<EditTarget>,
-}
-
-/// The table a result set's rows can be written back to, already resolved to
-/// names and result-column positions.
-///
-/// The identity work — which oid, which attribute number — happens inside this
-/// module and stops here (hard rule 4). A caller gets an answer it can build
-/// SQL from, not a puzzle it has to ask the catalog about.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct EditTarget {
-    pub schema: String,
-    pub table: String,
-    /// The real column name behind each result column, positionally. `None`
-    /// where the result column is computed rather than read from the table, so
-    /// `SELECT id AS ident, count(*)` gives `[Some("id"), None]`.
-    pub columns: Vec<Option<String>>,
-    /// Result-column indices that together identify one row. Never empty.
-    pub keys: Vec<usize>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct DbError {
-    pub message: String,
-    /// Byte offset into the submitted statement, when the server reports one.
-    /// Used to point at the offending token instead of the whole statement.
-    pub position: Option<usize>,
-}
-
-impl std::fmt::Display for DbError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.message)
-    }
-}
-
-impl std::error::Error for DbError {}
 
 /// A live connection. Cloneable so a background task can take one without
 /// borrowing the view.
@@ -457,21 +279,21 @@ pub struct Connection {
 }
 
 impl Connection {
-    pub fn open(config: ConnectionConfig) -> Result<Self, DbError> {
+    pub fn open(server: &ServerConfig) -> Result<Self, DbError> {
         // Two branches rather than a boxed connector: `Client::connect` is
         // generic over it, and `NoTls` is a distinct type whose entire purpose
         // is to refuse. Building one at all is what `disable` means.
-        let connector = tls::connector(config.sslmode, config.root_certificate.as_deref())
+        let connector = tls::connector(server.sslmode, server.root_certificate.as_deref())
             .map_err(|message| DbError {
                 message,
                 position: None,
             })?;
-        let string = config.connection_string();
+        let string = connection_string(server);
         let client = match connector {
             None => Client::connect(&string, NoTls),
             Some(connector) => Client::connect(&string, connector),
         }
-        .map_err(|error| connect_error(&error, &config))?;
+        .map_err(|error| connect_error(&error, server))?;
 
         Ok(Self {
             client: Arc::new(Mutex::new(client)),
@@ -708,17 +530,14 @@ fn resolve_edit_target(probed: &[ProbedColumn], table: &KeyedTable) -> Option<Ed
     })
 }
 
+/// A relation name is user data and can contain a quote.
 fn structure_sql(template: &str, schema: &str, relation: &str) -> String {
     template
-        .replace("{schema}", &quote_literal(schema))
-        .replace("{relation}", &quote_literal(relation))
-}
-
-/// A relation name is user data and can contain a quote. Doubling is enough
-/// because `standard_conforming_strings` is on by default, so a backslash in a
-/// name is not an escape character.
-pub(crate) fn quote_literal(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "''"))
+        .replace("{schema}", &super::Engine::Postgres.quote_literal(schema))
+        .replace(
+            "{relation}",
+            &super::Engine::Postgres.quote_literal(relation),
+        )
 }
 
 /// The result, plus the number of statements the server completed -- one
@@ -854,137 +673,7 @@ fn readable_wkt(wkt: &str) -> String {
     readable
 }
 
-fn assemble_catalog(relations: QueryResult, routines: QueryResult) -> Result<Catalog, DbError> {
-    let mut schemas = std::collections::BTreeMap::<String, Schema>::new();
-
-    for row in &relations.rows {
-        let schema_name = required_cell(&relations, row, "schema_name")?;
-        let name = required_cell(&relations, row, "relation_name")?;
-        let kind = match required_cell(&relations, row, "relation_kind")? {
-            "table" => RelationKind::Table,
-            "partitioned_table" => RelationKind::PartitionedTable,
-            "view" => RelationKind::View,
-            "materialized_view" => RelationKind::MaterializedView,
-            "foreign_table" => RelationKind::ForeignTable,
-            kind => return Err(unexpected_catalog_value("relation kind", kind)),
-        };
-
-        schema(&mut schemas, schema_name).relations.push(Relation {
-            name: name.to_string(),
-            kind,
-        });
-    }
-
-    for row in &routines.rows {
-        let schema_name = required_cell(&routines, row, "schema_name")?;
-        let name = required_cell(&routines, row, "routine_name")?;
-        let kind = match required_cell(&routines, row, "routine_kind")? {
-            "function" => RoutineKind::Function,
-            "procedure" => RoutineKind::Procedure,
-            kind => return Err(unexpected_catalog_value("routine kind", kind)),
-        };
-
-        schema(&mut schemas, schema_name).routines.push(Routine {
-            name: name.to_string(),
-            kind,
-            identity_arguments: required_cell(&routines, row, "identity_arguments")?.to_string(),
-            result_type: required_cell(&routines, row, "result_type")?.to_string(),
-            language: required_cell(&routines, row, "language")?.to_string(),
-            definition: required_cell(&routines, row, "definition")?.to_string(),
-        });
-    }
-
-    Ok(Catalog {
-        schemas: schemas.into_values().collect(),
-    })
-}
-
-fn assemble_structure(
-    columns: QueryResult,
-    indexes: QueryResult,
-    constraints: QueryResult,
-) -> Result<Structure, DbError> {
-    let mut structure = Structure::default();
-
-    for row in &columns.rows {
-        let default = required_cell(&columns, row, "column_default")?;
-        structure.columns.push(ColumnDefinition {
-            name: required_cell(&columns, row, "column_name")?.to_string(),
-            data_type: required_cell(&columns, row, "data_type")?.to_string(),
-            nullable: match required_cell(&columns, row, "nullable")? {
-                "yes" => true,
-                "no" => false,
-                value => return Err(unexpected_catalog_value("nullability", value)),
-            },
-            default: (!default.is_empty()).then(|| default.to_string()),
-        });
-    }
-
-    for (result, into) in [
-        (&indexes, &mut structure.indexes),
-        (&constraints, &mut structure.constraints),
-    ] {
-        for row in &result.rows {
-            into.push(NamedDefinition {
-                name: required_cell(result, row, "object_name")?.to_string(),
-                definition: required_cell(result, row, "definition")?.to_string(),
-            });
-        }
-    }
-
-    Ok(structure)
-}
-
-fn schema<'a>(
-    schemas: &'a mut std::collections::BTreeMap<String, Schema>,
-    name: &str,
-) -> &'a mut Schema {
-    schemas.entry(name.to_string()).or_insert_with(|| Schema {
-        name: name.to_string(),
-        relations: Vec::new(),
-        routines: Vec::new(),
-    })
-}
-
-fn required_cell<'a>(
-    result: &'a QueryResult,
-    row: &'a [Cell],
-    column_name: &str,
-) -> Result<&'a str, DbError> {
-    let index = result
-        .columns
-        .iter()
-        .position(|column| column.name == column_name)
-        .ok_or_else(|| plain_error(format!("Catalog query omitted column {column_name}.")))?;
-
-    row.get(index)
-        .and_then(Option::as_deref)
-        .ok_or_else(|| plain_error(format!("Catalog query returned no {column_name}.")))
-}
-
-fn unexpected_catalog_value(label: &str, value: &str) -> DbError {
-    plain_error(format!("Catalog query returned unknown {label} {value}."))
-}
-
-fn non_utf8_error(columns: &[Column], index: usize) -> DbError {
-    let column = columns
-        .get(index)
-        .map(|column| format!("column {}", column.name))
-        .unwrap_or_else(|| format!("column {index}"));
-
-    plain_error(format!(
-        "A value in {column} is not valid UTF-8 text and cannot be displayed."
-    ))
-}
-
-fn plain_error(message: String) -> DbError {
-    DbError {
-        message,
-        position: None,
-    }
-}
-
-fn connect_error(error: &postgres::Error, config: &ConnectionConfig) -> DbError {
+fn connect_error(error: &postgres::Error, server: &ServerConfig) -> DbError {
     // A refused connection is the most common failure by a wide margin, and the
     // driver's own wording buries the endpoint. Say what happened, and nothing
     // about what the user should do -- we cannot see their machine.
@@ -994,7 +683,7 @@ fn connect_error(error: &postgres::Error, config: &ConnectionConfig) -> DbError 
         return DbError {
             message: format!(
                 "Connection refused: nothing is listening on {}",
-                config.endpoint()
+                server.endpoint()
             ),
             position: None,
         };
@@ -1082,9 +771,10 @@ fn io_source(error: &postgres::Error) -> Option<&std::io::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::{RelationKind, RoutineKind, SslMode, result};
 
-    fn config() -> ConnectionConfig {
-        ConnectionConfig {
+    fn config() -> ServerConfig {
+        ServerConfig {
             host: "db.example.test".into(),
             port: Some(8432),
             database: "slate_test".into(),
@@ -1096,8 +786,8 @@ mod tests {
     }
 
     /// The server the `live_` tests talk to, from the standard `PG*` variables.
-    fn live_config() -> ConnectionConfig {
-        ConnectionConfig {
+    fn live_config() -> ServerConfig {
+        ServerConfig {
             host: std::env::var("PGHOST").expect("PGHOST is required"),
             port: std::env::var("PGPORT")
                 .ok()
@@ -1159,7 +849,7 @@ mod tests {
     fn connection_string_quotes_values() {
         let config = config();
         assert_eq!(
-            config.connection_string(),
+            connection_string(&config),
             "host='db.example.test' dbname='slate_test' user='someone' port=8432 \
              sslmode=prefer connect_timeout=10"
         );
@@ -1167,11 +857,11 @@ mod tests {
 
     #[test]
     fn connection_string_omits_an_unspecified_port() {
-        let config = ConnectionConfig {
+        let config = ServerConfig {
             port: None,
             ..config()
         };
-        assert!(!config.connection_string().contains("port="));
+        assert!(!connection_string(&config).contains("port="));
         assert_eq!(config.endpoint(), "db.example.test");
     }
 
@@ -1180,56 +870,47 @@ mod tests {
         // An empty `password=''` is not the same as offering no password, and
         // IAM auth relies on the latter.
         let config = config();
-        assert!(!config.connection_string().contains("password"));
+        assert!(!connection_string(&config).contains("password"));
     }
 
     #[test]
     fn username_with_at_sign_survives() {
         // Cloud IAM usernames are email addresses. A bare interpolation would
         // still work here, but quoting is what keeps it working.
-        let config = ConnectionConfig {
+        let config = ServerConfig {
             user: "person@example.com".into(),
             ..config()
         };
-        assert!(
-            config
-                .connection_string()
-                .contains("user='person@example.com'")
-        );
+        assert!(connection_string(&config).contains("user='person@example.com'"));
     }
 
     #[test]
     fn quotes_and_backslashes_are_escaped() {
-        let config = ConnectionConfig {
+        let config = ServerConfig {
             password: r"pa'ss\word".into(),
             ..config()
         };
-        assert!(
-            config
-                .connection_string()
-                .contains(r"password='pa\'ss\\word'")
-        );
+        assert!(connection_string(&config).contains(r"password='pa\'ss\\word'"));
     }
 
     #[test]
     fn spaces_in_values_do_not_split_the_string() {
-        let config = ConnectionConfig {
+        let config = ServerConfig {
             database: "my database".into(),
             ..config()
         };
-        assert!(config.connection_string().contains("dbname='my database'"));
+        assert!(connection_string(&config).contains("dbname='my database'"));
     }
 
     #[test]
     fn url_populates_fields_without_inventing_a_port() {
-        let config = ConnectionConfig::from_url(
-            "postgresql://person%40example.com@db.example.test/slate_test",
-        )
-        .unwrap();
+        let config =
+            config_from_url("postgresql://person%40example.com@db.example.test/slate_test")
+                .unwrap();
 
         assert_eq!(
             config,
-            ConnectionConfig {
+            ServerConfig {
                 host: "db.example.test".into(),
                 port: None,
                 database: "slate_test".into(),
@@ -1243,13 +924,108 @@ mod tests {
 
     #[test]
     fn url_preserves_an_explicit_port_and_password() {
-        let config = ConnectionConfig::from_url(
-            "postgres://someone:pa%20ss@db.example.test:8432/slate_test",
-        )
-        .unwrap();
+        let config =
+            config_from_url("postgres://someone:pa%20ss@db.example.test:8432/slate_test").unwrap();
 
         assert_eq!(config.port, Some(8432));
         assert_eq!(config.password, "pa ss");
+    }
+
+    #[test]
+    fn a_url_carries_its_sslmode_through_instead_of_losing_it() {
+        // The whole hazard this replaced: the mode used to be dropped on the
+        // way in, so the rebuilt string defaulted to `prefer`, and `prefer`
+        // with a connector that cannot do TLS returns a plaintext socket
+        // without even sending an SSLRequest. A demand for encryption became a
+        // cleartext password and a UI that said Connected.
+        for (mode, expected) in [
+            ("disable", SslMode::Disable),
+            ("prefer", SslMode::Prefer),
+            ("require", SslMode::Require),
+            ("verify-ca", SslMode::VerifyCa),
+            ("verify-full", SslMode::VerifyFull),
+        ] {
+            let url = format!("postgresql://someone@db.example.test/slate_test?sslmode={mode}");
+            assert_eq!(config_from_url(&url).unwrap().sslmode, expected, "{url}");
+        }
+    }
+
+    #[test]
+    fn the_two_keys_slate_owns_are_kept_away_from_the_drivers_parser() {
+        // The driver knows neither `verify-full` nor `sslrootcert` and refuses
+        // the whole string for either, naming nothing useful. Both have to be
+        // taken out of the URL before it reaches that parser, and everything
+        // else has to survive the round trip.
+        let config = config_from_url(
+            "postgresql://someone@db.example.test:5433/slate_test\
+             ?sslmode=verify-full&sslrootcert=/tmp/rds.pem&application_name=slate",
+        )
+        .unwrap();
+
+        assert_eq!(config.sslmode, SslMode::VerifyFull);
+        assert_eq!(config.root_certificate.as_deref(), Some("/tmp/rds.pem"));
+        assert_eq!(config.port, Some(5433));
+        assert_eq!(config.user, "someone");
+    }
+
+    #[test]
+    fn a_url_asking_for_a_mode_slate_cannot_honour_says_so() {
+        assert!(
+            config_from_url("postgresql://someone@db.example.test/slate_test?sslmode=allow")
+                .unwrap_err()
+                .contains("allow")
+        );
+    }
+
+    #[test]
+    fn a_url_port_parameter_wins_over_the_port_in_the_host() {
+        // The driver fills the port from the host section first -- 5432 when
+        // there is none -- and pushes `?port=` after it, so reading the first
+        // entry connected to a different server than the URL named.
+        for (url, expected) in [
+            ("postgresql://someone@db.example.test/slate_test", None),
+            (
+                "postgresql://someone@db.example.test:5433/slate_test",
+                Some(5433),
+            ),
+            (
+                "postgresql://someone@db.example.test/slate_test?port=6000",
+                Some(6000),
+            ),
+            (
+                "postgresql://someone@db.example.test:5433/slate_test?port=6000",
+                Some(6000),
+            ),
+        ] {
+            assert_eq!(config_from_url(url).unwrap().port, expected, "{url}");
+        }
+    }
+
+    #[test]
+    fn the_driver_is_only_ever_handed_a_mode_it_knows() {
+        // Slate's five rungs collapse to the driver's three on the wire; the
+        // rest is the verifier's job. A word the driver does not know fails
+        // its parse and takes the whole connection with it.
+        for (mode, expected) in [
+            (SslMode::Disable, "sslmode=disable"),
+            (SslMode::Prefer, "sslmode=prefer"),
+            (SslMode::Require, "sslmode=require"),
+            (SslMode::VerifyCa, "sslmode=require"),
+            (SslMode::VerifyFull, "sslmode=require"),
+        ] {
+            let config = ServerConfig {
+                sslmode: mode,
+                ..config()
+            };
+            let string = connection_string(&config);
+            assert!(string.contains(expected), "{mode:?} produced {string}");
+            // And it parses: this is the check that would have caught handing
+            // the driver "verify-full".
+            assert!(
+                string.parse::<::postgres::Config>().is_ok(),
+                "{mode:?} produced an unparsable string: {string}"
+            );
+        }
     }
 
     #[test]
@@ -1314,123 +1090,6 @@ mod tests {
         assert_eq!(result.rows[0][0].as_deref(), Some("not ewkb"));
     }
 
-    fn result(columns: &[&str], rows: &[&[Option<&str>]]) -> QueryResult {
-        QueryResult {
-            columns: columns
-                .iter()
-                .map(|name| Column {
-                    name: (*name).to_string(),
-                    ..Default::default()
-                })
-                .collect(),
-            rows: rows
-                .iter()
-                .map(|row| row.iter().map(|cell| cell.map(str::to_string)).collect())
-                .collect(),
-            ..Default::default()
-        }
-    }
-
-    #[test]
-    fn catalog_groups_relations_and_routines_by_schema() {
-        let relations = result(
-            &["schema_name", "relation_name", "relation_kind"],
-            &[
-                &[Some("analytics"), Some("events"), Some("partitioned_table")],
-                &[Some("public"), Some("accounts"), Some("table")],
-                &[Some("public"), Some("account_overview"), Some("view")],
-            ],
-        );
-        let routines = result(
-            &[
-                "schema_name",
-                "routine_name",
-                "routine_kind",
-                "identity_arguments",
-                "result_type",
-                "language",
-                "definition",
-            ],
-            &[
-                &[
-                    Some("analytics"),
-                    Some("refresh_events"),
-                    Some("procedure"),
-                    Some("full boolean"),
-                    Some(""),
-                    Some("plpgsql"),
-                    Some("CREATE PROCEDURE analytics.refresh_events(full boolean)"),
-                ],
-                &[
-                    Some("public"),
-                    Some("account_name"),
-                    Some("function"),
-                    Some("account_id bigint"),
-                    Some("text"),
-                    Some("sql"),
-                    Some("CREATE FUNCTION public.account_name(account_id bigint)"),
-                ],
-            ],
-        );
-
-        let catalog = assemble_catalog(relations, routines).unwrap();
-
-        assert_eq!(catalog.schemas.len(), 2);
-        assert_eq!(catalog.schemas[0].name, "analytics");
-        assert_eq!(
-            catalog.schemas[0].relations,
-            vec![Relation {
-                name: "events".into(),
-                kind: RelationKind::PartitionedTable,
-            }]
-        );
-        assert_eq!(catalog.schemas[0].routines[0].kind, RoutineKind::Procedure);
-        assert_eq!(catalog.schemas[1].name, "public");
-        assert_eq!(catalog.schemas[1].relations[1].kind, RelationKind::View);
-        assert_eq!(catalog.schemas[1].routines[0].result_type, "text");
-    }
-
-    #[test]
-    fn structure_reads_nullability_and_treats_a_blank_default_as_absent() {
-        let columns = result(
-            &["column_name", "data_type", "nullable", "column_default"],
-            &[
-                &[Some("id"), Some("bigint"), Some("no"), Some("nextval('s')")],
-                &[Some("label"), Some("text"), Some("yes"), Some("")],
-            ],
-        );
-        let indexes = result(
-            &["object_name", "definition"],
-            &[&[Some("accounts_pkey"), Some("CREATE UNIQUE INDEX …")]],
-        );
-        let constraints = result(
-            &["object_name", "definition"],
-            &[&[Some("accounts_pkey"), Some("PRIMARY KEY (id)")]],
-        );
-
-        let structure = assemble_structure(columns, indexes, constraints).unwrap();
-
-        assert_eq!(
-            structure.columns,
-            vec![
-                ColumnDefinition {
-                    name: "id".into(),
-                    data_type: "bigint".into(),
-                    nullable: false,
-                    default: Some("nextval('s')".into()),
-                },
-                ColumnDefinition {
-                    name: "label".into(),
-                    data_type: "text".into(),
-                    nullable: true,
-                    default: None,
-                },
-            ]
-        );
-        assert_eq!(structure.indexes[0].name, "accounts_pkey");
-        assert_eq!(structure.constraints[0].definition, "PRIMARY KEY (id)");
-    }
-
     #[test]
     fn structure_sql_quotes_a_name_containing_a_quote() {
         let sql = structure_sql(
@@ -1443,113 +1102,6 @@ mod tests {
             sql,
             "WHERE namespace.nspname = 'public' AND class.relname = 'odd''name'"
         );
-    }
-
-    #[test]
-    fn a_url_carries_its_sslmode_through_instead_of_losing_it() {
-        // The whole hazard this replaced: the mode used to be dropped on the
-        // way in, so the rebuilt string defaulted to `prefer`, and `prefer`
-        // with a connector that cannot do TLS returns a plaintext socket
-        // without even sending an SSLRequest. A demand for encryption became a
-        // cleartext password and a UI that said Connected.
-        for (mode, expected) in [
-            ("disable", SslMode::Disable),
-            ("prefer", SslMode::Prefer),
-            ("require", SslMode::Require),
-            ("verify-ca", SslMode::VerifyCa),
-            ("verify-full", SslMode::VerifyFull),
-        ] {
-            let url = format!("postgresql://someone@db.example.test/slate_test?sslmode={mode}");
-            assert_eq!(
-                ConnectionConfig::from_url(&url).unwrap().sslmode,
-                expected,
-                "{url}"
-            );
-        }
-    }
-
-    #[test]
-    fn the_two_keys_slate_owns_are_kept_away_from_the_drivers_parser() {
-        // The driver knows neither `verify-full` nor `sslrootcert` and refuses
-        // the whole string for either, naming nothing useful. Both have to be
-        // taken out of the URL before it reaches that parser, and everything
-        // else has to survive the round trip.
-        let config = ConnectionConfig::from_url(
-            "postgresql://someone@db.example.test:5433/slate_test\
-             ?sslmode=verify-full&sslrootcert=/tmp/rds.pem&application_name=slate",
-        )
-        .unwrap();
-
-        assert_eq!(config.sslmode, SslMode::VerifyFull);
-        assert_eq!(config.root_certificate.as_deref(), Some("/tmp/rds.pem"));
-        assert_eq!(config.port, Some(5433));
-        assert_eq!(config.user, "someone");
-    }
-
-    #[test]
-    fn a_url_asking_for_a_mode_slate_cannot_honour_says_so() {
-        assert!(
-            ConnectionConfig::from_url(
-                "postgresql://someone@db.example.test/slate_test?sslmode=allow"
-            )
-            .unwrap_err()
-            .contains("allow")
-        );
-    }
-
-    #[test]
-    fn a_url_port_parameter_wins_over_the_port_in_the_host() {
-        // The driver fills the port from the host section first -- 5432 when
-        // there is none -- and pushes `?port=` after it, so reading the first
-        // entry connected to a different server than the URL named.
-        for (url, expected) in [
-            ("postgresql://someone@db.example.test/slate_test", None),
-            (
-                "postgresql://someone@db.example.test:5433/slate_test",
-                Some(5433),
-            ),
-            (
-                "postgresql://someone@db.example.test/slate_test?port=6000",
-                Some(6000),
-            ),
-            (
-                "postgresql://someone@db.example.test:5433/slate_test?port=6000",
-                Some(6000),
-            ),
-        ] {
-            assert_eq!(
-                ConnectionConfig::from_url(url).unwrap().port,
-                expected,
-                "{url}"
-            );
-        }
-    }
-
-    #[test]
-    fn the_driver_is_only_ever_handed_a_mode_it_knows() {
-        // Slate's five rungs collapse to the driver's three on the wire; the
-        // rest is the verifier's job. A word the driver does not know fails
-        // its parse and takes the whole connection with it.
-        for (mode, expected) in [
-            (SslMode::Disable, "sslmode=disable"),
-            (SslMode::Prefer, "sslmode=prefer"),
-            (SslMode::Require, "sslmode=require"),
-            (SslMode::VerifyCa, "sslmode=require"),
-            (SslMode::VerifyFull, "sslmode=require"),
-        ] {
-            let config = ConnectionConfig {
-                sslmode: mode,
-                ..config()
-            };
-            let string = config.connection_string();
-            assert!(string.contains(expected), "{mode:?} produced {string}");
-            // And it parses: this is the check that would have caught handing
-            // the driver "verify-full".
-            assert!(
-                string.parse::<postgres::Config>().is_ok(),
-                "{mode:?} produced an unparsable string: {string}"
-            );
-        }
     }
 
     #[test]
@@ -1667,21 +1219,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn catalog_rejects_unknown_object_kinds() {
-        let relations = result(
-            &["schema_name", "relation_name", "relation_kind"],
-            &[&[Some("public"), Some("mystery"), Some("unknown")]],
-        );
-
-        let error = assemble_catalog(relations, QueryResult::default()).unwrap_err();
-
-        assert_eq!(
-            error.message,
-            "Catalog query returned unknown relation kind unknown."
-        );
-    }
-
     /// What each mode does against a server with no TLS configured, which is
     /// what the compose development database is.
     ///
@@ -1693,7 +1230,7 @@ mod tests {
     #[ignore = "requires the repository development database configured through PG*"]
     fn live_only_the_modes_that_tolerate_plaintext_reach_a_server_without_tls() {
         let connect = |sslmode| {
-            Connection::open(ConnectionConfig {
+            Connection::open(&ServerConfig {
                 sslmode,
                 ..live_config()
             })
@@ -1717,7 +1254,7 @@ mod tests {
     #[test]
     #[ignore = "requires a local Postgres server configured through PG*"]
     fn live_query_round_trip() {
-        let connection = Connection::open(live_config()).expect("connection should open");
+        let connection = Connection::open(&live_config()).expect("connection should open");
         let result = connection
             .query("SELECT * FROM (VALUES (1, 'alpha'), (2, NULL)) AS sample(id, label)")
             .expect("query should succeed");
@@ -1746,7 +1283,7 @@ mod tests {
         // before running therefore killed a selection the simple protocol
         // handles fine, and reported every later failure as "current
         // transaction is aborted" instead of its own cause.
-        let connection = Connection::open(live_config()).expect("connection should open");
+        let connection = Connection::open(&live_config()).expect("connection should open");
         connection.query("BEGIN").expect("BEGIN should succeed");
 
         let result = connection
@@ -1778,7 +1315,7 @@ mod tests {
         // have no public constructor -- so the ragged-rows panic is guarded
         // here. Before the RowDescription arm existed this produced 3 columns
         // against a 1-cell row, and the grid aborted the process painting it.
-        let connection = Connection::open(live_config()).expect("connection should open");
+        let connection = Connection::open(&live_config()).expect("connection should open");
 
         let result = connection
             .query("SELECT 1 AS a, 2 AS b, 3 AS c; SELECT 4 AS d")
@@ -1787,7 +1324,10 @@ mod tests {
         assert_eq!(names(&result), vec!["d"]);
         assert_eq!(result.rows, vec![vec![Some("4".into())]]);
         assert!(
-            result.rows.iter().all(|row| row.len() == result.columns.len()),
+            result
+                .rows
+                .iter()
+                .all(|row| row.len() == result.columns.len()),
             "every row must match the column count"
         );
 
@@ -1806,7 +1346,7 @@ mod tests {
         // The whole point of the widened probe: the grid holds names the user
         // chose, in the order they asked for, and an UPDATE needs the table's
         // own names and the key's position among them.
-        let result = Connection::open(live_config())
+        let result = Connection::open(&live_config())
             .expect("connection should open")
             .query("SELECT name, id FROM accounts")
             .expect("query should succeed");
@@ -1826,7 +1366,7 @@ mod tests {
     fn live_an_aliased_or_computed_column_reports_what_the_table_calls_it() {
         // An alias is the one case where the result's own column name is a lie
         // about the table, and an expression has no name in the table at all.
-        let result = Connection::open(live_config())
+        let result = Connection::open(&live_config())
             .expect("connection should open")
             .query("SELECT id AS ident, upper(name) AS shouted, name FROM accounts")
             .expect("query should succeed");
@@ -1844,7 +1384,7 @@ mod tests {
     fn live_a_join_or_an_aggregate_is_not_editable() {
         // Two tables, or no table: either way the row on screen is not a row
         // of anything Slate could write back to.
-        let connection = Connection::open(live_config()).expect("connection should open");
+        let connection = Connection::open(&live_config()).expect("connection should open");
 
         for sql in [
             "SELECT accounts.id, locations.name
@@ -1867,7 +1407,7 @@ mod tests {
     #[ignore = "requires the repository development database configured through PG*"]
     fn live_a_select_omitting_the_key_is_not_editable() {
         // Nothing in this result set identifies which account a row is.
-        let result = Connection::open(live_config())
+        let result = Connection::open(&live_config())
             .expect("connection should open")
             .query("SELECT name, email FROM accounts")
             .expect("query should succeed");
@@ -1879,7 +1419,7 @@ mod tests {
     #[ignore = "requires a local Postgres server configured through PG*"]
     fn live_a_table_without_a_primary_key_is_not_editable() {
         // There is no predicate that names one of two identical rows.
-        let connection = Connection::open(live_config()).expect("connection should open");
+        let connection = Connection::open(&live_config()).expect("connection should open");
         connection
             .query("CREATE TEMP TABLE slate_unkeyed (value integer, label text)")
             .expect("the temporary table should be created");
@@ -1894,7 +1434,7 @@ mod tests {
     #[test]
     #[ignore = "requires a local Postgres server configured through PG*"]
     fn live_a_composite_primary_key_reports_every_column_it_is_made_of() {
-        let connection = Connection::open(live_config()).expect("connection should open");
+        let connection = Connection::open(&live_config()).expect("connection should open");
         connection
             .query(
                 "CREATE TEMP TABLE slate_composite (
@@ -1928,7 +1468,7 @@ mod tests {
         // The edit target costs a second round trip, on the same connection,
         // inside whatever transaction the user has open. It must be as
         // harmless there as the type probe beside it.
-        let connection = Connection::open(live_config()).expect("connection should open");
+        let connection = Connection::open(&live_config()).expect("connection should open");
         connection.query("BEGIN").expect("BEGIN should succeed");
 
         assert!(
@@ -1956,7 +1496,7 @@ mod tests {
     #[test]
     #[ignore = "requires the repository development database configured through PG*"]
     fn live_structure_round_trip() {
-        let structure = Connection::open(live_config())
+        let structure = Connection::open(&live_config())
             .expect("connection should open")
             .structure("public", "accounts")
             .expect("structure should load");
@@ -1996,7 +1536,7 @@ mod tests {
     #[test]
     #[ignore = "requires the repository development database configured through PG*"]
     fn live_catalog_round_trip() {
-        let catalog = Connection::open(live_config())
+        let catalog = Connection::open(&live_config())
             .expect("connection should open")
             .catalog()
             .expect("catalog should load");

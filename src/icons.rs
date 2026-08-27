@@ -29,7 +29,10 @@ const ICONS: [(&str, &IconData); 31] = [
     ("icons/chevron-up.svg", icondata_lu::LuChevronUp),
     ("icons/chevrons-up-down.svg", icondata_lu::LuChevronsUpDown),
     ("icons/sort-ascending.svg", icondata_lu::LuArrowUpNarrowWide),
-    ("icons/sort-descending.svg", icondata_lu::LuArrowDownWideNarrow),
+    (
+        "icons/sort-descending.svg",
+        icondata_lu::LuArrowDownWideNarrow,
+    ),
     ("icons/file-code.svg", icondata_lu::LuFileCode),
     ("icons/trash.svg", icondata_lu::LuTrash2),
     ("icons/check.svg", icondata_lu::LuCheck),
@@ -189,10 +192,7 @@ mod tests {
         // Any child element counts: Lucide draws with <path>, <polygon>,
         // <circle> and friends, and an icon that names none of them is
         // an invisible icon.
-        let content = document
-            .split_once('>')
-            .map(|(_, rest)| rest)
-            .unwrap_or("");
+        let content = document.split_once('>').map(|(_, rest)| rest).unwrap_or("");
         assert!(
             content.trim_end().trim_end_matches("</svg>").contains('<'),
             "{path} drew nothing"

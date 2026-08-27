@@ -1,7 +1,6 @@
 use gpui::{
-    App, AppContext, Context, Entity, Focusable, InteractiveElement, IntoElement,
-    ParentElement, SharedString, StatefulInteractiveElement, Styled, Window, div,
-    prelude::FluentBuilder, px,
+    App, AppContext, Context, Entity, Focusable, InteractiveElement, IntoElement, ParentElement,
+    SharedString, StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder, px,
 };
 use gpui_component::{
     InteractiveElementExt,
@@ -451,11 +450,7 @@ pub struct Field {
 /// A column wide enough for what it holds. One fixed width for every column
 /// wastes the screen on a boolean and hides most of a UUID; a table's own
 /// shape is the only thing that knows how wide its columns want to be.
-fn fitted_width(
-    name: &str,
-    display: &[Vec<Option<SharedString>>],
-    col_ix: usize,
-) -> gpui::Pixels {
+fn fitted_width(name: &str, display: &[Vec<Option<SharedString>>], col_ix: usize) -> gpui::Pixels {
     let widest = display
         .iter()
         .take(WIDTH_SAMPLE_ROWS)
@@ -563,9 +558,10 @@ impl TableDelegate for ResultGrid {
                         // until it is clicked does not read as clickable. And
                         // absent rather than faint where a click would do
                         // nothing, which is the same rule the other way round.
-                        None => control.children(self.sortable.then(|| {
-                            icon(icon::SORTABLE).size(px(12.)).text_color(faint)
-                        })),
+                        None => control.children(
+                            self.sortable
+                                .then(|| icon(icon::SORTABLE).size(px(12.)).text_color(faint)),
+                        ),
                     })
                     // Only worth saying which key this is when there is more
                     // than one of them.
@@ -743,7 +739,10 @@ mod tests {
         assert!(grid.set_pending(0, 1, "changed".into()));
 
         assert_eq!(grid.result.rows[0][1].as_deref(), Some("first"));
-        assert_eq!(grid.display[0][1].as_ref().map(SharedString::as_ref), Some("first"));
+        assert_eq!(
+            grid.display[0][1].as_ref().map(SharedString::as_ref),
+            Some("first")
+        );
         assert_eq!(grid.cell(0, 1), Some("first"));
         assert!(grid.has_pending());
     }
@@ -762,7 +761,10 @@ mod tests {
         assert_eq!(updates[0].table, "measurements");
         // The alias is resolved here, so the caller generates SQL against the
         // column the table actually has.
-        assert_eq!(updates[0].sets, vec![("body".to_string(), "twice".to_string())]);
+        assert_eq!(
+            updates[0].sets,
+            vec![("body".to_string(), "twice".to_string())]
+        );
     }
 
     #[test]
@@ -787,7 +789,10 @@ mod tests {
 
         let updates = grid.pending_updates();
         assert_eq!(updates[0].keys, vec![("id".to_string(), "7".to_string())]);
-        assert_eq!(updates[0].sets, vec![("body".to_string(), "changed".to_string())]);
+        assert_eq!(
+            updates[0].sets,
+            vec![("body".to_string(), "changed".to_string())]
+        );
     }
 
     #[test]
@@ -1111,8 +1116,14 @@ mod tests {
         let fields = grid.fields(0);
         assert_eq!(fields.len(), 2);
         assert_eq!(fields[0].name, "id");
-        assert_eq!(fields[0].data_type.as_ref().map(SharedString::as_ref), Some("int4"));
-        assert_eq!(fields[0].value.as_ref().map(SharedString::as_ref), Some("7"));
+        assert_eq!(
+            fields[0].data_type.as_ref().map(SharedString::as_ref),
+            Some("int4")
+        );
+        assert_eq!(
+            fields[0].value.as_ref().map(SharedString::as_ref),
+            Some("7")
+        );
         // A NULL has to stay absent rather than becoming the word for one.
         assert!(fields[1].value.is_none());
         // A type Slate could not learn is shown as nothing, never as a guess.

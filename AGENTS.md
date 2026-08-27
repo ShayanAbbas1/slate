@@ -1,11 +1,14 @@
 # AGENTS.md
 
-Slate is a native macOS Postgres client in Rust on GPUI. A SQL editor that shows
-results — not a database browser with an editor bolted on.
+Slate is a native macOS SQL client in Rust on GPUI, speaking Postgres, MySQL
+and SQLite. A SQL editor that shows results — not a database browser with an editor
+bolted on.
 
 **Read `docs/specs/2026-08-17-slate-design.md` before doing anything.** It carries
 the reasoning behind every decision below, including the rejected alternatives.
-This file is the operational summary; the spec is the source of truth.
+`docs/specs/2026-08-26-multi-engine-design.md` carries the second and third, and
+supersedes the first spec's §4.1 on what the boundary looks like. This file is
+the operational summary; the specs are the source of truth.
 
 ---
 
@@ -49,9 +52,25 @@ require it, stop and raise it instead.
 3. **No environment-specific behaviour.** No vendor binary names in error
    strings, no assumption that a loopback host means plaintext, no hardcoded
    ports or hostnames. Slate is a generic client.
-4. **Postgres types do not reach the UI layer.** The grid receives rendered
-   strings and type tags, never driver row types. This is the only concession to
-   a future second engine — do not add a driver trait.
+4. **Driver types do not reach the UI layer.** The grid receives rendered
+   strings and type tags, never a `postgres::Row`, a `mysql::Value`, a
+   `rusqlite::ValueRef`, an OID or a storage class. Engine dispatch is a closed enum inside `src/db/`
+   and stops there: no trait, no plugin surface, and no code above `src/db/`
+   that branches on which engine is connected.
+
+   This replaces the earlier wording, which said the rendered-string rule was
+   "the only concession to a future second engine — do not add a driver trait".
+   That was written when the second engine was hypothetical. The reasoning is
+   unchanged, and is why the rule survives at all: a UI that knows which engine
+   it is talking to grows an engine-shaped special case in every view, and
+   those are the special cases nobody ever removes. An enum rather than a trait
+   for the same reason in miniature — three arms the compiler makes every match
+   enumerate, instead of an open extension point.
+
+   The one thing that legitimately crosses out is `db::Engine`, and only
+   because Slate writes SQL: `explorer::preview_sql` and `sql::update_row` have
+   to quote an identifier the way the server will read it. It answers three
+   questions and holds no connection.
 5. **Blank passwords are valid.** Never warn about them. Usernames containing `@`
    must work. Both are required by cloud IAM auth and both are commonly broken.
 6. **Errors describe what happened, not what to do about it.** "Connection
@@ -75,6 +94,8 @@ require it, stop and raise it instead.
 gpui = "=0.2.2"
 gpui-component = { version = "=0.5.1", features = ["tree-sitter-languages"] }
 postgres = "0.19"          # blocking client, NOT tokio-postgres
+rusqlite = "0.40"          # bundled + column_metadata + column_decltype
+mysql = "28"               # rust-mysql-simple, blocking; rustls-tls-ring NOT rustls-tls
 nucleo-matcher = "=0.3.1"  # fuzzy scoring; gpui-component ships no scorer
 icondata_lu = "=0.1.0"     # Lucide icon data; gpui-component ships no icon files
 rustls = "0.23"            # TLS; the driver ships none. default-features = false
@@ -93,10 +114,18 @@ reasoning.
 gpui is pre-1.0 and breaks on minor bumps; `main` has declared `0.2.2` for ten
 months, which is a stalled version field rather than parity with the release.
 
+**`default-features = false` on `rusqlite` is load-bearing too.** 0.40's
+defaults pull in `ffi-sqlite-wasm-rs`, a WASM backend with no business in a
+native build. `bundled` compiles the amalgamation rather than linking whatever
+libsqlite3 macOS shipped; `column_metadata` is what makes in-grid editing
+reachable, since it is the only way to learn that a result column is
+`accounts.id` and not an expression.
+
 **Do not add tokio.** GPUI's executor is `async-task` over Grand Central
 Dispatch. A tokio future on `cx.background_executor().spawn(...)` _panics_ the
-moment it touches a socket or timer. Database work uses the blocking `postgres`
-client, which owns its runtime internally, spawned onto the background executor.
+moment it touches a socket or timer. Database work uses blocking drivers, which
+own their runtimes internally, spawned onto the background executor. `rusqlite`
+is blocking by construction and has no runtime at all.
 
 `tokio-rustls` in the tree is not a breach of that rule, and the rule is why:
 the TLS handshake is a future belonging to the connection, so it runs inside the
@@ -115,14 +144,52 @@ cargo run
 ```
 
 The app opens the connection form when no `PG*` environment is configured. The
-repository-owned development database accepts:
+repository-owned development databases accept:
 
 ```text
 postgresql://slate:slate@127.0.0.1:55432/slate_dev
+mysql://slate:slate@127.0.0.1:53306/slate_dev
 ```
 
-Paste that URL into the form and choose **Use URL**, then **Connect**. Connecting
-is the connection test; there is deliberately no separate test button.
+Pick the engine on the form's chip row first — it decides which fields exist.
+Then paste a URL and choose **Use URL**, or fill the fields in. Connecting is
+the connection test; there is deliberately no separate test button.
+
+SQLite has no server to connect to. Build the file once, then give the form its
+absolute path:
+
+```sh
+sqlite3 dev/slate_dev.db < dev/sqlite/001-slate-demo.sql
+```
+
+**The MySQL container reports itself healthy when its init script failed.**
+`mysqladmin ping` does not care whether the seed applied, so a half-seeded
+database looks exactly like a good one. Check a row count, not the status —
+`live_the_development_database_is_fully_seeded` is that check.
+
+### Engine divergences
+
+Decided, recorded in the multi-engine spec, and not to be re-litigated:
+
+- **`Engine` is the only engine-shaped thing above `src/db/`**, and only because
+  Slate writes SQL. It answers three questions — quote an identifier, quote a
+  literal, qualify a name — plus the inverse used to read a sort key back.
+  There are **four** call sites that generate SQL, not three:
+  `explorer::preview_sql`, `sql::with_order_by`, `sql::update_row`, and
+  `main::sort_expression`. The last one is the one that gets forgotten, and
+  forgetting it is silent: a double-quoted name is a *string literal* in MySQL,
+  so `ORDER BY "name"` sorts every row by the same constant with no error.
+- **SQLite brackets a generated multi-row batch** in `BEGIN`/`COMMIT`, because
+  it commits each statement on its own where one Postgres or MySQL submission is
+  atomic. The brackets go in the statement text, never around it invisibly, and
+  `sql::is_generated_update` refuses a transaction it cannot see closed.
+- **`CHECK` constraints are absent** from the Structure tab on MySQL and SQLite.
+  SQLite keeps them only in the `CREATE TABLE` text; MySQL's
+  `information_schema.CHECK_CONSTRAINTS` only exists from 8.0.16.
+- **MySQL verifies certificates against `webpki-roots`**, not the Keychain the
+  Postgres path reads. It fails loudly, which rule 7 permits.
+- **Geometry is Postgres-only.** MySQL has a `GEOMETRY` type; rendering it is a
+  separate decision nobody has asked for.
 
 ### What gpui-component provides
 

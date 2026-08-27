@@ -3,7 +3,7 @@ name = "slate"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
-description = "A native macOS Postgres client"
+description = "A native macOS SQL client"
 publish = false
 
 # Exact pins: gpui is pre-1.0 and breaks on minor bumps. See AGENTS.md before
@@ -27,6 +27,40 @@ tree-sitter-sequel = "=0.3.11"
 # Central Dispatch with no reactor, so a tokio future panics on it. This owns
 # its runtime and runs on the background executor. See AGENTS.md.
 postgres = "0.19"
+
+# SQLite. Blocking like the Postgres driver, and for the same reason.
+#
+# `bundled` compiles the amalgamation instead of linking whatever libsqlite3
+# macOS shipped, so the version and the compile-time options are Slate's rather
+# than the OS release's. `column_metadata` is what makes in-grid editing
+# reachable at all: it is the only way to learn that a result column is
+# `accounts.id` and not an expression. `column_decltype` is the type tag.
+#
+# `default-features = false` is load-bearing here too: 0.40's defaults pull in
+# `ffi-sqlite-wasm-rs`, a WASM backend with no business in a native build.
+rusqlite = { version = "0.40", default-features = false, features = [
+    "bundled",
+    "column_metadata",
+    "column_decltype",
+] }
+
+# MySQL. Blocking, and with no tokio anywhere in its tree -- rust-mysql-simple
+# is the sibling of the blocking `postgres` client, not of `mysql_async`.
+#
+# `rustls-tls-ring` rather than `rustls-tls`: the latter selects the aws-lc-rs
+# provider, which is the same second-crypto-library hazard documented on
+# `rustls` below. `minimal-rust` takes flate2's pure-Rust backend over zlib for
+# the same reason -- no C built for something already solved in the graph.
+#
+# It verifies certificates itself, against webpki-roots rather than the
+# Keychain the Postgres path reads. That divergence is deliberate and recorded
+# in the multi-engine spec, section 4.3: it fails loudly rather than quietly
+# accepting less than the sslmode asked for.
+mysql = { version = "28", default-features = false, features = [
+    "minimal-rust",
+    "buffer-pool",
+    "rustls-tls-ring",
+] }
 
 # PostGIS sends geometry through the simple query protocol as hex EWKB. Decode
 # that server value at the database boundary so the UI still receives strings,
