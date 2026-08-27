@@ -1,7 +1,7 @@
 # Slate
 
-A native macOS SQL client, speaking Postgres and SQLite. Rust, GPUI, no
-Electron.
+A native macOS SQL client, speaking Postgres, MySQL and SQLite. Rust, GPUI,
+no Electron.
 
 A SQL editor that shows results — not a database browser with an editor bolted
 on. Keyboard-first, minimal, and built to stay at display refresh rate on real

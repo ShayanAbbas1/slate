@@ -736,6 +736,7 @@ impl ConnectionForm {
                 ConnectionConfig::Sqlite { path }
             }
             Engine::Postgres => ConnectionConfig::Postgres(self.server(cx)?),
+            Engine::MySql => ConnectionConfig::MySql(self.server(cx)?),
         };
 
         Ok((name, config))
@@ -791,7 +792,9 @@ impl ConnectionForm {
 /// engine that has one, and the file for an engine that is one.
 fn default_profile_name(config: &ConnectionConfig) -> String {
     match config {
-        ConnectionConfig::Postgres(server) => server.database.clone(),
+        ConnectionConfig::Postgres(server) | ConnectionConfig::MySql(server) => {
+            server.database.clone()
+        }
         ConnectionConfig::Sqlite { path } => file_stem(path).to_string(),
     }
 }
@@ -1043,16 +1046,22 @@ impl Workspace {
             Engine::Sqlite => ConnectionConfig::Sqlite {
                 path: stored.path.unwrap_or_default(),
             },
-            Engine::Postgres => ConnectionConfig::Postgres(ServerConfig {
-                host: stored.host,
-                port: stored.port,
-                database: stored.database,
-                user: stored.user,
-                // Never on disk. Read from the Keychain when connecting.
-                password: String::new(),
-                sslmode,
-                root_certificate: stored.root_certificate,
-            }),
+            Engine::Postgres | Engine::MySql => {
+                let server = ServerConfig {
+                    host: stored.host,
+                    port: stored.port,
+                    database: stored.database,
+                    user: stored.user,
+                    // Never on disk. Read from the Keychain when connecting.
+                    password: String::new(),
+                    sslmode,
+                    root_certificate: stored.root_certificate,
+                };
+                match engine {
+                    Engine::MySql => ConnectionConfig::MySql(server),
+                    _ => ConnectionConfig::Postgres(server),
+                }
+            }
         };
         let mut session = Session::new(
             stored.id.clone(),
@@ -1155,7 +1164,7 @@ impl Workspace {
                 (&form.name, default_profile_name(&config)),
                 (&form.path, path.clone()),
             ],
-            ConnectionConfig::Postgres(server) => vec![
+            ConnectionConfig::Postgres(server) | ConnectionConfig::MySql(server) => vec![
                 (&form.name, server.database.clone()),
                 (&form.host, server.host.clone()),
                 (
@@ -1319,7 +1328,7 @@ impl Workspace {
             async move {
                 // A file engine has nothing to authenticate to, so it never
                 // reaches the Keychain — and never triggers its prompt.
-                if let ConnectionConfig::Postgres(server) = &mut config
+                if let Some(server) = config.server_mut()
                     && server.password.is_empty()
                 {
                     match store::password(&id) {

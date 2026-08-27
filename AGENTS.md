@@ -1,12 +1,12 @@
 # AGENTS.md
 
-Slate is a native macOS SQL client in Rust on GPUI, speaking Postgres and
-SQLite. A SQL editor that shows results — not a database browser with an editor
+Slate is a native macOS SQL client in Rust on GPUI, speaking Postgres, MySQL
+and SQLite. A SQL editor that shows results — not a database browser with an editor
 bolted on.
 
 **Read `docs/specs/2026-08-17-slate-design.md` before doing anything.** It carries
 the reasoning behind every decision below, including the rejected alternatives.
-`docs/specs/2026-08-26-multi-engine-design.md` carries the second engine, and
+`docs/specs/2026-08-26-multi-engine-design.md` carries the second and third, and
 supersedes the first spec's §4.1 on what the boundary looks like. This file is
 the operational summary; the specs are the source of truth.
 
@@ -53,8 +53,8 @@ require it, stop and raise it instead.
    strings, no assumption that a loopback host means plaintext, no hardcoded
    ports or hostnames. Slate is a generic client.
 4. **Driver types do not reach the UI layer.** The grid receives rendered
-   strings and type tags, never a `postgres::Row`, a `rusqlite::ValueRef`, an
-   OID or a storage class. Engine dispatch is a closed enum inside `src/db/`
+   strings and type tags, never a `postgres::Row`, a `mysql::Value`, a
+   `rusqlite::ValueRef`, an OID or a storage class. Engine dispatch is a closed enum inside `src/db/`
    and stops there: no trait, no plugin surface, and no code above `src/db/`
    that branches on which engine is connected.
 
@@ -95,6 +95,7 @@ gpui = "=0.2.2"
 gpui-component = { version = "=0.5.1", features = ["tree-sitter-languages"] }
 postgres = "0.19"          # blocking client, NOT tokio-postgres
 rusqlite = "0.40"          # bundled + column_metadata + column_decltype
+mysql = "28"               # rust-mysql-simple, blocking; rustls-tls-ring NOT rustls-tls
 nucleo-matcher = "=0.3.1"  # fuzzy scoring; gpui-component ships no scorer
 icondata_lu = "=0.1.0"     # Lucide icon data; gpui-component ships no icon files
 rustls = "0.23"            # TLS; the driver ships none. default-features = false

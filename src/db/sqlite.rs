@@ -24,7 +24,8 @@ use rusqlite::{Batch, OpenFlags};
 
 use super::{
     Catalog, Cell, Column, DbError, EditTarget, Engine, NamedDefinition, QueryResult, Structure,
-    assemble_catalog, assemble_structure, non_utf8_error, plain_error, required_cell,
+    assemble_catalog, assemble_structure, non_utf8_error, percent_decoded, plain_error,
+    required_cell,
 };
 
 /// The path out of a `sqlite:` or `file:` URL.
@@ -47,31 +48,6 @@ pub fn path_from_url(url: &str) -> Result<String, String> {
         return Err("Connection URL does not name a database file.".into());
     }
     Ok(decoded)
-}
-
-/// A URL is percent-encoded by definition, and a path with a space in it is
-/// ordinary on macOS.
-fn percent_decoded(value: &str) -> Result<String, String> {
-    let bytes = value.as_bytes();
-    let mut decoded = Vec::with_capacity(bytes.len());
-    let mut index = 0;
-    while index < bytes.len() {
-        if bytes[index] == b'%' {
-            let digits = value
-                .get(index + 1..index + 3)
-                .ok_or_else(|| "Connection URL ends in an incomplete escape.".to_string())?;
-            decoded
-                .push(u8::from_str_radix(digits, 16).map_err(|_| {
-                    format!("Connection URL contains an invalid escape %{digits}.")
-                })?);
-            index += 3;
-        } else {
-            decoded.push(bytes[index]);
-            index += 1;
-        }
-    }
-
-    String::from_utf8(decoded).map_err(|_| "Connection URL path is not valid UTF-8.".to_string())
 }
 
 /// A live connection. Cloneable so a background task can take one without

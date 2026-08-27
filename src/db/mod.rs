@@ -16,6 +16,7 @@ use std::time::Duration;
 
 pub use crate::tls::SslMode;
 
+mod mysql;
 mod postgres;
 mod sqlite;
 
@@ -28,16 +29,18 @@ mod sqlite;
 pub enum Engine {
     #[default]
     Postgres,
+    MySql,
     Sqlite,
 }
 
 impl Engine {
     /// Presentation order, which is the order the form's chips appear in.
-    pub const ALL: [Self; 2] = [Self::Postgres, Self::Sqlite];
+    pub const ALL: [Self; 3] = [Self::Postgres, Self::MySql, Self::Sqlite];
 
     pub fn label(self) -> &'static str {
         match self {
             Self::Postgres => "Postgres",
+            Self::MySql => "MySQL",
             Self::Sqlite => "SQLite",
         }
     }
@@ -47,6 +50,7 @@ impl Engine {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Postgres => "postgres",
+            Self::MySql => "mysql",
             Self::Sqlite => "sqlite",
         }
     }
@@ -56,6 +60,7 @@ impl Engine {
     pub fn parse(value: &str) -> Result<Self, String> {
         match value.trim().to_ascii_lowercase().as_str() {
             "postgres" | "postgresql" => Ok(Self::Postgres),
+            "mysql" | "mariadb" => Ok(Self::MySql),
             "sqlite" | "sqlite3" | "file" => Ok(Self::Sqlite),
             other => Err(format!("{other} is not a database engine Slate speaks.")),
         }
@@ -68,21 +73,29 @@ impl Engine {
         !matches!(self, Self::Sqlite)
     }
 
-    /// Postgres and SQLite take the standard's double quote.
+    /// Postgres and SQLite take the standard's double quote. MySQL takes a
+    /// backtick, which it accepts whether or not `ANSI_QUOTES` is set — a double
+    /// quote there is a string literal unless the server was configured
+    /// otherwise, and Slate does not configure servers.
     pub fn quote_identifier(self, identifier: &str) -> String {
         match self {
             Self::Postgres | Self::Sqlite => {
                 format!("\"{}\"", identifier.replace('"', "\"\""))
             }
+            Self::MySql => format!("`{}`", identifier.replace('`', "``")),
         }
     }
 
-    /// Doubling the quote is enough for both: neither reads a backslash as an
-    /// escape, Postgres because `standard_conforming_strings` is on by default
-    /// and SQLite because it has no such notion at all.
+    /// Doubling the quote is enough for two of the three: neither Postgres nor
+    /// SQLite reads a backslash as an escape, the first because
+    /// `standard_conforming_strings` is on by default and the second because it
+    /// has no such notion at all. MySQL does, unless `NO_BACKSLASH_ESCAPES` is
+    /// set — which is again not Slate's to set — so a literal backslash has to
+    /// survive as two.
     pub fn quote_literal(self, value: &str) -> String {
         match self {
             Self::Postgres | Self::Sqlite => format!("'{}'", value.replace('\'', "''")),
+            Self::MySql => format!("'{}'", value.replace('\\', r"\\").replace('\'', "''")),
         }
     }
 
@@ -93,6 +106,31 @@ impl Engine {
             self.quote_identifier(name)
         )
     }
+}
+
+/// A URL is percent-encoded by definition, and a path with a space in it is
+/// ordinary on macOS.
+pub(super) fn percent_decoded(value: &str) -> Result<String, String> {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            let digits = value
+                .get(index + 1..index + 3)
+                .ok_or_else(|| "Connection URL ends in an incomplete escape.".to_string())?;
+            decoded
+                .push(u8::from_str_radix(digits, 16).map_err(|_| {
+                    format!("Connection URL contains an invalid escape %{digits}.")
+                })?);
+            index += 3;
+        } else {
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+    }
+
+    String::from_utf8(decoded).map_err(|_| "Connection URL path is not valid UTF-8.".to_string())
 }
 
 /// What an engine needs to reach a server. SQLite has none of it.
@@ -129,6 +167,7 @@ impl ServerConfig {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ConnectionConfig {
     Postgres(ServerConfig),
+    MySql(ServerConfig),
     Sqlite { path: String },
 }
 
@@ -136,6 +175,7 @@ impl ConnectionConfig {
     pub fn engine(&self) -> Engine {
         match self {
             Self::Postgres(_) => Engine::Postgres,
+            Self::MySql(_) => Engine::MySql,
             Self::Sqlite { .. } => Engine::Sqlite,
         }
     }
@@ -144,7 +184,16 @@ impl ConnectionConfig {
     /// there is one — the credential fields, and the Keychain.
     pub fn server(&self) -> Option<&ServerConfig> {
         match self {
-            Self::Postgres(server) => Some(server),
+            Self::Postgres(server) | Self::MySql(server) => Some(server),
+            Self::Sqlite { .. } => None,
+        }
+    }
+
+    /// The same, for the one caller that fills the password in: connecting
+    /// reads it from the Keychain, which the profile on disk never holds.
+    pub fn server_mut(&mut self) -> Option<&mut ServerConfig> {
+        match self {
+            Self::Postgres(server) | Self::MySql(server) => Some(server),
             Self::Sqlite { .. } => None,
         }
     }
@@ -167,6 +216,7 @@ impl ConnectionConfig {
             format!("Connection URL scheme {scheme}:// is not a database Slate speaks.")
         })? {
             Engine::Postgres => postgres::config_from_url(url).map(Self::Postgres),
+            Engine::MySql => mysql::config_from_url(url).map(Self::MySql),
             Engine::Sqlite => sqlite::path_from_url(url).map(|path| Self::Sqlite { path }),
         }
     }
@@ -174,7 +224,7 @@ impl ConnectionConfig {
     /// What was being talked to, for an error or a title to name.
     pub fn endpoint(&self) -> String {
         match self {
-            Self::Postgres(server) => server.endpoint(),
+            Self::Postgres(server) | Self::MySql(server) => server.endpoint(),
             Self::Sqlite { path } => path.clone(),
         }
     }
@@ -185,6 +235,7 @@ impl ConnectionConfig {
 #[derive(Clone)]
 pub enum Connection {
     Postgres(postgres::Connection),
+    MySql(mysql::Connection),
     Sqlite(sqlite::Connection),
 }
 
@@ -194,6 +245,7 @@ impl Connection {
             ConnectionConfig::Postgres(server) => {
                 postgres::Connection::open(&server).map(Self::Postgres)
             }
+            ConnectionConfig::MySql(server) => mysql::Connection::open(&server).map(Self::MySql),
             ConnectionConfig::Sqlite { path } => sqlite::Connection::open(&path).map(Self::Sqlite),
         }
     }
@@ -206,6 +258,7 @@ impl Connection {
     pub fn query(&self, sql: &str) -> Result<QueryResult, DbError> {
         match self {
             Self::Postgres(connection) => connection.query(sql),
+            Self::MySql(connection) => connection.query(sql),
             Self::Sqlite(connection) => connection.query(sql),
         }
     }
@@ -213,6 +266,7 @@ impl Connection {
     pub fn catalog(&self) -> Result<Catalog, DbError> {
         match self {
             Self::Postgres(connection) => connection.catalog(),
+            Self::MySql(connection) => connection.catalog(),
             Self::Sqlite(connection) => connection.catalog(),
         }
     }
@@ -220,6 +274,7 @@ impl Connection {
     pub fn structure(&self, schema: &str, relation: &str) -> Result<Structure, DbError> {
         match self {
             Self::Postgres(connection) => connection.structure(schema, relation),
+            Self::MySql(connection) => connection.structure(schema, relation),
             Self::Sqlite(connection) => connection.structure(schema, relation),
         }
     }
@@ -599,16 +654,47 @@ mod tests {
     }
 
     #[test]
-    fn a_name_carrying_a_quote_survives_being_quoted() {
-        // Both are user data, and both reach a statement Slate generates.
+    fn each_engine_quotes_the_way_its_own_server_reads() {
+        // An identifier and a literal are both user data, and both reach a
+        // statement Slate generates. The escape is what stops a table called
+        // `odd"name` from ending the identifier early.
+        assert_eq!(
+            Engine::Postgres.quote_identifier("odd\"name"),
+            "\"odd\"\"name\""
+        );
+        assert_eq!(
+            Engine::Sqlite.quote_identifier("odd\"name"),
+            "\"odd\"\"name\""
+        );
+        assert_eq!(Engine::MySql.quote_identifier("odd`name"), "`odd``name`");
+
         for engine in Engine::ALL {
-            assert_eq!(engine.quote_identifier("odd\"name"), "\"odd\"\"name\"");
-            assert_eq!(engine.quote_literal("odd'value"), "'odd''value'");
             assert_eq!(
-                engine.qualified("odd\"schema", "table"),
-                "\"odd\"\"schema\".\"table\""
+                engine.quote_literal("odd'value"),
+                "'odd''value'",
+                "{engine:?}"
             );
         }
+
+        // Only MySQL reads a backslash as an escape, so only MySQL has to
+        // double one. Getting this wrong is how a trailing backslash turns the
+        // closing quote into an escaped one and swallows the rest of the
+        // statement.
+        assert_eq!(Engine::MySql.quote_literal(r"back\slash"), r"'back\\slash'");
+        assert_eq!(
+            Engine::Postgres.quote_literal(r"back\slash"),
+            r"'back\slash'"
+        );
+        assert_eq!(Engine::Sqlite.quote_literal(r"back\slash"), r"'back\slash'");
+
+        assert_eq!(
+            Engine::Postgres.qualified("odd\"schema", "table"),
+            "\"odd\"\"schema\".\"table\""
+        );
+        assert_eq!(
+            Engine::MySql.qualified("slate_dev", "table"),
+            "`slate_dev`.`table`"
+        );
     }
 
     #[test]

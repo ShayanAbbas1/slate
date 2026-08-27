@@ -1,7 +1,7 @@
 # Multi-engine support: SQLite and MySQL
 
 Date: 2026-08-26
-Status: accepted
+Status: implemented
 
 Slate speaks to one engine. This adds two more without letting either of them
 be visible above `src/db/`.
@@ -107,17 +107,30 @@ Slate's own rather than the OS's. `default-features = false` is required
 because rusqlite 0.40's defaults include `ffi-sqlite-wasm-rs`, which is not
 wanted in a native build. No tokio.
 
-**Opening.** `open_with_flags` with `SQLITE_OPEN_READ_WRITE | SQLITE_OPEN_URI`,
-and deliberately **without** `SQLITE_OPEN_CREATE`. A mistyped path must be an
-error that names the path, not a silently created empty database that then
-reports an empty catalog as though the file were simply new.
+**Opening.** `open_with_flags` with `SQLITE_OPEN_READ_WRITE`, and deliberately
+**without** `SQLITE_OPEN_CREATE`. `SQLITE_OPEN_URI` is off too: the path is
+resolved out of the URL before the driver sees it, so leaving URI parsing on
+would make a path containing `?` mean something other than itself — and one of
+the parameters it would then honour is `mode=rwc`, which puts the file creation
+straight back.
 
-**Statements.** `rusqlite` has no multi-result-set API. A submission is split
-with `sql::Buffer::parse`, which is already Slate's authority on where a
-statement ends, and the pieces are run in order; the last result set wins, the
-same rule Postgres follows. This is not a behaviour change for the user: SQLite
-autocommits each statement anyway, so running them in sequence is what a single
-submission already meant.
+A mistyped path must be an error that names the path, not a silently created
+empty database that then reports an empty catalog as though the file were
+simply new.
+
+**Statements.** Split with `rusqlite::Batch`, which uses SQLite's own
+prepare-tail rather than a second parser. `sql::Buffer::parse` was the fallback
+and is not needed: a statement SQLite accepts and Slate's tree-sitter grammar
+does not would otherwise have become a statement Slate refused to send.
+
+The pieces run in order and the last result set wins, the same rule Postgres
+follows. But SQLite commits each statement on its own, where one Postgres
+submission is one implicit transaction — so a **generated** multi-row batch is
+bracketed with `BEGIN` and `COMMIT`. Those brackets go into the statement text
+the user can read, edit and undo, never around it invisibly, and
+`sql::is_generated_update` learns the shape rather than trusting it: it refuses
+a transaction it cannot see closed, and still scans inside for anything
+destructive.
 
 **Values.** From `ValueRef`: `Null` is `None`, integers and reals go through
 `Display`, `Text` is decoded as UTF-8 and raises the existing non-UTF-8 error
@@ -134,11 +147,19 @@ column's type and must not be presented as one.
 `sqlite_master` gives tables and views, excluding `sqlite_%`. Routines are
 always empty — SQLite has none, and an empty list is the truthful answer.
 
-**Structure.** `PRAGMA table_info` for columns (name, declared type, `notnull`,
-`dflt_value`), `PRAGMA index_list` joined to `sqlite_master.sql` for index
-definitions, and `PRAGMA foreign_key_list` plus `table_info`'s `pk` for
-constraints. SQLite has no constraint catalog, so these are reconstructed into
-the same `name: definition` shape the other engines report directly.
+**Structure.** `PRAGMA table_info` for columns, `PRAGMA index_list` joined to
+`sqlite_master.sql` for index definitions, and `PRAGMA foreign_key_list` plus
+`table_info`'s `pk` for constraints. SQLite has no constraint catalog, so these
+are reconstructed into the same `name: definition` shape the other engines
+report directly. `CHECK` constraints are left out: SQLite keeps them only inside
+the `CREATE TABLE` text, and parsing DDL to show it back is a worse trade than
+not showing it.
+
+Nullability needs one correction the pragma does not make. An
+`INTEGER PRIMARY KEY` is the rowid under another name and cannot hold a null,
+but `table_info` reports `notnull = 0` for it. Every *other* kind of primary key
+column in SQLite genuinely can hold one — a real quirk, and one the query is
+careful to preserve while fixing the rowid case.
 
 **Edit target.** `Statement::columns_with_metadata()` gives `database_name`,
 `table_name` and `origin_name` per column — the provenance the Postgres probe
@@ -198,7 +219,19 @@ and to mark `unsigned`.
 `ROUTINE_DEFINITION` as the body and `PARAMETERS` for the identity arguments.
 
 **Structure.** `information_schema.COLUMNS` for columns, `STATISTICS` for
-indexes, `TABLE_CONSTRAINTS` joined to `KEY_COLUMN_USAGE` for constraints.
+indexes, `TABLE_CONSTRAINTS` joined to `KEY_COLUMN_USAGE` for constraints. A
+column's default reports `AUTO_INCREMENT` or the generation expression where
+there is one, because `COLUMN_DEFAULT` alone says "no default" for exactly the
+two cases where the server supplies the value itself.
+
+`CHECK` is left out here too, for a different reason: its clause lives in
+`information_schema.CHECK_CONSTRAINTS`, which MySQL only grew in 8.0.16, and a
+Structure tab that fails wholesale against an older server is worse than one
+showing the constraints every server has.
+
+Every aggregate in these queries is grouped, `only_full_group_by` being on by
+default since 5.7 — a foreign key's `REFERENCED_TABLE_NAME` beside a
+`GROUP_CONCAT` is rejected outright without it.
 
 **Edit target.** `Column::org_table_str()` and `schema_str()` give the sole
 table; `org_name_str()` gives the real column name behind an alias. The key
@@ -315,6 +348,8 @@ view, and those are the special cases nobody ever removes.
 - **Writing `NULL` from the grid.** `sql::update_row` writes every value as a
   quoted literal and cannot express `NULL` for Postgres either. Unchanged here,
   and not made worse.
+- **`CHECK` constraints** in the Structure tab, on MySQL and SQLite. Reasons
+  above; Postgres still shows them, because Postgres will simply state them.
 - **Geometry outside PostGIS.** MySQL has a `GEOMETRY` type; rendering it is a
   separate decision with its own cost, and nobody has asked.
 - **`ATTACH` from the UI.** An attached database appears in the tree if the

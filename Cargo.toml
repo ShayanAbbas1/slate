@@ -44,6 +44,24 @@ rusqlite = { version = "0.40", default-features = false, features = [
     "column_decltype",
 ] }
 
+# MySQL. Blocking, and with no tokio anywhere in its tree -- rust-mysql-simple
+# is the sibling of the blocking `postgres` client, not of `mysql_async`.
+#
+# `rustls-tls-ring` rather than `rustls-tls`: the latter selects the aws-lc-rs
+# provider, which is the same second-crypto-library hazard documented on
+# `rustls` below. `minimal-rust` takes flate2's pure-Rust backend over zlib for
+# the same reason -- no C built for something already solved in the graph.
+#
+# It verifies certificates itself, against webpki-roots rather than the
+# Keychain the Postgres path reads. That divergence is deliberate and recorded
+# in the multi-engine spec, section 4.3: it fails loudly rather than quietly
+# accepting less than the sslmode asked for.
+mysql = { version = "28", default-features = false, features = [
+    "minimal-rust",
+    "buffer-pool",
+    "rustls-tls-ring",
+] }
+
 # PostGIS sends geometry through the simple query protocol as hex EWKB. Decode
 # that server value at the database boundary so the UI still receives strings,
 # but receives readable WKT rather than binary rendered as hexadecimal.
