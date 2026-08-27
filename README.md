@@ -13,60 +13,56 @@ data.
 > amended by [`docs/specs/2026-08-23-in-grid-editing-design.md`](docs/specs/2026-08-23-in-grid-editing-design.md)
 > and [`docs/specs/2026-08-26-multi-engine-design.md`](docs/specs/2026-08-26-multi-engine-design.md).
 
-## Development database
+## Development databases
 
-The repository includes a disposable Postgres/PostGIS database with deterministic
-data for editor, result-grid and large-value testing.
+The repository includes a disposable database per engine, all carrying the same
+demo objects with deterministic data for editor, result-grid and large-value
+testing: enum, UUID, numeric, array, JSON, `NULL`, Unicode, binary, large text
+and 5,000 measurement rows. Geometry is Postgres-only — PostGIS has no
+equivalent in the other two, and Slate does not pretend otherwise.
 
 ```sh
-docker compose up -d postgres
-
-PGHOST=127.0.0.1 \
-PGPORT=55432 \
-PGDATABASE=slate_dev \
-PGUSER=slate \
-PGPASSWORD=slate \
+docker compose up -d                                       # postgres + mysql
+sqlite3 dev/slate_dev.db < dev/sqlite/001-slate-demo.sql    # a file, not a service
 cargo run
 ```
 
-The seed includes enum, UUID, numeric, array, JSONB, `NULL`, Unicode, binary,
-large text, 5,000 measurement rows and PostGIS geometry values.
+Pick the engine in the connection form, then paste a URL or fill in the fields:
+
+```text
+postgresql://slate:slate@127.0.0.1:55432/slate_dev
+mysql://slate:slate@127.0.0.1:53306/slate_dev
+/absolute/path/to/slate/dev/slate_dev.db
+```
+
+`PG*` environment variables still configure a Postgres profile at startup and
+are not generalised — Slate is a generic client, not a generic environment
+reader, and the other two engines have no such convention to read.
+
+```sh
+PGHOST=127.0.0.1 PGPORT=55432 PGDATABASE=slate_dev \
+PGUSER=slate PGPASSWORD=slate cargo run
+```
 
 The official PostGIS image is currently `amd64`-only. Docker Desktop runs it
 under emulation on Apple Silicon; `compose.yaml` declares that platform
 explicitly rather than emitting a misleading mismatch warning.
 
-Initialization runs only when Docker creates the data volume. Reset it after
-changing a seed file:
+Initialization runs only when Docker creates the data volume, so reset it after
+changing a seed file. The MySQL container reports itself healthy even when its
+init script failed, so check the row count rather than the status:
 
 ```sh
-docker compose down --volumes
-docker compose up -d postgres
+docker compose down --volumes && docker compose up -d
+rm -f dev/slate_dev.db && sqlite3 dev/slate_dev.db < dev/sqlite/001-slate-demo.sql
 ```
-
-MySQL and SQLite carry the same demo objects, minus anything PostGIS-specific.
-MySQL runs the same way, on its own container:
-
-```sh
-docker compose up -d mysql
-```
-
-```text
-mysql://slate:slate@127.0.0.1:53306/slate_dev
-```
-
-SQLite is a file, not a service — build it once with the system `sqlite3`:
-
-```sh
-sqlite3 dev/slate_dev.db < dev/sqlite/001-slate-demo.sql
-```
-
-Paste a URL, or the SQLite file path, into the connection form. `PG*`
-environment variables remain Postgres-only; the other two engines connect
-through the form.
 
 ## What works
 
+- **Postgres, MySQL and SQLite**, behind one interface. Pick the engine on the
+  connection form and the fields follow it — a file path for SQLite, host and
+  credentials for the other two. No driver type reaches the UI, so the grid,
+  the explorer and the editor do not know which engine they are showing.
 - **Connection profiles with isolated workspaces.** Switch database and your
   whole set of tabs, tree and history switches with it. Nothing is shared, so a
   buffer written against staging cannot be silently retargeted at production.
@@ -92,12 +88,13 @@ through the form.
   exists, so closing that one is deleting it and it asks first; everything else
   just goes.
 - **TLS, with libpq's five `sslmode` rungs** — `disable`, `prefer`, `require`,
-  `verify-ca`, `verify-full` — selectable per connection and carried in the
-  connection string. `verify-full` checks the certificate against the macOS
-  trust store, or against a root certificate you name, which replaces that store
-  rather than adding to it. A mode is never quietly downgraded: ask for
-  encryption and Slate either gets it or tells you which certificate failed and
-  why.
+  `verify-ca`, `verify-full` — selectable per connection and carried through to
+  both server engines. `verify-full` checks the certificate against the macOS
+  trust store on Postgres, or against a root certificate you name, which
+  replaces that store rather than adding to it. A mode is never quietly
+  downgraded: ask for encryption and Slate either gets it or tells you which
+  certificate failed and why. SQLite has no transport to secure, so it has no
+  such setting.
 
 ## Planned
 
@@ -111,7 +108,9 @@ assumes you write SQL.
 **Slate will never write a `DELETE`, `DROP` or `TRUNCATE`** — not on request, not
 by accident. Generated statements pass a whitelist gate that admits `UPDATE` and
 nothing else, so the guarantee is structural rather than a list of names someone
-remembered to check.
+remembered to check. On SQLite, where each statement commits on its own, a
+multi-row edit is bracketed with `BEGIN`/`COMMIT` — written into the buffer
+where you can read it, never opened behind your back.
 
 ## License
 

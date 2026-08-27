@@ -151,15 +151,45 @@ postgresql://slate:slate@127.0.0.1:55432/slate_dev
 mysql://slate:slate@127.0.0.1:53306/slate_dev
 ```
 
-Paste a URL into the form and choose **Use URL**, then **Connect**. Connecting
-is the connection test; there is deliberately no separate test button.
+Pick the engine on the form's chip row first — it decides which fields exist.
+Then paste a URL and choose **Use URL**, or fill the fields in. Connecting is
+the connection test; there is deliberately no separate test button.
 
-SQLite has no server to connect to — build the file once, then point the form
-at its path:
+SQLite has no server to connect to. Build the file once, then give the form its
+absolute path:
 
 ```sh
 sqlite3 dev/slate_dev.db < dev/sqlite/001-slate-demo.sql
 ```
+
+**The MySQL container reports itself healthy when its init script failed.**
+`mysqladmin ping` does not care whether the seed applied, so a half-seeded
+database looks exactly like a good one. Check a row count, not the status —
+`live_the_development_database_is_fully_seeded` is that check.
+
+### Engine divergences
+
+Decided, recorded in the multi-engine spec, and not to be re-litigated:
+
+- **`Engine` is the only engine-shaped thing above `src/db/`**, and only because
+  Slate writes SQL. It answers three questions — quote an identifier, quote a
+  literal, qualify a name — plus the inverse used to read a sort key back.
+  There are **four** call sites that generate SQL, not three:
+  `explorer::preview_sql`, `sql::with_order_by`, `sql::update_row`, and
+  `main::sort_expression`. The last one is the one that gets forgotten, and
+  forgetting it is silent: a double-quoted name is a *string literal* in MySQL,
+  so `ORDER BY "name"` sorts every row by the same constant with no error.
+- **SQLite brackets a generated multi-row batch** in `BEGIN`/`COMMIT`, because
+  it commits each statement on its own where one Postgres or MySQL submission is
+  atomic. The brackets go in the statement text, never around it invisibly, and
+  `sql::is_generated_update` refuses a transaction it cannot see closed.
+- **`CHECK` constraints are absent** from the Structure tab on MySQL and SQLite.
+  SQLite keeps them only in the `CREATE TABLE` text; MySQL's
+  `information_schema.CHECK_CONSTRAINTS` only exists from 8.0.16.
+- **MySQL verifies certificates against `webpki-roots`**, not the Keychain the
+  Postgres path reads. It fails loudly, which rule 7 permits.
+- **Geometry is Postgres-only.** MySQL has a `GEOMETRY` type; rendering it is a
+  separate decision nobody has asked for.
 
 ### What gpui-component provides
 
