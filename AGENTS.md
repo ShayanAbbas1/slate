@@ -211,6 +211,14 @@ serves the same paths from `icondata_lu` in memory, so nothing is vendored into
 the repository and the library's own widgets get their icons from it too. Add a
 row to `ICONS` when something needs one; an unlisted path draws nothing.
 
+Its `Button` is worth using for the mechanism and nothing else. **Never
+construct one directly** — go through `button`, `icon_button` and `button_label`
+in `main.rs`, which measure the box off `CONTROL_HEIGHT*` and put the label and
+the icon in as children carrying their own colour. That last part is not style:
+0.5.1 tints button content `red_400` on hover from a hardcoded colour, and a
+child that sets a colour is the only thing that colour does not reach. GPUI's
+`.hover()` panics if called twice, so there is no fixing it from outside.
+
 The library owns scroll math, text shaping and virtualization. **Every visible
 pixel is still ours** — `TableDelegate::render_td(row_ix, col_ix)` is pull-based,
 and the highlighter emits neutral token kinds that we map to our own palette.

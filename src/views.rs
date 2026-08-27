@@ -13,19 +13,18 @@ use gpui::{
 };
 use gpui_component::{
     InteractiveElementExt, Sizable,
-    button::{Button, ButtonVariants},
     input::{Input, InputState},
     resizable::{resizable_panel, v_resizable},
     table::{Table, TableDelegate, TableState},
 };
 
 use crate::{
-    NewQuery, ObjectBody, ObjectTab, Profile, QueryState, RunQuery, SaveQuery, SetRowLimit,
-    StructureState, Tab, Workspace, compact_count, db,
+    Control, NewQuery, ObjectBody, ObjectTab, Profile, QueryState, RunQuery, SaveQuery,
+    SetRowLimit, StructureState, Tab, Tone, Workspace, button_label, compact_count, db,
     db::RoutineKind,
     editor_zoom_percent,
     explorer::ROW_LIMITS,
-    group_thousands,
+    group_thousands, icon_button,
     icons::icon,
     key_hint, object_icon, result_grid,
     result_grid::ResultGrid,
@@ -370,14 +369,17 @@ fn render_row_inspector(
                     )
                     .child(
                         div().ml_auto().child(
-                            Button::new("close-row-inspector")
-                                .icon(icon(icon::CLOSE))
-                                .ghost()
-                                .xsmall()
-                                .tooltip("Close the row panel")
-                                .on_click(move |_, _, cx| {
-                                    table.update(cx, |table, cx| table.clear_selection(cx));
-                                }),
+                            icon_button(
+                                "close-row-inspector",
+                                icon::CLOSE,
+                                Tone::Quiet,
+                                Control::Compact,
+                                t,
+                            )
+                            .tooltip("Close the row panel")
+                            .on_click(move |_, _, cx| {
+                                table.update(cx, |table, cx| table.clear_selection(cx));
+                            }),
                         ),
                     ),
             )
@@ -696,25 +698,37 @@ fn render_tab_strip(profile: &Profile, cx: &mut Context<Workspace>) -> AnyElemen
                                     })
                             })
                             .child(
-                                Button::new(("delete-query", index))
-                                    .label(if pending { "Delete?" } else { "" })
-                                    .icon(icon(icon::DELETE))
-                                    .ghost()
-                                    .xsmall()
-                                    .tooltip("Delete query")
-                                    .on_click(move |_, window, cx| {
-                                        // Or the chip underneath opens the query in
-                                        // the same click, and the confirmation this
-                                        // arms is cleared before it can be seen.
-                                        cx.stop_propagation();
-                                        _ = delete_workspace.update(cx, |workspace, cx| {
-                                            workspace.arm_delete_saved_query(
-                                                delete_name.clone(),
-                                                window,
-                                                cx,
-                                            );
-                                        });
-                                    }),
+                                // Armed, it says the word and takes the danger
+                                // fill: the icon alone asks, the red confirms.
+                                icon_button(
+                                    ("delete-query", index),
+                                    icon::DELETE,
+                                    if pending { Tone::Danger } else { Tone::Quiet },
+                                    Control::Inline,
+                                    t,
+                                )
+                                .when(pending, |armed| {
+                                    armed.w_auto().px(px(layout::SPACE_XS)).child(button_label(
+                                        "Delete?",
+                                        Tone::Danger,
+                                        Control::Inline,
+                                        t,
+                                    ))
+                                })
+                                .tooltip("Delete query")
+                                .on_click(move |_, window, cx| {
+                                    // Or the chip underneath opens the query in
+                                    // the same click, and the confirmation this
+                                    // arms is cleared before it can be seen.
+                                    cx.stop_propagation();
+                                    _ = delete_workspace.update(cx, |workspace, cx| {
+                                        workspace.arm_delete_saved_query(
+                                            delete_name.clone(),
+                                            window,
+                                            cx,
+                                        );
+                                    });
+                                }),
                             ),
                     )
                     .on_click(move |_, window, cx| {
@@ -747,19 +761,22 @@ fn render_tab_strip(profile: &Profile, cx: &mut Context<Workspace>) -> AnyElemen
                     .opacity(0.)
                     .group_hover(group, |style| style.opacity(1.))
                     .child(
-                        Button::new(("close-object", id as usize))
-                            .icon(icon(icon::CLOSE))
-                            .ghost()
-                            .xsmall()
-                            .tooltip("Close tab")
-                            .on_click(move |_, _, cx| {
-                                // Or the chip underneath activates the tab
-                                // this just closed, in the same click.
-                                cx.stop_propagation();
-                                _ = close_workspace.update(cx, |workspace, cx| {
-                                    workspace.close_object(id, cx);
-                                });
-                            }),
+                        icon_button(
+                            ("close-object", id as usize),
+                            icon::CLOSE,
+                            Tone::Quiet,
+                            Control::Inline,
+                            t,
+                        )
+                        .tooltip("Close tab")
+                        .on_click(move |_, _, cx| {
+                            // Or the chip underneath activates the tab
+                            // this just closed, in the same click.
+                            cx.stop_propagation();
+                            _ = close_workspace.update(cx, |workspace, cx| {
+                                workspace.close_object(id, cx);
+                            });
+                        }),
                     ),
             )
             .on_click(move |_, _, cx| {
@@ -790,23 +807,27 @@ fn render_tab_strip(profile: &Profile, cx: &mut Context<Workspace>) -> AnyElemen
             // single centreline instead of jostling.
             .child(Input::new(&session.save_name).small().flex_1())
             .child(
-                Button::new("confirm-save-query")
-                    .icon(icon(if naming_a_rename {
+                icon_button(
+                    "confirm-save-query",
+                    if naming_a_rename {
                         icon::RENAME
                     } else {
                         icon::SAVE
-                    }))
-                    .small()
-                    .tooltip(if naming_a_rename {
-                        "Rename query"
-                    } else {
-                        "Save query"
-                    })
-                    .on_click(move |_, window, cx| {
-                        _ = confirm_workspace.update(cx, |workspace, cx| {
-                            workspace.confirm_save(window, cx);
-                        });
-                    }),
+                    },
+                    Tone::Primary,
+                    Control::Compact,
+                    t,
+                )
+                .tooltip(if naming_a_rename {
+                    "Rename query"
+                } else {
+                    "Save query"
+                })
+                .on_click(move |_, window, cx| {
+                    _ = confirm_workspace.update(cx, |workspace, cx| {
+                        workspace.confirm_save(window, cx);
+                    });
+                }),
             )
     });
 
@@ -894,16 +915,19 @@ fn render_tab_strip(profile: &Profile, cx: &mut Context<Workspace>) -> AnyElemen
                 .child(
                     // Beside the last tab, where a browser puts it, rather
                     // than orphaned at the far edge of the window.
-                    Button::new("new-query-tab")
-                        .icon(icon(icon::PLUS))
-                        .ghost()
-                        .xsmall()
-                        .tooltip_with_action("New query", &NewQuery, None)
-                        .on_click(move |_, window, cx| {
-                            _ = new_workspace.update(cx, |workspace, cx| {
-                                workspace.new_query(&NewQuery, window, cx);
-                            });
-                        }),
+                    icon_button(
+                        "new-query-tab",
+                        icon::PLUS,
+                        Tone::Quiet,
+                        Control::Compact,
+                        t,
+                    )
+                    .tooltip_with_action("New query", &NewQuery, None)
+                    .on_click(move |_, window, cx| {
+                        _ = new_workspace.update(cx, |workspace, cx| {
+                            workspace.new_query(&NewQuery, window, cx);
+                        });
+                    }),
                 ),
         )
         .children(structure_toggle)
@@ -921,22 +945,22 @@ fn render_tab_strip(profile: &Profile, cx: &mut Context<Workspace>) -> AnyElemen
         // is nothing for a save button to do that has not been done. What
         // it can still do is change the name.
         .children((runnable && !session.naming && named).then(|| {
-            Button::new("rename-query")
-                .icon(icon(icon::RENAME))
-                .ghost()
-                .xsmall()
-                .tooltip("Rename query")
-                .on_click(move |_, window, cx| {
-                    _ = rename_workspace.update(cx, |workspace, cx| {
-                        workspace.rename_query(window, cx);
-                    });
-                })
+            icon_button(
+                "rename-query",
+                icon::RENAME,
+                Tone::Quiet,
+                Control::Compact,
+                t,
+            )
+            .tooltip("Rename query")
+            .on_click(move |_, window, cx| {
+                _ = rename_workspace.update(cx, |workspace, cx| {
+                    workspace.rename_query(window, cx);
+                });
+            })
         }))
         .children((runnable && !session.naming && !named).then(|| {
-            Button::new("save-query")
-                .icon(icon(icon::SAVE))
-                .ghost()
-                .xsmall()
+            icon_button("save-query", icon::SAVE, Tone::Quiet, Control::Compact, t)
                 .tooltip_with_action("Save query", &SaveQuery, None)
                 .on_click(move |_, window, cx| {
                     _ = save_workspace.update(cx, |workspace, cx| {
@@ -945,10 +969,10 @@ fn render_tab_strip(profile: &Profile, cx: &mut Context<Workspace>) -> AnyElemen
                 })
         }))
         .children(runnable.then(|| {
-            Button::new("run-query")
-                .icon(icon(icon::RUN))
-                .ghost()
-                .xsmall()
+            // Filled where its neighbours are ghosts: running the buffer is
+            // what the surface is for, and the fill is the only hierarchy
+            // available without spending a colour on it.
+            icon_button("run-query", icon::RUN, Tone::Primary, Control::Compact, t)
                 .tooltip_with_action("Run", &RunQuery, None)
                 .on_click(move |_, window, cx| {
                     _ = run_workspace.update(cx, |workspace, cx| {

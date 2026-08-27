@@ -19,7 +19,7 @@ use gpui::{
     TitlebarOptions, Window, WindowOptions, actions, div, point, prelude::FluentBuilder, px,
 };
 use gpui_component::{
-    Disableable, IndexPath, InteractiveElementExt, Root, Sizable,
+    Disableable, IndexPath, InteractiveElementExt, Root,
     button::{Button, ButtonVariants},
     input::{Input, InputEvent, InputState},
     kbd::Kbd,
@@ -2977,10 +2977,15 @@ impl Workspace {
                                             .child(Input::new(&form.url).w_full()),
                                     )
                                     .child(
-                                        Button::new("apply-connection-url")
-                                            .icon(icon(icon::FILL_DOWN))
-                                            .tooltip("Fill the fields from this URL")
-                                            .on_click(cx.listener(Self::apply_connection_url)),
+                                        icon_button(
+                                            "apply-connection-url",
+                                            icon::FILL_DOWN,
+                                            Tone::Primary,
+                                            Control::Standard,
+                                            t,
+                                        )
+                                        .tooltip("Fill the fields from this URL")
+                                        .on_click(cx.listener(Self::apply_connection_url)),
                                     ),
                             ),
                     )
@@ -3069,9 +3074,7 @@ impl Workspace {
                             .child(message)
                     }))
                     .child(
-                        Button::new("connect")
-                            .label("Connect")
-                            .primary()
+                        button("connect", "Connect", Tone::Primary, Control::Standard, t)
                             .w_full()
                             .on_click(cx.listener(Self::connect)),
                     ),
@@ -3180,22 +3183,31 @@ impl Workspace {
                                 .justify_end()
                                 .gap(px(layout::SPACE_SM))
                                 .child(
-                                    Button::new("cancel-close-tab")
-                                        .label("Cancel")
-                                        .ghost()
-                                        .small()
-                                        .on_click(move |_, _, cx| {
+                                    button(
+                                        "cancel-close-tab",
+                                        "Cancel",
+                                        Tone::Quiet,
+                                        Control::Standard,
+                                        t,
+                                    )
+                                    .on_click(
+                                        move |_, _, cx| {
                                             _ = cancel_workspace.update(cx, |workspace, cx| {
                                                 workspace.cancel_close_tab(cx);
                                             });
-                                        }),
+                                        },
+                                    ),
                                 )
                                 .child(
-                                    Button::new("confirm-close-tab")
-                                        .label("Delete")
-                                        .danger()
-                                        .small()
-                                        .on_click(move |_, window, cx| {
+                                    button(
+                                        "confirm-close-tab",
+                                        "Delete",
+                                        Tone::Danger,
+                                        Control::Standard,
+                                        t,
+                                    )
+                                    .on_click(
+                                        move |_, window, cx| {
                                             _ = delete_workspace.update(cx, |workspace, cx| {
                                                 workspace.delete_saved_query(
                                                     deleted.clone(),
@@ -3203,7 +3215,8 @@ impl Workspace {
                                                     cx,
                                                 );
                                             });
-                                        }),
+                                        },
+                                    ),
                                 ),
                         ),
                 )
@@ -3272,27 +3285,41 @@ impl Workspace {
                                 .justify_end()
                                 .gap(px(layout::SPACE_SM))
                                 .child(
-                                    Button::new("cancel-apply")
-                                        .label("Cancel")
-                                        .ghost()
-                                        .small()
-                                        .on_click(move |_, _, cx| {
+                                    button(
+                                        "cancel-apply",
+                                        "Cancel",
+                                        Tone::Quiet,
+                                        Control::Standard,
+                                        t,
+                                    )
+                                    .on_click(
+                                        move |_, _, cx| {
                                             _ = cancel_workspace.update(cx, |workspace, cx| {
                                                 workspace.close_apply_review(cx);
                                             });
-                                        }),
+                                        },
+                                    ),
                                 )
                                 .child(
-                                    Button::new("run-apply")
-                                        .label("Run")
-                                        .primary()
-                                        .small()
-                                        .disabled(running)
-                                        .on_click(move |_, _, cx| {
+                                    // Quiet while it runs, because the library's
+                                    // disabled fill is the only thing that
+                                    // dims and our pinned label would stay
+                                    // bright over it.
+                                    button(
+                                        "run-apply",
+                                        "Run",
+                                        if running { Tone::Quiet } else { Tone::Primary },
+                                        Control::Standard,
+                                        t,
+                                    )
+                                    .disabled(running)
+                                    .on_click(
+                                        move |_, _, cx| {
                                             _ = run_workspace.update(cx, |workspace, cx| {
                                                 workspace.run_apply_review(cx);
                                             });
-                                        }),
+                                        },
+                                    ),
                                 ),
                         ),
                 )
@@ -3348,17 +3375,32 @@ impl Workspace {
                                         })
                                 })
                                 .child(
-                                    Button::new(("remove-profile", index))
-                                        .label(if pending { "Remove?" } else { "" })
-                                        .icon(icon(icon::DELETE))
-                                        .ghost()
-                                        .xsmall()
-                                        .tooltip("Remove connection")
-                                        .on_click(move |_, window, cx| {
+                                    // Armed, it says the word and takes the
+                                    // danger fill: the icon alone asks, the
+                                    // red confirms.
+                                    icon_button(
+                                        ("remove-profile", index),
+                                        icon::DELETE,
+                                        if pending { Tone::Danger } else { Tone::Quiet },
+                                        Control::Inline,
+                                        t,
+                                    )
+                                    .when(pending, |armed| {
+                                        armed.w_auto().px(px(layout::SPACE_XS)).child(button_label(
+                                            "Remove?",
+                                            Tone::Danger,
+                                            Control::Inline,
+                                            t,
+                                        ))
+                                    })
+                                    .tooltip("Remove connection")
+                                    .on_click(
+                                        move |_, window, cx| {
                                             _ = remove_workspace.update(cx, |workspace, cx| {
                                                 workspace.remove_profile(index, window, cx);
                                             });
-                                        }),
+                                        },
+                                    ),
                                 ),
                         )
                         // The mark sits at the trailing edge like a menu's
@@ -3819,28 +3861,34 @@ impl Render for Workspace {
                             .ml_auto()
                             .flex()
                             .items_center()
-                            .gap(px(layout::SPACE_XS))
+                            .gap(px(layout::SPACE_SM))
                             .child(
-                                Button::new("discard-edits")
-                                    .label("Discard")
-                                    .ghost()
-                                    .xsmall()
-                                    .on_click(move |_, window, cx| {
-                                        _ = discard_workspace.update(cx, |workspace, cx| {
-                                            workspace.discard_edits(&DiscardEdits, window, cx);
-                                        });
-                                    }),
+                                button(
+                                    "discard-edits",
+                                    "Discard",
+                                    Tone::Quiet,
+                                    Control::Compact,
+                                    t,
+                                )
+                                .on_click(move |_, window, cx| {
+                                    _ = discard_workspace.update(cx, |workspace, cx| {
+                                        workspace.discard_edits(&DiscardEdits, window, cx);
+                                    });
+                                }),
                             )
                             .child(
-                                Button::new("apply-edits")
-                                    .label("Apply edits")
-                                    .primary()
-                                    .xsmall()
-                                    .on_click(move |_, window, cx| {
-                                        _ = apply_workspace.update(cx, |workspace, cx| {
-                                            workspace.apply_edits(&ApplyEdits, window, cx);
-                                        });
-                                    }),
+                                button(
+                                    "apply-edits",
+                                    "Apply edits",
+                                    Tone::Primary,
+                                    Control::Compact,
+                                    t,
+                                )
+                                .on_click(move |_, window, cx| {
+                                    _ = apply_workspace.update(cx, |workspace, cx| {
+                                        workspace.apply_edits(&ApplyEdits, window, cx);
+                                    });
+                                }),
                             )
                     })),
             )
@@ -4070,6 +4118,130 @@ fn dialog(t: Theme) -> gpui::Div {
         .border_color(t.border_strong)
         .rounded(px(layout::RADIUS_PANEL))
         .shadow_lg()
+}
+
+/// What a button's fill says. Colour is state here as everywhere else: a Slate
+/// button is the neutral control tone unless it is the one action its surface
+/// exists to take, or the one that destroys something.
+#[derive(Clone, Copy, PartialEq)]
+enum Tone {
+    Primary,
+    Quiet,
+    Danger,
+}
+
+/// Standard for a dialog or the connection form, where a button sits beside a
+/// field and is the thing the surface exists to click. Compact for the strips
+/// that are themselves only a control tall. Inline for the affordance revealed
+/// on a chip or a row it does not own.
+#[derive(Clone, Copy, PartialEq)]
+enum Control {
+    Standard,
+    Compact,
+    Inline,
+}
+
+impl Tone {
+    /// The colour of the label and the icon, pinned rather than inherited — see
+    /// [`button`].
+    fn ink(self, t: Theme) -> theme::color::Srgb {
+        match self {
+            Tone::Primary => t.text,
+            Tone::Quiet => t.text_muted,
+            Tone::Danger => t.on_accent,
+        }
+    }
+}
+
+impl Control {
+    fn height(self) -> f32 {
+        match self {
+            Control::Standard => layout::CONTROL_HEIGHT,
+            Control::Compact => layout::CONTROL_HEIGHT_COMPACT,
+            Control::Inline => layout::CONTROL_HEIGHT_INLINE,
+        }
+    }
+
+    fn text_size(self) -> f32 {
+        match self {
+            Control::Standard => layout::TEXT_MD,
+            Control::Compact | Control::Inline => layout::TEXT_SM,
+        }
+    }
+}
+
+/// A Slate button.
+///
+/// gpui-component supplies the mechanism — the tooltip and the keybinding in
+/// it, the focus ring, the disabled gate — and none of the appearance survives
+/// contact with it. Its size scale bottoms out at a 20px box with 4px of
+/// padding, its label comes out at the library's 16px body rather than Slate's
+/// 13, and 0.5.1 tints button content `red_400` on hover from a hardcoded
+/// colour no theme token reaches.
+///
+/// So the box is measured here off the layout scale, and the content goes in as
+/// a child carrying its own colour. That last part is what settles the hover
+/// tint: a child that sets a colour does not inherit the container's.
+fn button(
+    id: impl Into<gpui::ElementId>,
+    label: impl Into<gpui::SharedString>,
+    tone: Tone,
+    size: Control,
+    t: Theme,
+) -> Button {
+    control(id, tone, size)
+        .px(px(layout::SPACE_MD))
+        .when(size == Control::Standard, |standard| {
+            standard.min_w(px(layout::CONTROL_MIN_WIDTH))
+        })
+        .child(button_label(label, tone, size, t))
+}
+
+/// A button that is only its icon, so it is square and reads as an
+/// affordance beside the thing it acts on rather than as a control of its own.
+fn icon_button(
+    id: impl Into<gpui::ElementId>,
+    path: &'static str,
+    tone: Tone,
+    size: Control,
+    t: Theme,
+) -> Button {
+    control(id, tone, size).w(px(size.height())).p_0().child(
+        icon(path)
+            .size(px(layout::ICON_SIZE))
+            .text_color(tone.ink(t)),
+    )
+}
+
+/// A button's words. Separate so the two delete buttons, which grow a
+/// confirmation beside their icon once armed, can add them without becoming a
+/// different control.
+fn button_label(
+    label: impl Into<gpui::SharedString>,
+    tone: Tone,
+    size: Control,
+    t: Theme,
+) -> impl IntoElement {
+    div()
+        .flex_none()
+        // Or the descenders decide where the text sits in the box.
+        .line_height(gpui::relative(1.))
+        .text_size(px(size.text_size()))
+        .font_weight(FontWeight::MEDIUM)
+        .text_color(tone.ink(t))
+        .child(label.into())
+}
+
+/// The box, without its content. Radius comes from the theme, which is already
+/// pointed at `RADIUS_CONTROL`.
+fn control(id: impl Into<gpui::ElementId>, tone: Tone, size: Control) -> Button {
+    Button::new(id)
+        .map(|button| match tone {
+            Tone::Primary => button.primary(),
+            Tone::Quiet => button.ghost(),
+            Tone::Danger => button.danger(),
+        })
+        .h(px(size.height()))
 }
 
 fn section_label(t: Theme, label: &str) -> impl IntoElement {

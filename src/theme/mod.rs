@@ -54,11 +54,32 @@ pub mod layout {
     pub const RADIUS_PANEL: f32 = 10.0;
     pub const RADIUS_LARGE: f32 = 16.0;
 
+    /// The three heights a button is drawn at. Standard is for the dialogs and
+    /// the connection form, where it sits beside a field and is the thing the
+    /// surface exists to click. Compact is for the strips that are themselves
+    /// only a control tall. Inline is the affordance revealed on hover inside
+    /// something else — a tab chip, a profile row — and is a hit target on a
+    /// control it does not own, so it stays inside that chip's own height.
+    ///
+    /// The first two are well above gpui-component's own scale, which bottoms
+    /// out at a 20px box with 4px of padding — a size for a toolbar of twenty
+    /// icons, not for the two words that commit an edit to a table. Inline is
+    /// the one place that size is the right one.
+    pub const CONTROL_HEIGHT: f32 = 32.0;
+    pub const CONTROL_HEIGHT_COMPACT: f32 = 24.0;
+    pub const CONTROL_HEIGHT_INLINE: f32 = 20.0;
+    /// A floor on a standard button's width, so a dialog's Cancel and its
+    /// confirm come out the same size instead of one word wide each.
+    pub const CONTROL_MIN_WIDTH: f32 = 76.0;
+
     pub const TITLEBAR_HEIGHT: f32 = 38.0;
     /// Where the titlebar's own content can start without colliding with the
     /// platform's window buttons, which are drawn over it.
     pub const TITLEBAR_LEADING_INSET: f32 = 78.0;
-    pub const STATUS_HEIGHT: f32 = 24.0;
+    /// Tall enough to hold a compact control with air around it: the apply pair
+    /// lives in this strip, and a button wedged edge to edge in its own bar
+    /// reads as something that overflowed rather than something placed.
+    pub const STATUS_HEIGHT: f32 = 32.0;
     pub const TAB_HEIGHT: f32 = 34.0;
     /// A tab is a chip inside the strip, so it gets a chip height rather than
     /// the full bar.
