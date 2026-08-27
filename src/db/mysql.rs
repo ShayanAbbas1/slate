@@ -908,6 +908,43 @@ mod tests {
         );
     }
 
+    /// What each mode does against the compose server, which speaks TLS with a
+    /// certificate signed by nobody.
+    ///
+    /// Hard rule 7 in code, and the mode the connection form actually defaults
+    /// to. `prefer` and `require` promise encryption and no more, so a
+    /// certificate they cannot check is not their business. The two verifying
+    /// rungs refuse it and say TLS was the reason, rather than quietly
+    /// connecting anyway.
+    #[test]
+    #[ignore = "requires the repository development database configured through SLATE_MYSQL_URL"]
+    fn live_only_the_modes_that_tolerate_an_unchecked_certificate_connect() {
+        let url = std::env::var("SLATE_MYSQL_URL").expect("SLATE_MYSQL_URL is required");
+        let base = config_from_url(&url).expect("SLATE_MYSQL_URL should parse");
+        let connect = |sslmode| {
+            Connection::open(&ServerConfig {
+                sslmode,
+                ..base.clone()
+            })
+        };
+
+        for mode in [SslMode::Disable, SslMode::Prefer, SslMode::Require] {
+            assert!(connect(mode).is_ok(), "{mode:?} should connect");
+        }
+
+        for mode in [SslMode::VerifyCa, SslMode::VerifyFull] {
+            let Err(error) = connect(mode) else {
+                panic!("{mode:?} must not accept a certificate it cannot verify");
+            };
+            assert!(
+                error.message.to_lowercase().contains("tls")
+                    || error.message.to_lowercase().contains("certificate"),
+                "{mode:?} failed without saying why: {}",
+                error.message
+            );
+        }
+    }
+
     #[test]
     #[ignore = "requires the repository development database configured through SLATE_MYSQL_URL"]
     fn live_query_round_trip() {
