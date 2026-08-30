@@ -1,5 +1,6 @@
 mod db;
 mod explorer;
+mod export;
 mod palette;
 mod result_grid;
 mod sql;
@@ -10,7 +11,7 @@ mod icons;
 mod theme;
 mod tls;
 
-use std::{borrow::Cow, collections::HashMap, sync::Arc};
+use std::{borrow::Cow, collections::HashMap, path::PathBuf, sync::Arc};
 
 use gpui::{
     Action, AnyElement, App, AppContext, Application, ClickEvent, ClipboardItem, Context, Entity,
@@ -38,6 +39,7 @@ use explorer::{
     ExplorerLeaf, ExplorerTarget, ObjectKind, PREVIEW_ROW_LIMIT, preview_sql,
     tree as build_explorer_tree,
 };
+use export::Format;
 use icons::{Icons, icon};
 use palette::{Command, Mode as PaletteMode, Palette};
 use result_grid::{PendingRow, ResultGrid};
@@ -2040,6 +2042,7 @@ impl Workspace {
             Command::CloseObject(id) => self.close_object(id, cx),
             Command::ApplyEdits => self.apply_edits(&ApplyEdits, window, cx),
             Command::DiscardEdits => self.discard_edits(&DiscardEdits, window, cx),
+            Command::ExportResults(format) => self.export_results(format, cx),
             Command::SwitchProfile(index) => self.activate(index, cx),
             Command::NewConnection => self.open_connection_form(&NewConnection, window, cx),
             Command::CycleTheme => self.cycle_theme(&CycleTheme, window, cx),
@@ -2090,6 +2093,18 @@ impl Workspace {
                 .session
                 .active_results()
                 .is_some_and(|results| results.read(cx).delegate().has_pending())
+        })
+    }
+
+    /// Whether the surface in front has a result set to write out. Columns, not
+    /// rows: a statement that matched nothing still has a shape, and a
+    /// header-only CSV is a truthful answer to it.
+    fn has_results(&self, cx: &App) -> bool {
+        self.profile().is_some_and(|profile| {
+            profile
+                .session
+                .active_results()
+                .is_some_and(|results| !results.read(cx).delegate().result().columns.is_empty())
         })
     }
 
@@ -2272,9 +2287,9 @@ impl Workspace {
 
     /// `cmd+c` on the active cell, whole value and all.
     ///
-    /// Slate ships no CSV or Parquet export because clipboard copy covers the
-    /// common case (2026-08-17 spec §2), so this is load-bearing for a decision
-    /// already taken. It works on every cell, including the ones that can never
+    /// The one-cell answer beside `export_results`' whole-grid one, and still
+    /// the common case: reaching for a file to carry a single value across is
+    /// the long way round. It works on every cell, including the ones that can never
     /// open an input — a join, an aggregate, a view, a primary-key column — and
     /// the grid withholds the value while an input is open, where `cmd+c`
     /// belongs to the input's own text selection.
@@ -2294,6 +2309,98 @@ impl Workspace {
             return;
         };
         cx.write_to_clipboard(ClipboardItem::new_string(value));
+    }
+
+    /// Write the result set in front of the user to a file they pick.
+    ///
+    /// The rows on screen and only those. A relation tab holds what its
+    /// row-limit chip asked for, and an export that quietly re-fetched the whole
+    /// table behind that chip would make the number on it a lie — the tab has no
+    /// buffer to show a larger statement in, so nothing would be on screen to
+    /// read it off. Pending edits are not written either: this is the result set
+    /// the server returned, and applying them is a separate, visible act.
+    fn export_results(&mut self, format: Format, cx: &mut Context<Self>) {
+        let Some(profile) = self.profile() else {
+            return;
+        };
+        let Some(results) = profile.session.active_results() else {
+            return;
+        };
+        // ponytail: the whole result set is copied here, on the frame thread,
+        // before the panel even opens -- a wasted copy if the user cancels. It
+        // is taken now rather than after the await because the panel is
+        // modeless: what the user was looking at when they asked is the only
+        // unambiguous answer to what they asked to export. `ResultGrid` holding
+        // its `QueryResult` behind an `Arc` is the upgrade path if a large
+        // export is ever seen to stutter.
+        let result = results.read(cx).delegate().result().clone();
+        if result.columns.is_empty() {
+            return;
+        }
+
+        // What the tab calls itself, so the file lands named after the thing the
+        // user was looking at rather than after the statement that built it.
+        let stem = match profile.session.active_object() {
+            Some(tab) => tab.name.clone(),
+            None => profile
+                .session
+                .open_query
+                .clone()
+                .unwrap_or_else(|| "results".to_string()),
+        };
+        let id = profile.id.clone();
+        let generation = profile.generation;
+        let rows = result.rows.len();
+        let suggested = format!("{stem}.{}", format.extension());
+        let directory = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/"));
+        let chosen = cx.prompt_for_new_path(&directory, Some(&suggested));
+
+        cx.spawn(async move |workspace, cx| {
+            let Ok(Ok(Some(path))) = chosen.await else {
+                return;
+            };
+            // Rendering a hundred thousand rows is not work to do on the frame
+            // thread, and the write even less so.
+            let written = cx
+                .background_executor()
+                .spawn(async move {
+                    // The extension decides the format, not the row that started
+                    // this: someone who typed `.json` over the suggested `.csv`
+                    // asked for JSON. Which is why the notice says which one it
+                    // wrote -- that rename is the one thing they could have got
+                    // wrong, and the file name alone does not read it back.
+                    let format = Format::for_path(&path);
+                    let text = export::render(format, &result);
+                    match std::fs::write(&path, text) {
+                        Ok(()) => Ok((path, format)),
+                        Err(error) => Err(format!("Could not write {}: {error}", path.display())),
+                    }
+                })
+                .await;
+            _ = workspace.update(cx, |workspace, cx| {
+                // The panel is modeless, so the profile can have moved under
+                // this task while it was open. `note` writes to whichever
+                // profile is active now, which would announce an export in a
+                // session that never ran the query behind it.
+                let Some(profile) = workspace.issued_to(&id, generation) else {
+                    return;
+                };
+                profile.session.notice = Some(match written {
+                    Ok((path, format)) => format!(
+                        "Exported {} {} as {} to {}.",
+                        group_thousands(rows as u64),
+                        if rows == 1 { "row" } else { "rows" },
+                        format.extension().to_uppercase(),
+                        path.display()
+                    ),
+                    Err(error) => error,
+                });
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     /// Turn the grid's pending edits into SQL and put it where the user can read
@@ -3761,8 +3868,11 @@ impl Render for Workspace {
         };
         let notice = profile.session.notice.clone();
         let has_pending = self.has_pending_edits(cx);
+        let has_results = self.has_results(cx);
         let apply_workspace = cx.entity().downgrade();
         let discard_workspace = apply_workspace.clone();
+        let csv_workspace = apply_workspace.clone();
+        let json_workspace = apply_workspace.clone();
 
         div()
             .id("workspace")
@@ -3850,33 +3960,58 @@ impl Render for Workspace {
                             .child(status),
                     )
                     .children(notice.map(|notice| div().text_color(t.text_muted).child(notice)))
-                    .children(query_status.map(|query_status| {
-                        div().ml_auto().text_color(t.text_faint).child(query_status)
-                    }))
-                    // Only while there is something to apply: a pair of buttons
-                    // that do nothing is a pair of buttons to read past. Apply
-                    // has no keybinding on purpose -- see `apply_edits`.
-                    .children(has_pending.then(|| {
+                    // One right-hand cluster, so there is a single `ml_auto`
+                    // in the row: two of them split the free space between
+                    // them and strand the readout in the middle of the bar.
+                    //
+                    // Each control appears only when it does something. A pair
+                    // of buttons that do nothing is a pair to read past, and
+                    // Apply has no keybinding on purpose -- see `apply_edits`.
+                    .child(
                         div()
                             .ml_auto()
                             .flex()
                             .items_center()
                             .gap(px(layout::SPACE_SM))
-                            .child(
+                            .children(query_status.map(|query_status| {
+                                div().text_color(t.text_faint).child(query_status)
+                            }))
+                            // Named, not one button over a menu: the choice is
+                            // between two things, and a control that opens
+                            // another control to ask which is a click spent on
+                            // nothing. It also puts the format on screen, which
+                            // a lone "Export" left to the file extension.
+                            .children(has_results.then(|| {
+                                button("export-csv", "Export CSV", Tone::Quiet, Control::Compact, t)
+                                    .on_click(move |_, _, cx| {
+                                        _ = csv_workspace.update(cx, |workspace, cx| {
+                                            workspace.export_results(Format::Csv, cx);
+                                        });
+                                    })
+                            }))
+                            .children(has_results.then(|| {
                                 button(
-                                    "discard-edits",
-                                    "Discard",
+                                    "export-json",
+                                    "Export JSON",
                                     Tone::Quiet,
                                     Control::Compact,
                                     t,
                                 )
-                                .on_click(move |_, window, cx| {
-                                    _ = discard_workspace.update(cx, |workspace, cx| {
-                                        workspace.discard_edits(&DiscardEdits, window, cx);
+                                .on_click(move |_, _, cx| {
+                                    _ = json_workspace.update(cx, |workspace, cx| {
+                                        workspace.export_results(Format::Json, cx);
                                     });
-                                }),
-                            )
-                            .child(
+                                })
+                            }))
+                            .children(has_pending.then(|| {
+                                button("discard-edits", "Discard", Tone::Quiet, Control::Compact, t)
+                                    .on_click(move |_, window, cx| {
+                                        _ = discard_workspace.update(cx, |workspace, cx| {
+                                            workspace.discard_edits(&DiscardEdits, window, cx);
+                                        });
+                                    })
+                            }))
+                            .children(has_pending.then(|| {
                                 button(
                                     "apply-edits",
                                     "Apply edits",
@@ -3888,9 +4023,9 @@ impl Render for Workspace {
                                     _ = apply_workspace.update(cx, |workspace, cx| {
                                         workspace.apply_edits(&ApplyEdits, window, cx);
                                     });
-                                }),
-                            )
-                    })),
+                                })
+                            })),
+                    ),
             )
             .children(self.render_apply_review(cx))
             .children(self.render_close_confirmation(cx))

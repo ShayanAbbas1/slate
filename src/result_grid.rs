@@ -209,6 +209,13 @@ impl ResultGrid {
         self.active
     }
 
+    /// What the server returned, whole: the rows an export writes out, and not
+    /// the clipped `display` strings the columns had room for. Pending edits are
+    /// not folded in, because this is the result set, not the grid's view of it.
+    pub fn result(&self) -> &QueryResult {
+        &self.result
+    }
+
     /// The whole value behind the active cell, which is what `cmd+c` copies —
     /// not the clipped string the column had room for. `None` while an input is
     /// open, because there `cmd+c` is the input's own text selection, and on a

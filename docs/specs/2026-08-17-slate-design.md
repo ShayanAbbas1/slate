@@ -44,7 +44,7 @@ Explicitly out of scope for v1. Each is a deliberate cut, not an oversight.
 | SSH tunneling | Additive later; the config is shaped for it. |
 | ~~Engines other than Postgres~~ | Superseded — see `2026-08-26-multi-engine-design.md`. The rule §4.1 was protecting held and is why the change was a refactor: engine dispatch is a closed enum in `src/db/`, still not a trait. |
 | Multiple windows | Single window, single root entity. |
-| CSV / Parquet export | Clipboard copy covers the common case. Cheap to add on demand. |
+| ~~CSV / Parquet export~~ | Superseded for CSV and JSON — asked for on demand, and it was as cheap as this row predicted: `src/export.rs` renders the result set a tab already holds, so there is no second fetch path and no streaming. Parquet stays out. Clipboard copy is still the one-cell answer. An export writes the rows the tab has: on a relation tab that is what the row-limit chip asked for, and it is not re-read behind the chip's back. |
 | Configurable keybindings | Hardcoded in v1. |
 | ER diagrams, migrations, seed tooling | Different product. |
 
@@ -440,7 +440,10 @@ and a syntax error shows up under the editor instead of crashing.
 
 ## 10. Deferred, in likely order
 
-Animation and transitions · SSH tunneling · cloud IAM authentication · CSV export
+Animation and transitions · SSH tunneling · cloud IAM authentication ·
+~~CSV export~~ (landed as CSV and JSON — `src/export.rs`; a relation tab exports
+what its row-limit chip fetched, so exporting a table larger than the chip's
+ceiling waits on the server-side cursors below — a query tab is already uncapped)
 · configurable keybindings · views and functions in the schema inspector ·
 server-side cursors for unbounded result sets · ~~a second database engine~~
 (landed — `2026-08-26-multi-engine-design.md`) ·

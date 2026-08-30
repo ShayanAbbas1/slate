@@ -23,6 +23,7 @@ use crate::{
     CatalogState, ObjectBody, Profile, Tab, Workspace,
     db::{RelationKind, RoutineKind},
     explorer::{ExplorerTarget, ObjectKind},
+    export::Format,
     icons::icon,
     object_icon, routine_name, row_icon,
     theme::{layout, theme},
@@ -55,6 +56,10 @@ pub enum Command {
     CloseObject(u64),
     ApplyEdits,
     DiscardEdits,
+    /// The format here only picks the extension the save dialog suggests. What
+    /// the file is written as is read back off the path the user confirmed, so
+    /// these two rows are one code path — see `export::Format::for_path`.
+    ExportResults(Format),
     SwitchProfile(usize),
     NewConnection,
     CycleTheme,
@@ -334,6 +339,23 @@ fn command_items(workspace: &Workspace, profile: &Profile, cx: &App) -> Vec<Item
             "⌘W",
             icon::CLOSE,
             Command::CloseObject(tab.id),
+        ));
+    }
+
+    // Only over a grid that has a result set behind it. A surface that has run
+    // nothing has nothing to write out.
+    if workspace.has_results(cx) {
+        items.push(Item::command(
+            "Export results as CSV",
+            "",
+            icon::SAVE,
+            Command::ExportResults(Format::Csv),
+        ));
+        items.push(Item::command(
+            "Export results as JSON",
+            "",
+            icon::SAVE,
+            Command::ExportResults(Format::Json),
         ));
     }
 
