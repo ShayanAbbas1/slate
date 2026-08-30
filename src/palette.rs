@@ -35,6 +35,8 @@ pub enum Mode {
     Jump,
     /// `cmd+shift+p` — the verbs that apply right now.
     Commands,
+    /// The statements this profile has run, reached from the command palette.
+    History,
 }
 
 /// What a row does when it is confirmed.
@@ -51,6 +53,11 @@ pub enum Command {
     RunQuery,
     SaveQuery,
     RenameQuery,
+    /// Open the history list. The one command that puts the palette back up
+    /// rather than doing something behind it.
+    QueryHistory,
+    /// Put a statement that has already been run back in the buffer.
+    RecallStatement(String),
     ShowStructure(bool),
     RefreshRelation(u64),
     CloseObject(u64),
@@ -103,6 +110,7 @@ impl Palette {
             Some(profile) => match mode {
                 Mode::Jump => jump_items(profile),
                 Mode::Commands => command_items(workspace, profile, cx),
+                Mode::History => history_items(profile),
             },
             None => Vec::new(),
         };
@@ -131,6 +139,7 @@ impl Palette {
         match self.mode {
             Mode::Jump => "Go to a table, view, routine or saved query…",
             Mode::Commands => "Run a command…",
+            Mode::History => "Recall a statement you have run…",
         }
     }
 }
@@ -276,6 +285,29 @@ fn jump_items(profile: &Profile) -> Vec<Item> {
     items
 }
 
+/// Every statement this profile has run, newest first.
+fn history_items(profile: &Profile) -> Vec<Item> {
+    profile
+        .session
+        .history
+        .iter()
+        .map(|sql| Item {
+            label: one_line(sql),
+            hint: "".into(),
+            icon: icon::HISTORY,
+            command: Command::RecallStatement(sql.clone()),
+        })
+        .collect()
+}
+
+/// A statement as a row: one line, however many it was written across. The
+/// label is what the matcher scores as well as what the row reads as, so
+/// collapsing the whitespace is also what makes `select from accounts` find a
+/// statement whose `FROM` was on its own line.
+fn one_line(sql: &str) -> String {
+    sql.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 /// The verbs, filtered to the ones that mean something from where the user is
 /// standing. A palette that lists what it cannot do is a palette to read past.
 fn command_items(workspace: &Workspace, profile: &Profile, cx: &App) -> Vec<Item> {
@@ -310,6 +342,17 @@ fn command_items(workspace: &Workspace, profile: &Profile, cx: &App) -> Vec<Item
                 Command::SaveQuery,
             ));
         }
+    }
+
+    // Not gated on the query tab being in front: recalling a statement brings
+    // it forward, which is where the statement is going anyway.
+    if !session.history.is_empty() {
+        items.push(Item::command(
+            "Query history",
+            "",
+            icon::HISTORY,
+            Command::QueryHistory,
+        ));
     }
 
     if let Some(tab) = session.active_object() {
@@ -480,6 +523,13 @@ mod tests {
             ["public.accounts", "public.account_log"]
         );
         assert!(matched(&labels, "zzz").is_empty());
+    }
+
+    #[test]
+    fn a_statement_written_across_lines_reads_and_matches_as_one() {
+        let sql = "SELECT *\n  FROM accounts\n WHERE id = 1;";
+        assert_eq!(one_line(sql), "SELECT * FROM accounts WHERE id = 1;");
+        assert_eq!(matched(&[&one_line(sql)], "from accounts").len(), 1);
     }
 
     #[test]

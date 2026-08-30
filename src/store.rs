@@ -1,5 +1,6 @@
+use std::collections::HashSet;
 use std::fs;
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use security_framework::passwords::{self, PasswordOptions};
@@ -8,6 +9,13 @@ use serde::{Deserialize, Serialize};
 const PROFILES_FILE: &str = "profiles.toml";
 const KEYCHAIN_SERVICE: &str = "Slate";
 const SCRATCH_FILE: &str = ".scratch.sql";
+const HISTORY_FILE: &str = ".history.jsonl";
+/// How far back the history reads.
+///
+/// ponytail: the whole file is read and the newest entries kept. A line per
+/// statement run is small for a long time; read it backwards from the end if
+/// one ever gets big enough to feel.
+pub const HISTORY_DEPTH: usize = 200;
 /// `errSecItemNotFound`. Apple's `OSStatus` values are frozen ABI, and the
 /// named constant lives in `security-framework-sys`, which is not a dependency
 /// here -- adding it with the exact pin this project uses everywhere would
@@ -240,6 +248,54 @@ pub fn read_scratch(profile_id: &str) -> Result<Option<String>, String> {
 
 pub fn write_scratch(profile_id: &str, sql: &str) -> Result<(), String> {
     write_file(&query_directory(profile_id)?.join(SCRATCH_FILE), sql)
+}
+
+/// One statement on its way into a profile's history, newest at the end.
+///
+/// A JSON string per line rather than the SQL itself: a statement holds
+/// newlines, semicolons and comments, so there is no separator to put between
+/// two of them that is not also SQL. Appended rather than rewritten, so a run
+/// costs one write and no history can be lost to a rewrite that failed
+/// halfway.
+pub fn append_history(profile_id: &str, sql: &str) -> Result<(), String> {
+    let directory = query_directory(profile_id)?;
+    fs::create_dir_all(&directory)
+        .map_err(|error| format!("Could not create {}: {error}", directory.display()))?;
+    let path = directory.join(HISTORY_FILE);
+    let line = serde_json::to_string(sql)
+        .map_err(|error| format!("Could not encode the statement: {error}"))?;
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .map_err(|error| format!("Could not open {}: {error}", path.display()))?;
+    writeln!(file, "{line}").map_err(|error| format!("Could not write {}: {error}", path.display()))
+}
+
+/// What this profile has run, newest first and each statement once. A missing
+/// or unreadable file reads as no history: there is nothing here that the user
+/// wrote and cannot get back another way.
+pub fn history(profile_id: &str) -> Vec<String> {
+    let Ok(directory) = query_directory(profile_id) else {
+        return Vec::new();
+    };
+    match fs::read_to_string(directory.join(HISTORY_FILE)) {
+        Ok(text) => decode_history(&text),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// A line that will not decode is skipped rather than ending the read: the file
+/// is appended to on every run, and the half-written last line a crash leaves
+/// behind is not a reason to lose everything before it.
+fn decode_history(text: &str) -> Vec<String> {
+    let mut seen = HashSet::new();
+    text.lines()
+        .rev()
+        .filter_map(|line| serde_json::from_str::<String>(line).ok())
+        .filter(|sql| seen.insert(sql.clone()))
+        .take(HISTORY_DEPTH)
+        .collect()
 }
 
 fn unsafe_component(value: &str) -> Option<&'static str> {
@@ -515,6 +571,30 @@ open_objects = []
         ] {
             assert!(validate_query_name(name).is_err(), "{name:?}");
         }
+    }
+
+    #[test]
+    fn a_history_file_reads_back_newest_first_and_each_statement_once() {
+        // The multi-line statement is the point of the encoding: a raw-SQL file
+        // has no separator between two statements that is not also SQL.
+        let text = format!(
+            "{}\n{}\n{}\n",
+            serde_json::to_string("SELECT 1").unwrap(),
+            serde_json::to_string("SELECT\n  *\nFROM accounts; -- all").unwrap(),
+            serde_json::to_string("SELECT 1").unwrap(),
+        );
+
+        assert_eq!(
+            decode_history(&text),
+            ["SELECT 1", "SELECT\n  *\nFROM accounts; -- all"]
+        );
+    }
+
+    #[test]
+    fn a_half_written_line_does_not_take_the_history_with_it() {
+        let text = format!("{}\n\"SELECT 2", serde_json::to_string("SELECT 1").unwrap());
+
+        assert_eq!(decode_history(&text), ["SELECT 1"]);
     }
 
     #[test]

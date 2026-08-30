@@ -22,7 +22,7 @@ use icondata_core::IconData;
 /// The gpui-component widgets ask for their own paths — those are Lucide names
 /// too, so they resolve here as well. Add a row when something asks for one;
 /// an unlisted path simply draws nothing.
-const ICONS: [(&str, &IconData); 31] = [
+const ICONS: [(&str, &IconData); 32] = [
     ("icons/chevron-down.svg", icondata_lu::LuChevronDown),
     ("icons/chevron-right.svg", icondata_lu::LuChevronRight),
     ("icons/chevron-left.svg", icondata_lu::LuChevronLeft),
@@ -57,6 +57,7 @@ const ICONS: [(&str, &IconData); 31] = [
     ("icons/square-play.svg", icondata_lu::LuSquarePlay),
     ("icons/play.svg", icondata_lu::LuPlay),
     ("icons/square-pen.svg", icondata_lu::LuSquarePen),
+    ("icons/history.svg", icondata_lu::LuHistory),
 ];
 
 /// Slate's own names for the icons it draws, so a call site names a thing
@@ -90,6 +91,7 @@ pub mod icon {
     pub const RENAME: &str = "icons/pencil.svg";
     pub const RUN: &str = "icons/play.svg";
     pub const SCRATCH_QUERY: &str = "icons/square-pen.svg";
+    pub const HISTORY: &str = "icons/history.svg";
     /// The connection form's "fill the fields from this URL" action: the URL
     /// flows down into the fields below it.
     pub const FILL_DOWN: &str = "icons/arrow-down.svg";

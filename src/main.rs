@@ -22,7 +22,7 @@ use gpui::{
 use gpui_component::{
     Disableable, IndexPath, InteractiveElementExt, Root,
     button::{Button, ButtonVariants},
-    input::{Input, InputEvent, InputState},
+    input::{Input, InputEvent, InputState, Position},
     kbd::Kbd,
     list::{List, ListEvent, ListItem, ListState},
     resizable::{h_resizable, resizable_panel},
@@ -205,6 +205,10 @@ struct Session {
     save_name_needs_focus: bool,
     open_query: Option<String>,
     saved_queries: Vec<String>,
+    /// The statements this profile has run, newest first. Held rather than read
+    /// off disk when the palette opens, for the reason `saved_queries` is: the
+    /// list is wanted while a list is being built, which is a frame.
+    history: Vec<String>,
     save_name: Entity<InputState>,
     naming: bool,
     pending_delete: Option<String>,
@@ -308,6 +312,7 @@ impl Session {
             save_name_needs_focus: false,
             open_query,
             saved_queries,
+            history: store::history(&id),
             save_name,
             naming: false,
             pending_delete: None,
@@ -2037,6 +2042,8 @@ impl Workspace {
             Command::RunQuery => self.run_query(&RunQuery, window, cx),
             Command::SaveQuery => self.save_query(&SaveQuery, window, cx),
             Command::RenameQuery => self.rename_query(window, cx),
+            Command::QueryHistory => self.open_palette(PaletteMode::History, window, cx),
+            Command::RecallStatement(sql) => self.recall_statement(sql, window, cx),
             Command::ShowStructure(showing) => self.show_structure(showing, cx),
             Command::RefreshRelation(id) => self.refresh_relation(id, cx),
             Command::CloseObject(id) => self.close_object(id, cx),
@@ -2719,6 +2726,28 @@ impl Workspace {
         self.activate_tab(Tab::Query, cx);
     }
 
+    /// A statement out of the history, back in the buffer.
+    ///
+    /// Appended rather than swapped in, for the reason `apply_in_buffer`
+    /// appends: recalling a statement is not a reason to take away what is
+    /// already written, and the statement that runs is the statement on screen.
+    /// The cursor lands on it, because that is what `cmd+enter` reads to decide
+    /// what to send.
+    fn recall_statement(&mut self, sql: String, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(profile) = self.profile() else {
+            return;
+        };
+        let editor = profile.session.editor.clone();
+        let text = editor.read(cx).value().to_string();
+        let appended = appended_statement(&text, &sql);
+        let line = appended.lines().count().saturating_sub(sql.lines().count()) as u32;
+        editor.update(cx, |editor, cx| {
+            editor.set_value(appended, window, cx);
+            editor.set_cursor_position(Position::new(line, 0), window, cx);
+        });
+        self.activate_tab(Tab::Query, cx);
+    }
+
     fn open_scratch_query(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self
             .profile()
@@ -2885,6 +2914,18 @@ impl Workspace {
         // Kept only where it is read back: the query tab's grid has to be able
         // to say which statement produced it.
         let statement = matches!(tab, Tab::Query).then(|| sql.clone());
+        // Recorded on the way out rather than on the way back: the history is
+        // what the user ran, and a statement that failed is exactly the one
+        // worth getting back. Only the buffer's — a relation's preview is SQL
+        // Slate wrote, and nobody asked to keep it.
+        if let Some(statement) = &statement
+            && let Some(profile) = self.profile_mut()
+        {
+            // A line that could not be written is not worth a notice on every
+            // run: the statement is still in the buffer, so nothing is lost.
+            let _ = store::append_history(&profile.id, statement);
+            remember_statement(&mut profile.session.history, statement);
+        }
         let query_task = cx
             .background_executor()
             .spawn(async move { connection.query(&sql) });
@@ -4099,6 +4140,15 @@ fn update_batch(engine: Engine, rows: &[PendingRow]) -> Option<String> {
     })
 }
 
+/// A statement at the front of the history, and there only once however many
+/// times it has been run: a query run five times is one row to recall, not five
+/// rows to read past.
+fn remember_statement(history: &mut Vec<String>, sql: &str) {
+    history.retain(|past| past != sql);
+    history.insert(0, sql.to_string());
+    history.truncate(store::HISTORY_DEPTH);
+}
+
 /// Slate's statement appended to the buffer the user is writing in.
 ///
 /// The terminator is the whole subtlety: an unterminated statement with an
@@ -4984,6 +5034,34 @@ mod tests {
     #[test]
     fn an_empty_batch_of_rows_has_nothing_to_send() {
         assert_eq!(update_batch(Engine::Postgres, &[]), None);
+    }
+
+    #[test]
+    fn a_statement_run_again_moves_to_the_front_rather_than_doubling() {
+        let mut history = vec!["SELECT 2".to_string(), "SELECT 1".to_string()];
+        remember_statement(&mut history, "SELECT 1");
+
+        assert_eq!(history, ["SELECT 1", "SELECT 2"]);
+    }
+
+    #[test]
+    fn a_recalled_statement_starts_on_the_line_the_cursor_is_sent_to() {
+        // The line `recall_statement` computes, against the text it computes it
+        // from. A cursor on the wrong line runs the wrong statement.
+        for (buffer, recalled) in [
+            ("", "SELECT 1"),
+            ("SELECT 2", "SELECT 1"),
+            ("SELECT 2;\n", "SELECT\n  1"),
+        ] {
+            let appended = appended_statement(buffer, recalled);
+            let line = appended.lines().count() - recalled.lines().count();
+
+            assert_eq!(
+                appended.lines().nth(line),
+                recalled.lines().next(),
+                "{appended:?}"
+            );
+        }
     }
 
     #[test]

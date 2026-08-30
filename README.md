@@ -84,6 +84,10 @@ rm -f dev/slate_dev.db && sqlite3 dev/slate_dev.db < dev/sqlite/001-slate-demo.s
 - **`cmd+p` and `cmd+shift+p`.** One flat fuzzy list over every table, view,
   routine and saved query the connection has, and one over the verbs that apply
   to what is on screen. Every row runs the same code the buttons do.
+- **Query history**, per profile and appended to on every run — a failed
+  statement included, since that is the one worth getting back. Reach it from
+  the command palette; recalling a statement appends it to the buffer with the
+  cursor on it, so `cmd+enter` sends what you are looking at.
 - **`cmd+w`** closes the tab in front. A saved query is listed while its file
   exists, so closing that one is deleting it and it asks first; everything else
   just goes.
