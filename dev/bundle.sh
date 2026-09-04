@@ -49,9 +49,15 @@ PLIST
 plutil -lint -s "$APP/Contents/Info.plist"
 
 # An arm64 binary will not launch without a signature, and copying it into the
-# bundle invalidates the one rustc left behind. Ad-hoc is enough to run on this
-# machine; SLATE_SIGN_ID takes a real identity when there is one to distribute
-# under.
+# bundle invalidates the one rustc left behind. SLATE_SIGN_ID takes a real
+# identity when there is one to distribute under, and dev/identity.sh's
+# self-signed one is what keeps the Keychain from re-asking after every
+# rebuild. Ad-hoc is the fallback, and it runs -- it just prompts.
+DEV_IDENTITY="Slate Dev Signing"
+if [[ -z "${SLATE_SIGN_ID:-}" ]] &&
+  security find-certificate -c "$DEV_IDENTITY" >/dev/null 2>&1; then
+  SLATE_SIGN_ID="$DEV_IDENTITY"
+fi
 codesign --force --sign "${SLATE_SIGN_ID:--}" "$APP"
 codesign --verify --strict "$APP"
 
