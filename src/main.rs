@@ -16,8 +16,9 @@ use std::{borrow::Cow, collections::HashMap, path::PathBuf, sync::Arc};
 use gpui::{
     Action, AnyElement, App, AppContext, Application, ClickEvent, ClipboardItem, Context, Entity,
     EntityInputHandler, FocusHandle, Focusable, FontWeight, InteractiveElement, IntoElement,
-    KeyBinding, Keystroke, ParentElement, Render, StatefulInteractiveElement, Styled,
-    TitlebarOptions, Window, WindowOptions, actions, div, point, prelude::FluentBuilder, px,
+    KeyBinding, Keystroke, Menu, MenuItem, ParentElement, Render, StatefulInteractiveElement,
+    Styled, TitlebarOptions, Window, WindowOptions, actions, div, point, prelude::FluentBuilder,
+    px,
 };
 use gpui_component::{
     Disableable, IndexPath, InteractiveElementExt, Root,
@@ -86,6 +87,7 @@ actions!(
         PaletteNext,
         PalettePrevious,
         CloseTab,
+        Quit,
     ]
 );
 
@@ -4668,7 +4670,19 @@ fn main() {
             // `cmd+c` wins there and the grid's copy never steals a text
             // selection.
             KeyBinding::new("cmd-c", CopyCell, Some("Table")),
+            KeyBinding::new("cmd-q", Quit, None),
         ]);
+
+        // An application menu is what actually makes `cmd+q` quit: the menu bar
+        // owns the keystroke at the AppKit level, so it fires whatever has
+        // focus, including a native text field that swallows the rest. Set
+        // after the bindings, because the shortcut the item displays is read
+        // back out of the keymap.
+        cx.on_action(|_: &Quit, cx: &mut App| cx.quit());
+        cx.set_menus(vec![Menu {
+            name: "Slate".into(),
+            items: vec![MenuItem::action("Quit Slate", Quit)],
+        }]);
 
         // The platform titlebar is kept only for its window buttons: a system
         // bar in its own grey above Slate's chrome is the seam every native app
