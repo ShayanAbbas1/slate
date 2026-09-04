@@ -876,9 +876,20 @@ impl Workspace {
 
         let mut load_failure = None;
         match store::load_profiles() {
-            Ok(profiles) => {
+            Ok((profiles, active)) => {
                 for stored in profiles {
                     workspace.restore_profile(stored, window, cx);
+                }
+                // Where the last session was left. An id that no longer names a
+                // profile leaves the first one in front, which is where an
+                // install with no history starts anyway.
+                if let Some(id) = active
+                    && let Some(index) = workspace
+                        .profiles
+                        .iter()
+                        .position(|profile| profile.id == id)
+                {
+                    workspace.active = index;
                 }
             }
             Err(message) => load_failure = Some(message),
@@ -899,6 +910,9 @@ impl Workspace {
                         workspace.create_profile(name, config, window, cx)
                     }
                 };
+                // The environment picked the profile, so it is the one to come
+                // back to next launch -- when there may be no environment.
+                workspace.remember_profiles(cx);
             }
             Ok(None) => {}
             Err(message) => {
@@ -1024,7 +1038,8 @@ impl Workspace {
             .iter()
             .map(Profile::stored)
             .collect::<Vec<_>>();
-        if let Err(message) = store::save_profiles(&profiles) {
+        let active = self.profile().map(|profile| profile.id.clone());
+        if let Err(message) = store::save_profiles(&profiles, active.as_deref()) {
             self.note(message, cx);
         }
     }
@@ -1454,6 +1469,9 @@ impl Workspace {
         self.form = None;
         self.switcher_open = false;
         self.pending_removal = None;
+        // Written here rather than at quit, so the profile in front survives a
+        // crash as well as a close.
+        self.remember_profiles(cx);
         if let Some(profile) = self.profile_mut() {
             profile.session.editor_needs_focus = true;
             profile.session.clear_prompts();

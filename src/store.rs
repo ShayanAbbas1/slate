@@ -75,22 +75,30 @@ pub struct StoredObject {
     pub active: bool,
 }
 
+/// Field order is load-bearing here too: `active` is a scalar, so it has to
+/// precede the profile table array.
 #[derive(Default, Debug, PartialEq, Serialize, Deserialize)]
 struct ProfileFile {
+    /// The profile that was in front. An id rather than a flag on the profile,
+    /// unlike [`StoredObject::active`]: an id is a validated slug, so there is
+    /// nothing in one that could be mistaken for a key.
+    #[serde(default)]
+    active: Option<String>,
     #[serde(default)]
     profiles: Vec<StoredProfile>,
 }
 
-/// A missing file is the first run, and reads as an empty list. Every other
-/// failure is reported, a missing `HOME` included -- `save_profiles` refuses on
-/// that too, and an empty list here is what the next save writes back.
-pub fn load_profiles() -> Result<Vec<StoredProfile>, String> {
+/// The profile list and the id of the one that was last in front. A missing
+/// file is the first run, and reads as an empty list. Every other failure is
+/// reported, a missing `HOME` included -- `save_profiles` refuses on that too,
+/// and an empty list here is what the next save writes back.
+pub fn load_profiles() -> Result<(Vec<StoredProfile>, Option<String>), String> {
     let path = slate_directory()?.join(PROFILES_FILE);
     // A file we could not read is not renamed: nothing is recovered by moving
     // it, so the overwrite hazard below technically remains. A directory we
     // cannot read is one we almost certainly cannot write either.
     let Some(text) = read_file(&path)? else {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), None));
     };
     decode_profiles(&text).map_err(|error| {
         // The next save rewrites this path, so moving the unparsable file aside
@@ -110,14 +118,15 @@ pub fn load_profiles() -> Result<Vec<StoredProfile>, String> {
     })
 }
 
-fn decode_profiles(text: &str) -> Result<Vec<StoredProfile>, String> {
+fn decode_profiles(text: &str) -> Result<(Vec<StoredProfile>, Option<String>), String> {
     toml::from_str::<ProfileFile>(text)
-        .map(|file| file.profiles)
+        .map(|file| (file.profiles, file.active))
         .map_err(|error| error.to_string())
 }
 
-pub fn save_profiles(profiles: &[StoredProfile]) -> Result<(), String> {
+pub fn save_profiles(profiles: &[StoredProfile], active: Option<&str>) -> Result<(), String> {
     let text = toml::to_string_pretty(&ProfileFile {
+        active: active.map(str::to_string),
         profiles: profiles.to_vec(),
     })
     .map_err(|error| format!("Could not encode the profile list: {error}"))?;
@@ -395,6 +404,7 @@ mod tests {
             ],
         };
         let file = ProfileFile {
+            active: Some("dev".into()),
             profiles: vec![profile.clone()],
         };
 
@@ -402,6 +412,7 @@ mod tests {
         let decoded: ProfileFile = toml::from_str(&text).expect("profiles must decode");
 
         assert_eq!(decoded.profiles, vec![profile]);
+        assert_eq!(decoded.active.as_deref(), Some("dev"));
     }
 
     #[test]
@@ -410,7 +421,7 @@ mod tests {
         // is the file already on disk for anyone who has run Slate before. A
         // decode error here reads as "no profiles", which is what the next save
         // would then write back.
-        let profiles = decode_profiles(
+        let (profiles, active) = decode_profiles(
             "\
 [[profiles]]
 id = \"slate-dev\"
@@ -425,6 +436,7 @@ open_objects = []
         )
         .expect("a profile predating the optional fields must load");
 
+        assert_eq!(active, None);
         let [profile] = &profiles[..] else {
             panic!("expected exactly one profile, got {}", profiles.len());
         };
@@ -459,6 +471,7 @@ open_objects = []
             }],
         };
         let file = ProfileFile {
+            active: None,
             profiles: vec![profile.clone()],
         };
 
@@ -473,7 +486,7 @@ open_objects = []
         // Every profile on disk before a second engine existed has no `engine`
         // key at all, and must load as Postgres -- which is what it was
         // connecting as -- rather than fail to decode.
-        let profiles = decode_profiles(
+        let (profiles, _) = decode_profiles(
             "\
 [[profiles]]
 id = \"slate-dev\"
@@ -521,6 +534,7 @@ open_objects = []
             }],
         };
         let text = toml::to_string_pretty(&ProfileFile {
+            active: None,
             profiles: vec![profile],
         })
         .expect("profile must encode");
@@ -546,7 +560,7 @@ open_objects = []
         // The empty list is what the next save writes back, so a parse error
         // that reads as "no profiles" is a parse error that deletes them.
         assert!(decode_profiles("host = ").is_err());
-        assert_eq!(decode_profiles(""), Ok(Vec::new()));
+        assert_eq!(decode_profiles(""), Ok((Vec::new(), None)));
     }
 
     #[test]
