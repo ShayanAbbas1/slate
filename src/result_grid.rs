@@ -425,7 +425,10 @@ impl ResultGrid {
                 .map(|value| SharedString::from(value.to_string()))
                 .unwrap_or_default(),
         };
-        let input = cx.new(|cx| InputState::new(window, cx).default_value(seed));
+        let input = cx.new(|cx| InputState::new(window, cx));
+        // `set_value` rather than `default_value`: only the former leaves the
+        // caret after the text, and an edit starts from the end of the value.
+        input.update(cx, |input, cx| input.set_value(seed, window, cx));
         // The keystrokes that follow belong to the value rather than to the
         // grid's selection, so the input takes focus as it appears.
         input.focus_handle(cx).focus(window);
