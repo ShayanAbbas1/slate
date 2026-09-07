@@ -294,7 +294,7 @@ fn render_results(
                     // its way out of the Table context.
                     .on_action(cx.listener(Workspace::edit_cell))
                     .on_action(cx.listener(Workspace::copy_cell))
-                    .child(Table::new(results).bordered(false).stripe(true)),
+                    .child(Table::new(results).bordered(false).stripe(false)),
             )
             .children(render_row_inspector(results, cx))
             .into_any_element(),
@@ -347,9 +347,11 @@ fn render_row_inspector(
             .h_full()
             .flex()
             .flex_col()
-            // One tone behind the results: this describes the data rather
-            // than being it.
-            .bg(t.panel_glass())
+            // The same plane as the results, separated by its edge rather
+            // than its tone: a second tint here reads as a slab pasted over
+            // the window instead of a panel inside it.
+            .border_l_1()
+            .border_color(t.border)
             .child(
                 div()
                     .h(px(layout::TAB_HEIGHT))

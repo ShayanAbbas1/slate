@@ -186,9 +186,9 @@ const HAIRLINE_LIGHT: f32 = 0.12;
 /// multiply: chrome is `1 - FROST`, and the planes over it are that again
 /// times their own. Keeping the three within a few points of each other is
 /// what lets the tone ramp, rather than the desktop, say which plane is which.
-const FROST_ALPHA: f32 = 0.86;
-const PANEL_ALPHA: f32 = 0.35;
-const DATA_ALPHA: f32 = 0.55;
+const FROST_ALPHA: f32 = 0.72;
+const PANEL_ALPHA: f32 = 0.14;
+const DATA_ALPHA: f32 = 0.14;
 
 fn neutral(lightness: f32) -> Srgb {
     Oklch::new(lightness, NEUTRAL_CHROMA, NEUTRAL_HUE).to_srgb()
@@ -304,8 +304,10 @@ impl Theme {
         self.panel.alpha(self.tint(PANEL_ALPHA))
     }
 
-    /// The results plane, as a tint over [`Theme::frost`]. The most solid of the
-    /// three: a dense grid read against a moving wallpaper is not read at all.
+    /// The results plane, as a tint over [`Theme::frost`]. The densest of the
+    /// three, but only just: a dense grid read against a moving wallpaper is
+    /// not read at all, and a grid that reads as a black slab beside a glass
+    /// editor is not the same window.
     pub fn data_glass(self) -> Rgba {
         self.bg.alpha(self.tint(DATA_ALPHA))
     }
@@ -392,12 +394,13 @@ impl Theme {
         component.colors.table_active = self.selection.into();
         component.colors.table_active_border = self.accent.into();
         component.colors.table_even = self.element_hover.into();
-        component.colors.table_head = self.panel.into();
+        component.colors.table_head = self.panel_glass().into();
         component.colors.table_head_foreground = self.text_muted.into();
         component.colors.table_hover = self.element_hover.into();
-        // Stripes carry the rows; a hairline under every row as well is the
-        // grid equivalent of ruled paper under print.
-        component.colors.table_row_border = TRANSPARENT.into();
+        // The hairline carries the rows. Stripes are off on glass: a 5% wash
+        // over every other row is exactly the transmission the plane is there
+        // to give up, and two rows of haze read as one flat slab.
+        component.colors.table_row_border = self.border.into();
         component.highlight_theme = self.highlight_theme();
     }
 
