@@ -14,6 +14,7 @@
 //! result column was read from, which is exactly what in-grid editing needs, so
 //! there is no describe step and nothing here can disturb an open transaction.
 
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -494,6 +495,20 @@ fn resolve_edit_target(
     // The caller has already established that the columns carrying a table all
     // carry the same one, so carrying a table at all means carrying this one.
     let column_of = |column: &ProbedColumn| column.table.as_ref().and(column.column.clone());
+    // Two result columns reading the same table column are the two sides of a
+    // self-join, and no driver reports the alias that tells them apart. The key
+    // below is located by position, so it would resolve to whichever side came
+    // first and write the edit at the other row's key; the same shape also
+    // generates one SET clause per side for the same column. Refusing the whole
+    // result set is one answer to both.
+    let mut origins = HashSet::new();
+    if !probed
+        .iter()
+        .filter_map(column_of)
+        .all(|column| origins.insert(column))
+    {
+        return None;
+    }
     let keys = key
         .iter()
         .map(|name| {
@@ -873,6 +888,21 @@ mod tests {
                 "{sql}"
             );
         }
+    }
+
+    #[test]
+    fn a_self_join_is_not_editable() {
+        // Both sides report the same origin table and column, so `sole_table`
+        // sees one table and the key resolves to the first side -- an edit
+        // typed on b.name would be written at a's id.
+        let result = memory(ACCOUNTS)
+            .query(
+                "SELECT a.id, a.name, b.name
+             FROM accounts a JOIN accounts b ON b.id = a.id",
+            )
+            .expect("query should succeed");
+
+        assert!(result.edit.is_none());
     }
 
     #[test]

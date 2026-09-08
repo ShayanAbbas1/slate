@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -499,6 +500,20 @@ fn resolve_edit_target(probed: &[ProbedColumn], table: &KeyedTable) -> Option<Ed
     // The caller has already established that the columns carrying a table all
     // carry the same one, so carrying a table at all means carrying this one.
     let attribute_of = |column: &ProbedColumn| column.table.and(column.attribute);
+    // Two result columns reading the same table column are the two sides of a
+    // self-join, and no driver reports the alias that tells them apart. The key
+    // below is located by position, so it would resolve to whichever side came
+    // first and write the edit at the other row's key; the same shape also
+    // generates one SET clause per side for the same column. Refusing the whole
+    // result set is one answer to both.
+    let mut origins = HashSet::new();
+    if !probed
+        .iter()
+        .filter_map(attribute_of)
+        .all(|attribute| origins.insert(attribute))
+    {
+        return None;
+    }
     let keys = table
         .key
         .iter()
@@ -1190,6 +1205,24 @@ mod tests {
         // Positions of the key in the *result*, not in the table -- the caller
         // reads cells by result column.
         assert_eq!(target.keys, vec![1, 2]);
+    }
+
+    #[test]
+    fn a_self_join_is_not_editable() {
+        // Both sides carry the same oid, so `sole_table` sees one table and the
+        // key resolves to the first side -- an edit typed on b.name would be
+        // written at a's id.
+        assert_eq!(
+            resolve_edit_target(
+                &probed(&[
+                    ("int4", Some(42), Some(1)),
+                    ("text", Some(42), Some(3)),
+                    ("text", Some(42), Some(3)),
+                ]),
+                &keyed(&[(1, "id", true), (3, "name", false)]),
+            ),
+            None
+        );
     }
 
     #[test]

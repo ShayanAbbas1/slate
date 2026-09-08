@@ -316,6 +316,25 @@ pub struct Column {
     pub data_type: Option<String>,
 }
 
+/// Whether a [`Column::data_type`] names a type whose values are bytes.
+///
+/// Three engines' spellings in one predicate rather than three, because nothing
+/// above this module is allowed to know which engine answered (AGENTS.md, hard
+/// rule 4). Substrings because the families are open-ended in two directions:
+/// MySQL prefixes its blobs and binaries, and SQLite gives BLOB affinity to any
+/// declared type merely *containing* `blob`.
+///
+/// What it is for: a blob is rendered as the engine's own literal — `x'AB'`,
+/// `0xAB` — and [`Engine::quote_literal`] would quote that back as the six
+/// characters it looks like, so an edited blob column becomes text. The grid
+/// refuses the edit instead. Absent here means unknown, not text: a driver that
+/// could not name the type says nothing, and treating silence as binary would
+/// make ordinary columns read-only.
+pub fn is_binary_type(data_type: &str) -> bool {
+    let name = data_type.to_ascii_lowercase();
+    name == "bytea" || name.contains("blob") || name.contains("binary")
+}
+
 /// A cell value, already formatted by the server. `None` is SQL NULL, which is
 /// distinct from an empty string and must stay distinguishable in the grid.
 pub type Cell = Option<String>;

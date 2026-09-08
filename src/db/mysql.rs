@@ -17,6 +17,7 @@
 //! below alias their columns to the names the shared assemblers in `mod.rs`
 //! read and nothing else here has to know how a `Catalog` is built.
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -594,6 +595,20 @@ fn resolve_edit_target(
     // The caller has already established that the columns carrying a table all
     // carry the same one, so carrying a table at all means carrying this one.
     let column_of = |column: &ProbedColumn| column.table.as_ref().and(column.column.clone());
+    // Two result columns reading the same table column are the two sides of a
+    // self-join, and no driver reports the alias that tells them apart. The key
+    // below is located by position, so it would resolve to whichever side came
+    // first and write the edit at the other row's key; the same shape also
+    // generates one SET clause per side for the same column. Refusing the whole
+    // result set is one answer to both.
+    let mut origins = HashSet::new();
+    if !probed
+        .iter()
+        .filter_map(column_of)
+        .all(|column| origins.insert(column))
+    {
+        return None;
+    }
     let keys = key
         .iter()
         .map(|name| {
@@ -870,6 +885,26 @@ mod tests {
             vec![Some("id".to_string()), None, Some("name".to_string())]
         );
         assert_eq!(target.keys, vec![0]);
+    }
+
+    #[test]
+    fn a_self_join_is_not_editable() {
+        // `org_table` is the same on both sides and the alias is not reported,
+        // so `sole_table` sees one table and the key resolves to the first
+        // side -- an edit typed on b.name would be written at a's id.
+        assert_eq!(
+            resolve_edit_target(
+                &probed(&[
+                    (Some("accounts"), Some("id")),
+                    (Some("accounts"), Some("name")),
+                    (Some("accounts"), Some("name")),
+                ]),
+                "slate_dev",
+                "accounts",
+                &["id".to_string()],
+            ),
+            None
+        );
     }
 
     #[test]

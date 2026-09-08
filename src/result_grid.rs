@@ -9,7 +9,7 @@ use gpui_component::{
 };
 
 use crate::{
-    db::{EditTarget, QueryResult},
+    db::{self, EditTarget, QueryResult},
     icons::icon,
     theme::{layout, theme},
 };
@@ -267,6 +267,11 @@ impl ResultGrid {
     /// traceable to one table, the column has to exist in it, and it must not
     /// be part of the key — a key edit is the one edit whose result cannot be
     /// re-verified afterwards, so the spec's §3 refuses it.
+    ///
+    /// Nor a binary column. What the grid shows there is a blob *literal* the
+    /// user could not type a replacement for anyway, and the value that came
+    /// back would be written as the text it looks like — see
+    /// [`db::is_binary_type`].
     pub fn editable(&self, row: usize, col: usize) -> bool {
         let Some(edit) = &self.result.edit else {
             return false;
@@ -274,6 +279,12 @@ impl ResultGrid {
         row < self.result.rows.len()
             && edit.columns.get(col).is_some_and(Option::is_some)
             && !edit.keys.contains(&col)
+            && !self
+                .result
+                .columns
+                .get(col)
+                .and_then(|column| column.data_type.as_deref())
+                .is_some_and(db::is_binary_type)
     }
 
     /// Open an input on a cell. `false` when the cell is not editable, and
@@ -300,6 +311,19 @@ impl ResultGrid {
     pub fn set_pending(&mut self, row: usize, col: usize, value: String) -> bool {
         if !self.editable(row, col) {
             return false;
+        }
+
+        // An input seeds itself with the value as fetched, so opening an edit
+        // and closing it without typing arrives here carrying the server's own
+        // value back. That is not an edit, and recording it would write a
+        // rendered value over the value it was rendered from. A NULL renders as
+        // nothing, which is why the empty string is what it compares against —
+        // typing the empty string into a cell that holds text is still an edit,
+        // and still recorded.
+        if self.cell(row, col).unwrap_or_default() == value {
+            self.pending
+                .retain(|edit| (edit.row, edit.col) != (row, col));
+            return true;
         }
 
         let value: SharedString = value.into();
@@ -849,6 +873,83 @@ mod tests {
         // Nor a row past the end of it.
         assert!(!grid.set_pending(9, 1, "99".into()));
         assert!(!grid.has_pending());
+    }
+
+    #[test]
+    fn a_binary_column_cannot_be_edited() {
+        // The grid paints a blob as the engine's own literal, and every value
+        // written back goes through `quote_literal`, which would store the
+        // literal as the text it looks like. Each engine's spelling of the
+        // type, since one predicate answers for all three.
+        for data_type in ["bytea", "blob", "longblob", "varbinary(16)", "BLOB"] {
+            let mut grid = ResultGrid::new(QueryResult {
+                columns: vec![
+                    column("id"),
+                    DbColumn {
+                        name: "payload".into(),
+                        data_type: Some(data_type.into()),
+                    },
+                ],
+                rows: vec![vec![Some("7".into()), Some("x'AB'".into())]],
+                edit: Some(EditTarget {
+                    schema: "public".into(),
+                    table: "measurements".into(),
+                    columns: vec![Some("id".into()), Some("payload".into())],
+                    keys: vec![0],
+                }),
+                ..QueryResult::default()
+            });
+
+            assert!(!grid.editable(0, 1), "{data_type}");
+            assert!(!grid.begin_edit(0, 1), "{data_type}");
+            assert!(!grid.set_pending(0, 1, "x'CD'".into()), "{data_type}");
+            assert!(!grid.has_pending(), "{data_type}");
+        }
+    }
+
+    #[test]
+    fn a_value_that_did_not_change_records_nothing() {
+        // An input seeds itself with the fetched value, so opening an edit and
+        // pressing Enter arrives here with that value: two keystrokes must not
+        // become a write.
+        let mut grid = editable_grid();
+        assert!(grid.set_pending(0, 1, "first".into()));
+        assert!(!grid.has_pending());
+
+        // Typed back to what the server sent, an edit already recorded goes.
+        assert!(grid.set_pending(0, 1, "changed".into()));
+        assert!(grid.has_pending());
+        assert!(grid.set_pending(0, 1, "first".into()));
+        assert!(!grid.has_pending());
+
+        // Emptying a cell that holds text is still a deliberate edit.
+        assert!(grid.set_pending(0, 1, String::new()));
+        assert_eq!(
+            grid.pending_updates()[0].sets,
+            vec![("body".to_string(), String::new())]
+        );
+    }
+
+    #[test]
+    fn an_untouched_null_stays_null() {
+        // A NULL is edited as the empty string because there is no way to type
+        // one back, so an untouched input on one carries the empty string --
+        // which written back would replace the NULL with a value.
+        let mut grid = ResultGrid::new(QueryResult {
+            columns: vec![column("id"), column("note")],
+            rows: vec![vec![Some("7".into()), None]],
+            edit: Some(EditTarget {
+                schema: "public".into(),
+                table: "measurements".into(),
+                columns: vec![Some("id".into()), Some("body".into())],
+                keys: vec![0],
+            }),
+            ..QueryResult::default()
+        });
+
+        assert!(grid.set_pending(0, 1, String::new()));
+        assert!(!grid.has_pending());
+        assert!(grid.pending_updates().is_empty());
     }
 
     #[test]
