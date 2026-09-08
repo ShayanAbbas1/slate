@@ -3374,6 +3374,11 @@ impl Workspace {
                 .inset_0()
                 .flex()
                 .justify_center()
+                // Cross-axis stretch is the flex default, and it would take the
+                // palette's own height with it: a box down to the bottom of the
+                // window, with the list capped at its own max height near the
+                // top and the rest of the panel painted empty.
+                .items_start()
                 .child(
                     div()
                         .id("palette")
