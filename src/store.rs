@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::fs;
 use std::io::{self, Write};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use security_framework::passwords::{self, PasswordOptions};
@@ -278,6 +279,7 @@ pub fn append_history(profile_id: &str, sql: &str) -> Result<(), String> {
         .append(true)
         .open(&path)
         .map_err(|error| format!("Could not open {}: {error}", path.display()))?;
+    secure(&path)?;
     writeln!(file, "{line}").map_err(|error| format!("Could not write {}: {error}", path.display()))
 }
 
@@ -359,8 +361,21 @@ fn write_file(path: &Path, contents: &str) -> Result<(), String> {
     let temporary = path.with_extension("tmp");
     fs::write(&temporary, contents)
         .map_err(|error| format!("Could not write {}: {error}", temporary.display()))?;
+    // Set before the rename, not after: the rename is what makes this the file
+    // at `path`, so a mode applied afterward would leave it world-readable for
+    // however long the two steps are apart.
+    secure(&temporary)?;
     fs::rename(&temporary, path)
         .map_err(|error| format!("Could not replace {}: {error}", path.display()))
+}
+
+/// Connection settings live in these files -- host, port, user, database --
+/// so `0600` holds regardless of whether `path` is being created or replaced.
+/// `OpenOptions::mode` only sets this at creation, which is not enough for a
+/// file that already existed with looser permissions from before this rule.
+fn secure(path: &Path) -> Result<(), String> {
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+        .map_err(|error| format!("Could not set permissions on {}: {error}", path.display()))
 }
 
 #[cfg(test)]
@@ -609,6 +624,23 @@ open_objects = []
         let text = format!("{}\n\"SELECT 2", serde_json::to_string("SELECT 1").unwrap());
 
         assert_eq!(decode_history(&text), ["SELECT 1"]);
+    }
+
+    #[test]
+    fn a_written_config_file_is_readable_only_by_its_owner() {
+        // Profiles, saved queries and the scratch buffer all hold connection
+        // settings and go through this one function, so this is the one place
+        // that has to prove the permission rather than every caller.
+        let path = std::env::temp_dir().join("slate-store-permissions-test.toml");
+        let _ = fs::remove_file(&path);
+
+        write_file(&path, "host = \"example\"").expect("file must write");
+
+        let mode = fs::metadata(&path)
+            .expect("file must exist")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
     }
 
     #[test]

@@ -179,23 +179,25 @@ Decided, recorded in the multi-engine spec, and not to be re-litigated:
   `main::sort_expression`. The last one is the one that gets forgotten, and
   forgetting it is silent: a double-quoted name is a *string literal* in MySQL,
   so `ORDER BY "name"` sorts every row by the same constant with no error.
-- **SQLite brackets a generated multi-row batch** in `BEGIN`/`COMMIT`, because
-  it commits each statement on its own where a Postgres `simple_query`
-  submission is one implicit transaction. The brackets go in the statement text,
-  never around it invisibly, and `sql::is_generated_update` refuses a
-  transaction it cannot see closed.
-- **MySQL is neither bracketed nor atomic, and this file said it was** until
-  2026-09-08. `query_iter` speaks the text protocol and MySQL autocommits each
-  statement, so a failed multi-row apply leaves every row before the failure
-  written. The engine that gets it decided in a `_ =>` catch-all at
-  `main::update_batch` — rule 4 violated in the one feature that writes to
-  the user's database. Bracketing is a question for `Engine` to answer with
-  three explicit arms, not a call site to guess at.
-- **Nothing rolls back on any engine.** `ROLLBACK` appears nowhere outside
-  tests, so a failed SQLite batch leaves its write transaction open on a
-  long-lived connection. Do not add a rollback to SQLite alone and call it
-  fixed; the bracketing and the rollback are one decision per engine. Findings
-  and fix order in `notes/release-audit-2026-09-08.md` (outside Git).
+- **MySQL and SQLite both bracket a generated multi-row batch** in
+  `BEGIN`/`COMMIT`, because each commits every statement on its own where a
+  Postgres `simple_query` submission is one implicit transaction. The brackets
+  go in the statement text, never around it invisibly, and
+  `sql::is_generated_update` refuses a transaction it cannot see closed.
+  `Engine::transaction_start` answers which engine needs one, with an arm per
+  engine; it was a `_ =>` catch-all at `main::update_batch` until 2026-09-08,
+  which is how MySQL went unbracketed while this file claimed it was atomic.
+  `BEGIN` rather than MySQL's own `START TRANSACTION` because the gate has to
+  read the brackets back and the tree-sitter grammar knows only the first —
+  MySQL takes it as an alias outside a stored program.
+- **A batch that fails part way is rolled back, and the error says which state
+  the data is in.** Without that the brackets produce a third state — neither
+  applied nor discarded, and rendered as applied, because the refresh `SELECT`
+  runs on the same long-lived connection and reads the uncommitted rows back.
+  Only a transaction *this* submission opened is rolled back; one the user began
+  in an earlier run is theirs to finish. SQLite asks `is_autocommit` before and
+  after; MySQL cannot, because the driver keeps the server's
+  `SERVER_STATUS_IN_TRANS` flag private, so it reads the submitted text instead.
 - **`CHECK` constraints are absent** from the Structure tab on MySQL and SQLite.
   SQLite keeps them only in the `CREATE TABLE` text; MySQL's
   `information_schema.CHECK_CONSTRAINTS` only exists from 8.0.16.
@@ -291,6 +293,8 @@ Two more that are not about animation, and cost a round each to find:
   section is binding — do not build ahead of it.
 - **Deletion over addition.** The shortest change that fully solves the problem
   wins, once the problem is actually understood.
+- A `ponytail:` comment marks a deliberate simplification and names its ceiling
+  and upgrade path. Leave one where a shortcut is a decision, not an oversight.
 - Non-trivial logic leaves one runnable check behind — the smallest test that
   fails if the logic breaks. No fixture scaffolding.
 - Match surrounding code's naming, density and idiom.

@@ -4114,11 +4114,13 @@ fn relation_sql(
 
 /// Every pending row as one `UPDATE`, joined into a single string.
 ///
-/// All-or-nothing, which each engine reaches differently. Postgres runs one
-/// submission as a single implicit transaction and needs nothing. SQLite commits
-/// every statement on its own, so a batch of more than one is bracketed — in the
-/// statement text itself, where the user can read, edit and undo it, because
-/// Slate does not open a transaction behind anyone's back.
+/// All-or-nothing, which each engine reaches differently, and
+/// `Engine::transaction_start` is where that per-engine answer lives. Postgres
+/// runs one submission as a single implicit transaction and needs nothing;
+/// MySQL and SQLite commit every statement on its own, so a batch of more than
+/// one is bracketed — in the statement text itself, where the user can read,
+/// edit and undo it, because Slate does not open a transaction behind anyone's
+/// back.
 ///
 /// `None` when there is nothing to apply, and `None` — rather than a shorter
 /// batch — when any one row cannot be written: a partial apply is not the change
@@ -4151,12 +4153,11 @@ fn update_batch(engine: Engine, rows: &[PendingRow]) -> Option<String> {
         })
         .collect();
 
-    let statements = statements?;
-    Some(match engine {
-        Engine::Sqlite if statements.len() > 1 => {
-            format!("BEGIN;\n{}\nCOMMIT;", statements.join("\n"))
-        }
-        _ => statements.join("\n"),
+    let batch = statements?.join("\n");
+    let bracket = engine.transaction_start().filter(|_| rows.len() > 1);
+    Some(match bracket {
+        Some(start) => format!("{start};\n{batch}\nCOMMIT;"),
+        None => batch,
     })
 }
 
@@ -5022,23 +5023,29 @@ mod tests {
 
     #[test]
     fn an_engine_without_an_implicit_transaction_gets_explicit_brackets() {
-        // SQLite commits each statement on its own, so an unbracketed batch
-        // could apply half the user's edits and report the failure of the rest.
+        // MySQL and SQLite commit each statement on its own, so an unbracketed
+        // batch could apply half the user's edits and report the failure of the
+        // rest.
         let rows = vec![
             pending_row(&[("name", "Ada")], &[("id", "1")]),
             pending_row(&[("name", "Bo")], &[("id", "2")]),
         ];
 
-        let batch = update_batch(Engine::Sqlite, &rows).unwrap();
-        assert!(batch.starts_with("BEGIN;\n"), "{batch}");
-        assert!(batch.ends_with("\nCOMMIT;"), "{batch}");
-        assert!(sql::is_generated_update(&batch));
+        for engine in [Engine::MySql, Engine::Sqlite] {
+            let batch = update_batch(engine, &rows).unwrap();
+            assert!(batch.starts_with("BEGIN;\n"), "{engine:?} {batch}");
+            assert!(batch.ends_with("\nCOMMIT;"), "{engine:?} {batch}");
+            assert!(sql::is_generated_update(&batch), "{engine:?} {batch}");
 
-        // One statement is already atomic, so brackets round it would be
-        // ceremony the user has to read past.
-        let single = update_batch(Engine::Sqlite, &rows[..1]).unwrap();
-        assert!(!single.contains("BEGIN"), "{single}");
-        assert!(sql::is_generated_update(&single));
+            // One statement is already atomic, so brackets round it would be
+            // ceremony the user has to read past.
+            let single = update_batch(engine, &rows[..1]).unwrap();
+            assert!(!single.contains("BEGIN"), "{engine:?} {single}");
+            assert!(sql::is_generated_update(&single), "{engine:?} {single}");
+        }
+
+        let postgres = update_batch(Engine::Postgres, &rows).unwrap();
+        assert!(!postgres.contains("BEGIN"), "{postgres}");
     }
 
     #[test]

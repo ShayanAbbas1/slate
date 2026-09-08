@@ -73,6 +73,26 @@ impl Engine {
         !matches!(self, Self::Sqlite)
     }
 
+    /// The word that opens a transaction around a generated multi-statement
+    /// batch, or `None` for the engine that already makes one submission
+    /// atomic. `COMMIT` and `ROLLBACK` are spelled the same everywhere, so the
+    /// opening word is the whole of the difference.
+    ///
+    /// MySQL's own spelling is `START TRANSACTION`, and `BEGIN` is its
+    /// documented alias outside a stored program. The alias is what Slate
+    /// writes because the brackets go into the statement text, where
+    /// `sql::is_generated_update` has to read them back: the tree-sitter
+    /// grammar has no `START TRANSACTION`, so the gate would refuse Slate's own
+    /// batch.
+    pub fn transaction_start(self) -> Option<&'static str> {
+        match self {
+            // One simple-query submission is already one implicit transaction.
+            Self::Postgres => None,
+            Self::MySql => Some("BEGIN"),
+            Self::Sqlite => Some("BEGIN"),
+        }
+    }
+
     /// Postgres and SQLite take the standard's double quote. MySQL takes a
     /// backtick, which it accepts whether or not `ANSI_QUOTES` is set — a double
     /// quote there is a *string literal*, so quoting a MySQL identifier the
@@ -693,6 +713,17 @@ mod tests {
             .endpoint(),
             "db.example.test"
         );
+    }
+
+    #[test]
+    fn only_the_engine_with_an_implicit_transaction_needs_no_brackets() {
+        // Postgres runs one submission as one transaction; the other two commit
+        // each statement on its own and have to be told. `BEGIN` rather than
+        // MySQL's own `START TRANSACTION` because the brackets are read back by
+        // `sql::is_generated_update`, whose grammar knows only the first.
+        assert_eq!(Engine::Postgres.transaction_start(), None);
+        assert_eq!(Engine::MySql.transaction_start(), Some("BEGIN"));
+        assert_eq!(Engine::Sqlite.transaction_start(), Some("BEGIN"));
     }
 
     #[test]

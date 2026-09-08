@@ -314,7 +314,7 @@ impl Connection {
         let mut result = QueryResult::default();
         let mut probed = Vec::new();
 
-        {
+        let mut submit = || -> Result<(), DbError> {
             // Timed from here, not from the call: one connection serialises a
             // profile's queries, and time spent waiting behind the catalog load
             // is not time the server spent on this statement.
@@ -381,6 +381,11 @@ impl Connection {
                 probed = described;
             }
             result.elapsed = started.elapsed();
+            Ok(())
+        };
+
+        if let Err(error) = submit() {
+            return Err(rolled_back(&mut connection, sql, error));
         }
 
         // The connection mutex is not reentrant and `edit_target` runs a catalog
@@ -698,6 +703,45 @@ fn query_error(error: &::mysql::Error) -> DbError {
         // MySQL reports no offset into the statement, so there is nothing to
         // point the editor at. Absent rather than guessed.
         position: None,
+    }
+}
+
+/// End the transaction a failed batch left open, and say so in the error.
+///
+/// MySQL stops a multi-statement submission at the failing statement, so the
+/// `COMMIT` Slate wrote into the text never runs and the transaction stays open
+/// on a connection that outlives it — the refresh that follows would read the
+/// uncommitted rows back as though the apply had succeeded, and every statement
+/// after it would join a transaction nobody closes.
+///
+/// Only a transaction *this* submission opened is rolled back, so one the user
+/// began in an earlier run is theirs to finish. Unlike SQLite, MySQL cannot be
+/// asked: the driver keeps the server's `SERVER_STATUS_IN_TRANS` flag private,
+/// so the submitted text is what there is to read, and it is the text Slate
+/// wrote or the user can see.
+fn rolled_back(connection: &mut Conn, sql: &str, error: DbError) -> DbError {
+    let Some(start) = Engine::MySql.transaction_start() else {
+        return error;
+    };
+    if !sql
+        .trim_start()
+        .get(..start.len())
+        .is_some_and(|word| word.eq_ignore_ascii_case(start))
+    {
+        return error;
+    }
+
+    let outcome = match connection.query_drop("ROLLBACK") {
+        Ok(()) => "The transaction the batch opened was rolled back; nothing it wrote remains."
+            .to_string(),
+        Err(failure) => format!(
+            "The transaction the batch opened is still open: the rollback failed too. {}",
+            describe(&failure)
+        ),
+    };
+    DbError {
+        message: format!("{}\n\n{outcome}", error.message),
+        position: error.position,
     }
 }
 

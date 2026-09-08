@@ -112,7 +112,12 @@ impl Connection {
         let mut result = QueryResult::default();
         let mut probed = Vec::new();
 
-        {
+        // Whether this submission is the one that opened a transaction, asked
+        // before it runs: a transaction the user began in an earlier run is
+        // theirs to finish, not Slate's to discard on their next typo.
+        let outside_a_transaction = connection.is_autocommit();
+
+        let outcome = (|| -> Result<(), DbError> {
             // SQLite splits the submission itself, using the tail its own
             // parser reports. Slate's tree-sitter grammar could have done it,
             // but then a statement SQLite accepts and the grammar does not
@@ -195,6 +200,11 @@ impl Connection {
                 probed = described;
             }
             result.elapsed = started.elapsed();
+            Ok(())
+        })();
+
+        if let Err(error) = outcome {
+            return Err(rolled_back(&connection, outside_a_transaction, error));
         }
 
         // The mutex is not reentrant and `edit_target` runs a pragma through it,
@@ -634,6 +644,42 @@ fn query_error(error: &rusqlite::Error, submission: &str) -> DbError {
     }
 }
 
+/// End the transaction a failed batch left open, and say so in the error.
+///
+/// SQLite stops the batch at the failing statement, so the `COMMIT` Slate wrote
+/// into the text never runs and the transaction stays open on a connection that
+/// outlives the statement: the refresh that follows reads the uncommitted rows
+/// back as though the apply had succeeded, and the next batch's `BEGIN` fails
+/// inside it. The brackets are there to make the batch all-or-nothing; without
+/// this they produce a third state instead, and one rendered as success.
+///
+/// Only a transaction *this* submission opened is rolled back, so one the user
+/// began in an earlier run is theirs to finish. Which state the data is in is
+/// the part the user cannot see for themselves, so the notice carries it rather
+/// than the log.
+fn rolled_back(
+    connection: &rusqlite::Connection,
+    outside_a_transaction: bool,
+    error: DbError,
+) -> DbError {
+    if !outside_a_transaction || connection.is_autocommit() {
+        return error;
+    }
+
+    let outcome = match connection.execute_batch("ROLLBACK") {
+        Ok(()) => "The transaction the batch opened was rolled back; nothing it wrote remains."
+            .to_string(),
+        Err(failure) => format!(
+            "The transaction the batch opened is still open: the rollback failed too. {}",
+            describe(&failure)
+        ),
+    };
+    DbError {
+        message: format!("{}\n\n{outcome}", error.message),
+        position: error.position,
+    }
+}
+
 /// Prefer SQLite's own message. The driver wraps it in a variant name that adds
 /// nothing a user would read.
 fn describe(error: &rusqlite::Error) -> String {
@@ -831,6 +877,35 @@ mod tests {
 
         assert!(error.message.contains("no_such_relation"), "{error}");
         assert_eq!(error.position, None);
+    }
+
+    #[test]
+    fn a_bracketed_batch_that_fails_part_way_rolls_back_and_says_so() {
+        // The brackets make the batch all-or-nothing; without the rollback they
+        // make a third state instead — the write uncommitted but visible to the
+        // next statement on the same connection, which is the refresh that
+        // renders the failure as a success.
+        let connection = memory(ACCOUNTS);
+        let error = connection
+            .query(
+                "BEGIN;\n                 UPDATE accounts SET name = 'Changed' WHERE id = 1;\n                 UPDATE no_such_relation SET name = 'Changed';\n                 COMMIT;",
+            )
+            .unwrap_err();
+
+        assert!(error.message.contains("no_such_relation"), "{error}");
+        assert!(error.message.contains("rolled back"), "{error}");
+        assert!(
+            connection
+                .connection
+                .lock()
+                .expect("the connection should not be poisoned")
+                .is_autocommit()
+        );
+
+        let after = connection
+            .query("SELECT name FROM accounts WHERE id = 1")
+            .expect("the connection should still be usable");
+        assert_eq!(after.rows, vec![vec![Some("Ada".to_string())]]);
     }
 
     #[test]
