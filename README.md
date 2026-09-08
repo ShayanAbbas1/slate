@@ -38,6 +38,9 @@ mysql://slate:slate@127.0.0.1:53306/slate_dev
 `PG*` environment variables still configure a Postgres profile at startup and
 are not generalised — Slate is a generic client, not a generic environment
 reader, and the other two engines have no such convention to read.
+`PGPASSWORD` is used for that session and nothing more: a profile the
+environment made gets no Keychain entry, because a variable set in a shell is
+not a credential anyone asked Slate to keep.
 
 ```sh
 PGHOST=127.0.0.1 PGPORT=55432 PGDATABASE=slate_dev \

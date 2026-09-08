@@ -722,6 +722,11 @@ impl ConnectionForm {
         });
 
         Self {
+            // The form is the whole window on a first launch, and a window
+            // with nothing focused has no dispatch path -- every binding is
+            // dead until a field is clicked. So the field the user is meant to
+            // start in asks for focus the moment it is mounted.
+            needs_focus: Some(url.clone()),
             url,
             engine: config.map(ConnectionConfig::engine).unwrap_or_default(),
             name,
@@ -733,7 +738,6 @@ impl ConnectionForm {
             password,
             sslmode: server.map(|server| server.sslmode).unwrap_or_default(),
             root_certificate,
-            needs_focus: None,
             error: None,
         }
     }
@@ -909,7 +913,7 @@ impl Workspace {
                     Some(index) => index,
                     None => {
                         let name = default_profile_name(&config);
-                        workspace.create_profile(name, config, window, cx)
+                        workspace.create_profile(name, config, Origin::Environment, window, cx)
                     }
                 };
                 // The environment picked the profile, so it is the one to come
@@ -1130,6 +1134,7 @@ impl Workspace {
         &mut self,
         name: String,
         config: ConnectionConfig,
+        origin: Origin,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> usize {
@@ -1147,9 +1152,7 @@ impl Workspace {
             window,
             cx,
         );
-        // A file engine has no password, so it gets no Keychain entry at all
-        // rather than an empty one nothing will ever read.
-        let password = config.server().map(|server| server.password.clone());
+        let password = password_to_persist(&config, origin).map(str::to_string);
         self.profiles.push(Profile {
             id: id.clone(),
             name,
@@ -1332,7 +1335,7 @@ impl Workspace {
         };
 
         self.form = None;
-        let index = self.create_profile(name, config, window, cx);
+        let index = self.create_profile(name, config, Origin::Form, window, cx);
         self.activate(index, cx);
     }
 
@@ -3242,9 +3245,24 @@ impl Workspace {
                             .child(message)
                     }))
                     .child(
-                        button("connect", "Connect", Tone::Primary, Control::Standard, t)
-                            .w_full()
-                            .on_click(cx.listener(Self::connect)),
+                        div()
+                            .flex()
+                            .gap(px(layout::SPACE_SM))
+                            // `escape` is the other way out, and on the first
+                            // launch there is nowhere to back out to: the form
+                            // is the whole application until a profile exists.
+                            .children((!self.profiles.is_empty()).then(|| {
+                                button("cancel", "Cancel", Tone::Quiet, Control::Standard, t)
+                                    .flex_1()
+                                    .on_click(cx.listener(|workspace, _, window, cx| {
+                                        workspace.show_editor(&ShowEditor, window, cx);
+                                    }))
+                            }))
+                            .child(
+                                button("connect", "Connect", Tone::Primary, Control::Standard, t)
+                                    .flex_1()
+                                    .on_click(cx.listener(Self::connect)),
+                            ),
                     ),
             )
     }
@@ -3877,6 +3895,10 @@ impl Render for Workspace {
             return div()
                 .id("connection-form")
                 .size_full()
+                // The floor under the focus, the same one the workspace root
+                // has: without it the form's bindings dispatch nowhere the
+                // moment no field holds focus.
+                .track_focus(&self.focus)
                 // Chrome, so the form's card is the raised plane on it.
                 .text_color(t.text)
                 .text_size(px(layout::TEXT_MD))
@@ -4563,6 +4585,31 @@ fn result_pane_is_expanded(query: &QueryState) -> bool {
     !matches!(query, QueryState::Idle)
 }
 
+/// Where a profile's connection details came from, which is what decides
+/// whether its password is a saved credential.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Origin {
+    Environment,
+    Form,
+}
+
+/// The password that earns a Keychain entry, if any.
+///
+/// A file engine has none. A blank one is valid and never warned about, but an
+/// empty Keychain item records nothing and is not written. And a password read
+/// out of the environment is ephemeral by the convention that put it there --
+/// copying it into the login Keychain would outlive the shell that set it, and
+/// the session it belongs to already holds it in the config.
+fn password_to_persist(config: &ConnectionConfig, origin: Origin) -> Option<&str> {
+    if origin == Origin::Environment {
+        return None;
+    }
+    config
+        .server()
+        .map(|server| server.password.as_str())
+        .filter(|password| !password.is_empty())
+}
+
 fn connection_config_from_environment() -> Result<Option<ConnectionConfig>, String> {
     let host = std::env::var("PGHOST").ok();
     let port = std::env::var("PGPORT").ok();
@@ -4624,7 +4671,48 @@ fn connection_config_from_environment() -> Result<Option<ConnectionConfig>, Stri
     })))
 }
 
+/// Where a panic goes when nobody is watching stderr. A `.app` is spawned by
+/// launchd, so a panic message lands in the unified log and the abort that
+/// follows writes an `.ips` trace that does not carry it -- every stranger's
+/// bug report would read "it closed" with nothing to read after it. Installed
+/// first thing in `main`, because the deaths hardest to guess at from outside
+/// are the ones before a window exists.
+///
+/// ponytail: one appended file, never rotated. A few kilobytes per crash; if
+/// that ever becomes a real number, truncate on open past some size.
+fn install_panic_log() {
+    let Some(home) = std::env::var_os("HOME").filter(|home| !home.is_empty()) else {
+        return;
+    };
+    let directory = PathBuf::from(home).join("Library/Logs/Slate");
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        // Nothing in here may panic: a panic inside the hook aborts with less
+        // to read than the one it was called for. Hence every result dropped
+        // rather than unwrapped.
+        use std::io::Write as _;
+        let at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|since| since.as_secs())
+            .unwrap_or_default();
+        if std::fs::create_dir_all(&directory).is_ok()
+            && let Ok(mut file) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(directory.join("panic.log"))
+        {
+            let _ = writeln!(
+                file,
+                "--- {at} (unix seconds)\n{info}\n{}",
+                std::backtrace::Backtrace::force_capture()
+            );
+        }
+        previous(info);
+    }));
+}
+
 fn main() {
+    install_panic_log();
     Application::new().with_assets(Icons).run(|cx: &mut App| {
         cx.text_system()
             .add_fonts(
@@ -4709,6 +4797,20 @@ fn main() {
         })
         .expect("failed to open window");
 
+        // Slate has one window and no way to open a second: with it closed the
+        // Dock icon is inert and the menu offers only Quit, which is an
+        // application nobody can get back into. Quitting is the way back --
+        // clicking the dead icon then launches Slate again, restoring the
+        // profiles and the buffers `Workspace::on_release` has just written.
+        // Reopening a window here would have to rebuild that same state anyway,
+        // and would keep a process alive that is holding nothing.
+        cx.on_window_closed(|cx| {
+            if cx.windows().is_empty() {
+                cx.quit();
+            }
+        })
+        .detach();
+
         cx.activate(true);
     });
 }
@@ -4744,6 +4846,38 @@ mod tests {
         assert_eq!(
             close_target(Tab::Object(3), Some("daily")),
             Some(CloseTarget::Object(3))
+        );
+    }
+
+    #[test]
+    fn the_environment_password_is_never_copied_into_the_keychain() {
+        let server = |password: &str| ServerConfig {
+            host: "db.example".to_string(),
+            port: None,
+            database: "app".to_string(),
+            user: "slate".to_string(),
+            password: password.to_string(),
+            sslmode: SslMode::default(),
+            root_certificate: None,
+        };
+        let typed = ConnectionConfig::Postgres(server("hunter2"));
+        assert_eq!(password_to_persist(&typed, Origin::Form), Some("hunter2"));
+        // `PGPASSWORD` belongs to the shell that set it.
+        assert_eq!(password_to_persist(&typed, Origin::Environment), None);
+        // Blank is a valid password; an empty keychain item is not how one is
+        // recorded.
+        assert_eq!(
+            password_to_persist(&ConnectionConfig::MySql(server("")), Origin::Form),
+            None
+        );
+        assert_eq!(
+            password_to_persist(
+                &ConnectionConfig::Sqlite {
+                    path: "/tmp/slate.db".to_string()
+                },
+                Origin::Form
+            ),
+            None
         );
     }
 
