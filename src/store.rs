@@ -53,6 +53,11 @@ pub struct StoredProfile {
     /// reads back as the default -- which is what it was showing.
     #[serde(default)]
     pub editor_font_size: Option<f32>,
+    /// Seconds a statement may run before the engine stops it, or 0 / absent
+    /// for no limit. Absent is a profile written before the field existed, and
+    /// no limit is exactly what it was running with.
+    #[serde(default)]
+    pub statement_timeout: Option<u32>,
     #[serde(default)]
     pub open_query: Option<String>,
     #[serde(default)]
@@ -402,6 +407,7 @@ mod tests {
             engine: Some("postgres".into()),
             path: None,
             editor_font_size: Some(16.0),
+            statement_timeout: Some(30),
             open_query: Some("daily".into()),
             open_objects: vec![
                 StoredObject {
@@ -458,6 +464,8 @@ open_objects = []
         assert_eq!(profile.editor_font_size, None);
         assert_eq!(profile.root_certificate, None);
         assert_eq!(profile.open_query, None);
+        // No limit, which is what it was running with.
+        assert_eq!(profile.statement_timeout, None);
     }
 
     #[test]
@@ -477,6 +485,7 @@ open_objects = []
             engine: Some("sqlite".into()),
             path: Some("/Users/dev/slate_dev.db".into()),
             editor_font_size: Some(14.0),
+            statement_timeout: None,
             open_query: None,
             open_objects: vec![StoredObject {
                 schema: "main".into(),
@@ -540,6 +549,7 @@ open_objects = []
             engine: Some("sqlite".into()),
             path: Some("/tmp/dev.sqlite".into()),
             editor_font_size: None,
+            statement_timeout: Some(30),
             open_query: None,
             open_objects: vec![StoredObject {
                 schema: "main".into(),
@@ -555,6 +565,9 @@ open_objects = []
         .expect("profile must encode");
 
         let engine_at = text.find("engine = ").expect("engine must be written");
+        let timeout_at = text
+            .find("statement_timeout = ")
+            .expect("statement_timeout must be written");
         let path_at = text.find("path = ").expect("path must be written");
         let open_objects_at = text
             .find("[[profiles.open_objects]]")
@@ -567,6 +580,10 @@ open_objects = []
         assert!(
             path_at < open_objects_at,
             "path after open_objects:\n{text}"
+        );
+        assert!(
+            timeout_at < open_objects_at,
+            "statement_timeout after open_objects:\n{text}"
         );
     }
 

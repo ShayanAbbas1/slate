@@ -246,7 +246,49 @@ pub fn config_from_url(url: &str) -> Result<ServerConfig, String> {
             .unwrap_or_default(),
         sslmode,
         root_certificate,
+        // A URL has nowhere to say it; the form is where it is set.
+        statement_timeout: 0,
     })
+}
+
+/// One socket to the server: the connection a profile keeps, and the throwaway
+/// one a cancel opens.
+fn connect(server: &ServerConfig) -> Result<Conn, DbError> {
+    let options = || {
+        let builder = OptsBuilder::new()
+            .ip_or_hostname(Some(server.host.clone()))
+            .tcp_port(server.port.unwrap_or(DEFAULT_PORT))
+            .db_name(Some(server.database.clone()))
+            .user(Some(server.user.clone()))
+            // Offered only when there is one. An empty password is not the
+            // same as no password, and IAM auth relies on the latter.
+            .pass((!server.password.is_empty()).then(|| server.password.clone()))
+            .tcp_connect_timeout(Some(Duration::from_secs(CONNECT_TIMEOUT_SECONDS)));
+        match server.statement_timeout {
+            0 => builder,
+            // Run once at connect as a session default, never spliced into the
+            // user's own submission — see `ServerConfig::statement_timeout` for
+            // what this does and does not bound. `max_execution_time` counts
+            // milliseconds, and a server too old to know the variable fails the
+            // connect here rather than the statement later.
+            seconds => builder.init(vec![format!(
+                "SET SESSION max_execution_time = {}",
+                u64::from(seconds) * 1_000
+            )]),
+        }
+    };
+
+    match Conn::new(options().ssl_opts(ssl_options(server))) {
+        Ok(connection) => Ok(connection),
+        // `prefer` is the one rung where a weaker connection is reachable, and
+        // reaching it is what the word means. The driver cannot say "encrypt if
+        // you can" in one attempt, so this is two — which is what libpq's own
+        // `prefer` amounts to. No other mode falls back.
+        Err(_) if server.sslmode == SslMode::Prefer => {
+            Conn::new(options().ssl_opts(None)).map_err(|error| connect_error(&error, server))
+        }
+        Err(error) => Err(connect_error(&error, server)),
+    }
 }
 
 /// A live connection. Cloneable so a background task can take one without
@@ -258,36 +300,47 @@ pub fn config_from_url(url: &str) -> Result<ServerConfig, String> {
 #[derive(Clone)]
 pub struct Connection {
     connection: Arc<Mutex<Conn>>,
+    /// Read in `open`, off the connection, before it goes behind the mutex —
+    /// see [`super::Connection::cancel`]. The crate offers no cancel API at
+    /// all, so stopping a statement means telling the server to over a second
+    /// socket, and the server knows this session by its number.
+    connection_id: u32,
+    /// The credentials that second socket is opened with, resolved, which the
+    /// config a profile holds above is not. Keeping the password here changes
+    /// nothing materially — the driver is holding the same one in the live
+    /// connection's own options, in this process — and it is kept here rather
+    /// than asked for from above because nothing above `src/db/` may learn that
+    /// MySQL is the engine needing a second socket (AGENTS.md, hard rule 4).
+    server: ServerConfig,
 }
 
 impl Connection {
     pub fn open(server: &ServerConfig) -> Result<Self, DbError> {
-        let options = || {
-            OptsBuilder::new()
-                .ip_or_hostname(Some(server.host.clone()))
-                .tcp_port(server.port.unwrap_or(DEFAULT_PORT))
-                .db_name(Some(server.database.clone()))
-                .user(Some(server.user.clone()))
-                // Offered only when there is one. An empty password is not the
-                // same as no password, and IAM auth relies on the latter.
-                .pass((!server.password.is_empty()).then(|| server.password.clone()))
-                .tcp_connect_timeout(Some(Duration::from_secs(CONNECT_TIMEOUT_SECONDS)))
-        };
-
-        let connection = match Conn::new(options().ssl_opts(ssl_options(server))) {
-            Ok(connection) => connection,
-            // `prefer` is the one rung where a weaker connection is reachable,
-            // and reaching it is what the word means. The driver cannot say
-            // "encrypt if you can" in one attempt, so this is two — which is
-            // what libpq's own `prefer` amounts to. No other mode falls back.
-            Err(_) if server.sslmode == SslMode::Prefer => Conn::new(options().ssl_opts(None))
-                .map_err(|error| connect_error(&error, server))?,
-            Err(error) => return Err(connect_error(&error, server)),
-        };
+        let connection = connect(server)?;
 
         Ok(Self {
+            connection_id: connection.connection_id(),
+            server: server.clone(),
             connection: Arc::new(Mutex::new(connection)),
         })
+    }
+
+    /// `KILL QUERY` over a connection of its own, because the connection being
+    /// stopped is busy holding the mutex. It ends the statement and not the
+    /// session, so the user's transaction and temporary tables survive it.
+    ///
+    /// Opening a whole connection to send one statement is what a driver with
+    /// no cancel API costs; there is no cheaper channel to the server. Socket
+    /// timeouts are not the alternative they look like — they abandon the
+    /// client while the server keeps grinding.
+    pub fn cancel(&self) -> Result<(), DbError> {
+        let mut connection = connect(&self.server)?;
+        connection
+            .query_drop(format!("KILL QUERY {}", self.connection_id))
+            .map_err(|error| DbError {
+                message: format!("Could not ask the server to cancel: {error}"),
+                position: None,
+            })
     }
 
     /// Run one statement verbatim.
@@ -821,6 +874,7 @@ mod tests {
                 password: "pa ss".into(),
                 sslmode: SslMode::default(),
                 root_certificate: None,
+                statement_timeout: 0,
             }
         );
         assert_eq!(
@@ -992,6 +1046,60 @@ mod tests {
     ///
     /// Hard rule 7 in code, and the mode the connection form actually defaults
     /// to. `prefer` and `require` promise encryption and no more, so a
+    #[test]
+    #[ignore = "requires the repository development database configured through SLATE_MYSQL_URL"]
+    fn live_a_cancel_stops_a_sleeping_statement_without_closing_the_session() {
+        // The connection id has to have been read in `open`: asking the live
+        // connection for it here would want the mutex the sleeping statement is
+        // holding, and this would hang rather than fail.
+        let connection = live();
+        let canceller = connection.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(500));
+            canceller.cancel().expect("the KILL QUERY should send");
+        });
+
+        let error = connection
+            .query("SELECT SLEEP(30)")
+            .expect_err("the statement should be cancelled");
+        assert!(
+            error.message.contains("interrupt"),
+            "the server's own words: {}",
+            error.message
+        );
+        // `KILL QUERY` ends the statement, not the session.
+        assert!(connection.query("SELECT 1").is_ok());
+    }
+
+    #[test]
+    #[ignore = "requires the repository development database configured through SLATE_MYSQL_URL"]
+    fn live_a_statement_timeout_bounds_a_select_and_nothing_else() {
+        let url = std::env::var("SLATE_MYSQL_URL").expect("SLATE_MYSQL_URL is required");
+        let config = config_from_url(&url).expect("SLATE_MYSQL_URL should parse");
+        let connection = Connection::open(&ServerConfig {
+            sslmode: SslMode::Disable,
+            statement_timeout: 1,
+            ..config
+        })
+        .expect("connection should open");
+
+        let error = connection
+            .query("SELECT SLEEP(30)")
+            .expect_err("a read-only SELECT should time out");
+        assert!(error.message.contains("exceeded"), "{}", error.message);
+
+        // The asymmetry `ServerConfig::statement_timeout` names: the same wait
+        // inside a statement that writes is not bounded at all, and Cancel is
+        // the only thing that reaches it.
+        assert!(
+            connection
+                .query("DO SLEEP(2)")
+                .expect("a non-SELECT is not bounded")
+                .rows
+                .is_empty()
+        );
+    }
+
     /// certificate they cannot check is not their business. The two verifying
     /// rungs refuse it and say TLS was the reason, rather than quietly
     /// connecting anyway.

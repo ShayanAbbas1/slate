@@ -198,6 +198,22 @@ Decided, recorded in the multi-engine spec, and not to be re-litigated:
   in an earlier run is theirs to finish. SQLite asks `is_autocommit` before and
   after; MySQL cannot, because the driver keeps the server's
   `SERVER_STATUS_IN_TRANS` flag private, so it reads the submitted text instead.
+- **A statement timeout is one number per profile, applied at connect**, and
+  each engine buys something different with it. Postgres's `statement_timeout`
+  bounds any statement; MySQL's `max_execution_time` bounds read-only `SELECT`s
+  only, so a runaway `UPDATE` or `ALTER` there is Cancel's problem alone, and a
+  server older than 5.7.8 (or MariaDB, which spells it differently) fails the
+  connect rather than the statement; SQLite has no such setting and gets a
+  wall-clock timer firing `sqlite3_interrupt`, which counts waiting on a lock
+  the same as scanning. It goes in at connect and never into the user's
+  submission — hard rule 1, and on Postgres a `SET` inside their submission
+  would be scoped to the implicit transaction around it. It therefore bounds
+  Slate's own catalog and structure queries too, which is intended.
+- **Cancel reaches the running statement and nothing queued behind it.** The
+  handle it needs — Postgres's `CancelToken`, MySQL's connection id, SQLite's
+  `InterruptHandle` — is captured in each engine's `open`, before the client
+  goes behind the connection mutex, because the statement being cancelled is
+  holding that mutex. `Connection::cancel` takes `&self` and locks nothing.
 - **`CHECK` constraints are absent** from the Structure tab on MySQL and SQLite.
   SQLite keeps them only in the `CREATE TABLE` text; MySQL's
   `information_schema.CHECK_CONSTRAINTS` only exists from 8.0.16.

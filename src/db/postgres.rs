@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use geozero::{CoordDimensions, ToWkt, wkb::Ewkb};
-use postgres::{Client, NoTls, SimpleQueryMessage, config::Host};
+use postgres::{CancelToken, Client, NoTls, SimpleQueryMessage, config::Host};
 
 use crate::tls;
 
@@ -232,6 +232,8 @@ pub fn config_from_url(url: &str) -> Result<ServerConfig, String> {
         password,
         sslmode,
         root_certificate,
+        // A URL has nowhere to say it; the form is where it is set.
+        statement_timeout: 0,
     })
 }
 
@@ -260,6 +262,21 @@ fn connection_string(server: &ServerConfig) -> String {
     // that resolves but drops packets pins the UI in "Connecting…" for
     // minutes with no cancel.
     parts.push(format!("connect_timeout={CONNECT_TIMEOUT_SECONDS}"));
+    if server.statement_timeout > 0 {
+        // A session default set once, here, rather than a `SET` prepended to
+        // the user's submission -- see `ServerConfig::statement_timeout`. It
+        // rides in as a startup option because `options` is the only channel
+        // libpq has for one, and nothing collides with it: Slate's URL parser
+        // has no `options` field, so a user-supplied one never reaches here.
+        // `statement_timeout` counts milliseconds when given a bare number.
+        parts.push(format!(
+            "options={}",
+            quote(&format!(
+                "-c statement_timeout={}",
+                u64::from(server.statement_timeout) * 1_000
+            ))
+        ));
+    }
     parts.join(" ")
 }
 
@@ -277,6 +294,15 @@ fn quote(value: &str) -> String {
 #[derive(Clone)]
 pub struct Connection {
     client: Arc<Mutex<Client>>,
+    /// Taken in `open`, off the client, before it goes behind the mutex -- see
+    /// [`super::Connection::cancel`]. It is plain data (address, backend PID,
+    /// secret key), so it holds no connection open and needs no password: the
+    /// cancel opens its own throwaway socket.
+    cancel: CancelToken,
+    /// The same connector the client was built with, because cancelling opens a
+    /// second socket to the same server and an `sslmode` is never quietly
+    /// weakened for it either (AGENTS.md, hard rule 7).
+    connector: Option<tls::MakeRustlsConnect>,
 }
 
 impl Connection {
@@ -290,14 +316,32 @@ impl Connection {
                 position: None,
             })?;
         let string = connection_string(server);
-        let client = match connector {
+        let client = match &connector {
             None => Client::connect(&string, NoTls),
-            Some(connector) => Client::connect(&string, connector),
+            Some(connector) => Client::connect(&string, connector.clone()),
         }
         .map_err(|error| connect_error(&error, server))?;
 
         Ok(Self {
+            cancel: client.cancel_token(),
+            connector,
             client: Arc::new(Mutex::new(client)),
+        })
+    }
+
+    /// Cancellation is advisory and racy by the driver's own admission: the
+    /// server reports nothing about whether the request landed, and it may
+    /// arrive after the statement has already finished. So `Ok` here means the
+    /// request was delivered, never that anything stopped -- what the query
+    /// eventually returned is the only account Slate gives of that.
+    pub fn cancel(&self) -> Result<(), DbError> {
+        match &self.connector {
+            None => self.cancel.cancel_query(NoTls),
+            Some(connector) => self.cancel.cancel_query(connector.clone()),
+        }
+        .map_err(|error| DbError {
+            message: format!("Could not ask the server to cancel: {error}"),
+            position: None,
         })
     }
 
@@ -797,6 +841,7 @@ mod tests {
             password: String::new(),
             sslmode: SslMode::default(),
             root_certificate: None,
+            statement_timeout: 0,
         }
     }
 
@@ -814,6 +859,7 @@ mod tests {
             // place a plaintext connection is the point.
             sslmode: SslMode::Disable,
             root_certificate: None,
+            statement_timeout: 0,
         }
     }
 
@@ -868,6 +914,27 @@ mod tests {
             "host='db.example.test' dbname='slate_test' user='someone' port=8432 \
              sslmode=prefer connect_timeout=10"
         );
+    }
+
+    #[test]
+    fn statement_timeout_rides_in_as_a_startup_option_in_milliseconds() {
+        let config = ServerConfig {
+            statement_timeout: 30,
+            ..config()
+        };
+        assert!(
+            connection_string(&config).contains("options='-c statement_timeout=30000'"),
+            "{}",
+            connection_string(&config)
+        );
+    }
+
+    #[test]
+    fn no_statement_timeout_says_nothing_rather_than_saying_zero() {
+        // `statement_timeout=0` is how Postgres spells "no limit", so either
+        // would work -- but a profile that never asked for one should connect
+        // with exactly the string it connected with before the field existed.
+        assert!(!connection_string(&config()).contains("options"));
     }
 
     #[test]
@@ -933,6 +1000,7 @@ mod tests {
                 password: String::new(),
                 sslmode: SslMode::default(),
                 root_certificate: None,
+                statement_timeout: 0,
             }
         );
     }
@@ -1282,6 +1350,45 @@ mod tests {
                 error.message
             );
         }
+    }
+
+    #[test]
+    #[ignore = "requires a local Postgres server configured through PG*"]
+    fn live_a_cancel_stops_a_sleeping_statement_without_closing_the_connection() {
+        // The handle has to have been taken in `open`: asking the client for a
+        // cancel token here would want the mutex the sleeping statement is
+        // holding, and this would hang rather than fail.
+        let connection = Connection::open(&live_config()).expect("connection should open");
+        let canceller = connection.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(500));
+            canceller.cancel().expect("the cancel request should send");
+        });
+
+        let error = connection
+            .query("SELECT pg_sleep(30)")
+            .expect_err("the statement should be cancelled");
+        assert!(
+            error.message.contains("cancel"),
+            "the server's own words: {}",
+            error.message
+        );
+        assert!(connection.query("SELECT 1").is_ok());
+    }
+
+    #[test]
+    #[ignore = "requires a local Postgres server configured through PG*"]
+    fn live_a_statement_timeout_stops_a_statement_that_outlasts_it() {
+        let connection = Connection::open(&ServerConfig {
+            statement_timeout: 1,
+            ..live_config()
+        })
+        .expect("connection should open");
+
+        let error = connection
+            .query("SELECT pg_sleep(30)")
+            .expect_err("the statement should time out");
+        assert!(error.message.contains("timeout"), "{}", error.message);
     }
 
     #[test]

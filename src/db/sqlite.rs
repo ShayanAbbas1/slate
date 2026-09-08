@@ -16,12 +16,13 @@
 
 use std::collections::HashSet;
 use std::path::Path;
+use std::sync::mpsc::{RecvTimeoutError, Sender, channel};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use rusqlite::fallible_iterator::FallibleIterator;
 use rusqlite::types::ValueRef;
-use rusqlite::{Batch, OpenFlags};
+use rusqlite::{Batch, InterruptHandle, OpenFlags};
 
 use super::{
     Catalog, Cell, Column, DbError, EditTarget, Engine, NamedDefinition, QueryResult, Structure,
@@ -60,10 +61,18 @@ pub fn path_from_url(url: &str) -> Result<String, String> {
 #[derive(Clone)]
 pub struct Connection {
     connection: Arc<Mutex<rusqlite::Connection>>,
+    /// Taken in `open`, off the connection, before it goes behind the mutex —
+    /// see [`super::Connection::cancel`]. `sqlite3_interrupt` is documented
+    /// safe to call from another thread, which is why `SQLITE_OPEN_NO_MUTEX`
+    /// below is no obstacle to it and stays.
+    interrupt: Arc<InterruptHandle>,
+    /// The profile's statement timeout. SQLite has no such setting, so this is
+    /// a wall-clock timer firing the same interrupt — see `run`.
+    statement_timeout: Option<Duration>,
 }
 
 impl Connection {
-    pub fn open(path: &str) -> Result<Self, DbError> {
+    pub fn open(path: &str, statement_timeout: u32) -> Result<Self, DbError> {
         // Deliberately no `SQLITE_OPEN_CREATE`. With it, a mistyped path is an
         // empty database that opens successfully and then reports an empty
         // catalog, which reads as "this database has nothing in it" rather than
@@ -83,9 +92,48 @@ impl Connection {
         )
         .map_err(|error| plain_error(format!("Cannot open {path}: {}", describe(&error))))?;
 
-        Ok(Self {
+        Ok(Self::wrap(connection, statement_timeout))
+    }
+
+    fn wrap(connection: rusqlite::Connection, statement_timeout: u32) -> Self {
+        Self {
+            interrupt: Arc::new(connection.get_interrupt_handle()),
+            statement_timeout: (statement_timeout > 0)
+                .then(|| Duration::from_secs(u64::from(statement_timeout))),
             connection: Arc::new(Mutex::new(connection)),
-        })
+        }
+    }
+
+    /// Interrupting is local and immediate: there is no server to ask, so
+    /// unlike the two client-server engines this cannot fail and cannot race
+    /// with a statement that already finished — `sqlite3_interrupt` on an idle
+    /// connection does nothing.
+    pub fn cancel(&self) -> Result<(), DbError> {
+        self.interrupt.interrupt();
+        Ok(())
+    }
+
+    /// Arms the statement timeout, if the profile has one, until the returned
+    /// sender is dropped.
+    ///
+    /// A thread per statement, parked on a channel that never receives: the
+    /// timer's only job is to outlive the statement or be dropped by it, and
+    /// `recv_timeout` is the stdlib's way to wait for exactly that without
+    /// leaving a thread sleeping out the full timeout after a fast query.
+    ///
+    /// It measures wall clock, not work done, because that is all a timer
+    /// outside SQLite can see: a statement parked on a locked database is
+    /// stopped as readily as one scanning a table.
+    fn deadline(&self) -> Option<Sender<()>> {
+        let limit = self.statement_timeout?;
+        let interrupt = self.interrupt.clone();
+        let (sender, receiver) = channel::<()>();
+        std::thread::spawn(move || {
+            if receiver.recv_timeout(limit) == Err(RecvTimeoutError::Timeout) {
+                interrupt.interrupt();
+            }
+        });
+        Some(sender)
     }
 
     /// Run one statement verbatim.
@@ -104,6 +152,10 @@ impl Connection {
     }
 
     fn run(&self, sql: &str, editable: bool) -> Result<QueryResult, DbError> {
+        // Armed before the lock rather than after it, so time spent queued
+        // behind another statement on this connection counts against the limit
+        // too. Dropped at the end of this call, whichever way it leaves.
+        let _deadline = self.deadline();
         let connection = self.connection.lock().map_err(|_| DbError {
             message: "The connection is unavailable after an earlier internal failure.".into(),
             position: None,
@@ -697,18 +749,60 @@ mod tests {
     /// A connection over a database built in memory. Needs nothing external, so
     /// unlike the `live_` tests below these run everywhere.
     fn memory(setup: &str) -> Connection {
+        memory_with_timeout(setup, 0)
+    }
+
+    fn memory_with_timeout(setup: &str, statement_timeout: u32) -> Connection {
         let connection = rusqlite::Connection::open_in_memory().expect("in-memory should open");
         connection.execute_batch(setup).expect("setup should apply");
-        Connection {
-            connection: Arc::new(Mutex::new(connection)),
-        }
+        Connection::wrap(connection, statement_timeout)
+    }
+
+    /// Runs until something stops it. The recursion has no termination
+    /// condition, which is the shape of the runaway both of these are about.
+    const FOREVER: &str = "
+WITH RECURSIVE forever(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM forever)
+SELECT count(*) FROM forever
+";
+
+    #[test]
+    fn a_cancel_from_another_thread_stops_a_statement_and_leaves_the_connection_usable() {
+        let connection = memory(ACCOUNTS);
+        let canceller = connection.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            canceller.cancel().expect("cancelling cannot fail");
+        });
+
+        let error = connection
+            .query(FOREVER)
+            .expect_err("the statement should be interrupted");
+        assert!(error.message.contains("interrupt"), "{}", error.message);
+
+        // The interrupt ends the statement, not the connection. A cancel that
+        // left the profile dead would be worse than the runaway.
+        let rows = connection
+            .query("SELECT count(*) FROM accounts")
+            .expect("the connection should still work")
+            .rows;
+        assert_eq!(rows, vec![vec![Some("2".to_string())]]);
+    }
+
+    #[test]
+    fn a_statement_timeout_stops_a_runaway_on_its_own() {
+        let connection = memory_with_timeout(ACCOUNTS, 1);
+        let error = connection
+            .query(FOREVER)
+            .expect_err("the statement should time out");
+        assert!(error.message.contains("interrupt"), "{}", error.message);
+        assert!(connection.query("SELECT 1").is_ok());
     }
 
     /// The database the `live_` tests talk to, seeded from
     /// `dev/sqlite/001-slate-demo.sql`.
     fn live() -> Connection {
         let path = std::env::var("SLATE_SQLITE_PATH").expect("SLATE_SQLITE_PATH is required");
-        Connection::open(&path).expect("connection should open")
+        Connection::open(&path, 0).expect("connection should open")
     }
 
     fn names(result: &QueryResult) -> Vec<&str> {
@@ -781,7 +875,7 @@ mod tests {
         let path = std::env::temp_dir().join("slate-absent-database.db");
         let _ = std::fs::remove_file(&path);
 
-        let Err(error) = Connection::open(path.to_str().unwrap()) else {
+        let Err(error) = Connection::open(path.to_str().unwrap(), 0) else {
             panic!("opening a path that is not there must fail");
         };
 

@@ -19,8 +19,9 @@ use gpui_component::{
 };
 
 use crate::{
-    Control, NewQuery, ObjectBody, ObjectTab, Profile, QueryState, RunQuery, SaveQuery,
-    SetRowLimit, StructureState, Tab, Tone, Workspace, button_label, compact_count, db,
+    CancelQuery, Control, NewQuery, ObjectBody, ObjectTab, Profile, QueryState, RunQuery,
+    SaveQuery, SetRowLimit, StructureState, Tab, Tone, Workspace, button, button_label,
+    compact_count, db,
     db::RoutineKind,
     editor_zoom_percent,
     explorer::ROW_LIMITS,
@@ -253,8 +254,28 @@ fn render_results(
             .into_any_element(),
         ),
         // A preview runs the moment its tab is shown, so an idle one is a
-        // tab that is about to run rather than one waiting to be asked.
-        QueryState::Idle | QueryState::Running => centered(quiet_line("Running query…".into())),
+        // tab that is about to run rather than one waiting to be asked. It has
+        // nothing to cancel yet, though, which is the whole difference here.
+        QueryState::Idle => centered(quiet_line("Running query…".into())),
+        QueryState::Running => centered(
+            div()
+                .flex()
+                .flex_col()
+                .items_center()
+                .gap(px(layout::SPACE_MD))
+                .child(quiet_line("Running query…".into()))
+                // A word rather than an icon: a square or a cross beside a
+                // status line reads as "close this", and the quiet tone is what
+                // keeps it from competing with rows that are still coming.
+                .child(
+                    button("cancel-query", "Cancel", Tone::Quiet, Control::Compact, t).on_click(
+                        cx.listener(|workspace, _, window, cx| {
+                            workspace.cancel_query(&CancelQuery, window, cx);
+                        }),
+                    ),
+                )
+                .into_any_element(),
+        ),
         QueryState::Failed(error) => {
             let position = error
                 .position

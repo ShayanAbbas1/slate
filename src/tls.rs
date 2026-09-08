@@ -30,7 +30,7 @@ use rustls::{
     pki_types::{CertificateDer, ServerName, UnixTime},
     server::ParsedCertificate,
 };
-use tokio_postgres_rustls::MakeRustlsConnect;
+pub use tokio_postgres_rustls::MakeRustlsConnect;
 
 /// What a connection asks of TLS, in libpq's vocabulary because that is the
 /// vocabulary every connection string is written in.

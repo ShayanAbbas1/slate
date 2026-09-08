@@ -190,6 +190,29 @@ pub struct ServerConfig {
     /// libpq's `sslrootcert`. Replaces the platform's trust store rather than
     /// adding to it, and only consulted by the two verifying modes.
     pub root_certificate: Option<String>,
+    /// How long a statement may run, in seconds, or 0 for no limit.
+    ///
+    /// A number here and nothing else: how it is expressed is a question each
+    /// engine module answers for itself (AGENTS.md, hard rule 4). What the
+    /// answers cost is worth knowing, because they are not the same bargain:
+    ///
+    /// - Postgres sets `statement_timeout`, which bounds any statement.
+    /// - MySQL sets `max_execution_time`, which bounds **read-only `SELECT`s
+    ///   only** -- a runaway `UPDATE` or `ALTER` runs to completion and Cancel
+    ///   is the only recourse against it. The server has also only had the
+    ///   variable since 5.7.8, and MariaDB spells it differently, so asking for
+    ///   a timeout there fails the connect rather than the statement.
+    /// - SQLite has no such setting and gets a wall-clock timer firing
+    ///   [`Connection::cancel`]'s interrupt instead, so it counts time a
+    ///   statement spent blocked on a lock as readily as time it spent scanning.
+    ///
+    /// Applied once at connect, as a session default, never spliced into the
+    /// user's submission -- rewriting what they typed is hard rule 1, and on
+    /// Postgres a `SET` inside their submission would be scoped to the implicit
+    /// transaction around it and change what their own `BEGIN` means. The other
+    /// side of that: a user who runs their own `SET statement_timeout = 0`
+    /// silently wins for the rest of the session, which is correct.
+    pub statement_timeout: u32,
 }
 
 impl ServerConfig {
@@ -211,7 +234,10 @@ impl ServerConfig {
 pub enum ConnectionConfig {
     Postgres(ServerConfig),
     MySql(ServerConfig),
-    Sqlite { path: String },
+    Sqlite {
+        path: String,
+        statement_timeout: u32,
+    },
 }
 
 impl ConnectionConfig {
@@ -260,7 +286,23 @@ impl ConnectionConfig {
         })? {
             Engine::Postgres => postgres::config_from_url(url).map(Self::Postgres),
             Engine::MySql => mysql::config_from_url(url).map(Self::MySql),
-            Engine::Sqlite => sqlite::path_from_url(url).map(|path| Self::Sqlite { path }),
+            Engine::Sqlite => sqlite::path_from_url(url).map(|path| Self::Sqlite {
+                path,
+                // A URL has nowhere to say it; the form is where it is set.
+                statement_timeout: 0,
+            }),
+        }
+    }
+
+    /// The statement timeout in seconds, or 0 for none. One accessor rather
+    /// than a match at every call site, since no caller above `src/db/` cares
+    /// which variant is carrying it.
+    pub fn statement_timeout(&self) -> u32 {
+        match self {
+            Self::Postgres(server) | Self::MySql(server) => server.statement_timeout,
+            Self::Sqlite {
+                statement_timeout, ..
+            } => *statement_timeout,
         }
     }
 
@@ -268,7 +310,7 @@ impl ConnectionConfig {
     pub fn endpoint(&self) -> String {
         match self {
             Self::Postgres(server) | Self::MySql(server) => server.endpoint(),
-            Self::Sqlite { path } => path.clone(),
+            Self::Sqlite { path, .. } => path.clone(),
         }
     }
 }
@@ -289,7 +331,10 @@ impl Connection {
                 postgres::Connection::open(&server).map(Self::Postgres)
             }
             ConnectionConfig::MySql(server) => mysql::Connection::open(&server).map(Self::MySql),
-            ConnectionConfig::Sqlite { path } => sqlite::Connection::open(&path).map(Self::Sqlite),
+            ConnectionConfig::Sqlite {
+                path,
+                statement_timeout,
+            } => sqlite::Connection::open(&path, statement_timeout).map(Self::Sqlite),
         }
     }
 
@@ -319,6 +364,33 @@ impl Connection {
             Self::Postgres(connection) => connection.structure(schema, relation),
             Self::MySql(connection) => connection.structure(schema, relation),
             Self::Sqlite(connection) => connection.structure(schema, relation),
+        }
+    }
+
+    /// Ask the server to stop whatever this connection is running.
+    ///
+    /// Takes `&self` and touches the connection mutex nowhere, deliberately:
+    /// the runaway statement is holding that mutex, so a cancel that waited for
+    /// it would deadlock against the very query it exists to stop. Every handle
+    /// this needs is therefore taken in each engine's `open`, off the client,
+    /// before the client is moved in behind the mutex.
+    ///
+    /// There is no cancelled state anywhere above this: a stopped statement
+    /// comes back out of [`Connection::query`] as an ordinary `Err` carrying the
+    /// server's own words, which is a truer account than Slate could write.
+    ///
+    /// What it cannot do. It reaches only the statement running on *this*
+    /// connection, so a catalog or structure load queued behind it on the same
+    /// mutex is untouched -- the profile is still frozen until the running
+    /// statement lets go. And it is the *slow* runaway it helps with, not the
+    /// fat one: Postgres buffers a whole result set before Slate sees a row, so
+    /// a query already returning gigabytes is past the point where stopping the
+    /// server helps.
+    pub fn cancel(&self) -> Result<(), DbError> {
+        match self {
+            Self::Postgres(connection) => connection.cancel(),
+            Self::MySql(connection) => connection.cancel(),
+            Self::Sqlite(connection) => connection.cancel(),
         }
     }
 }
@@ -659,7 +731,8 @@ mod tests {
         assert_eq!(
             ConnectionConfig::from_url("sqlite:///tmp/slate.db").unwrap(),
             ConnectionConfig::Sqlite {
-                path: "/tmp/slate.db".into()
+                path: "/tmp/slate.db".into(),
+                statement_timeout: 0
             }
         );
 
@@ -674,7 +747,8 @@ mod tests {
     fn a_sqlite_profile_has_no_server_half_and_a_postgres_one_does() {
         assert!(
             ConnectionConfig::Sqlite {
-                path: "/tmp/slate.db".into()
+                path: "/tmp/slate.db".into(),
+                statement_timeout: 0
             }
             .server()
             .is_none()
@@ -690,7 +764,8 @@ mod tests {
     fn an_endpoint_names_whatever_was_being_talked_to() {
         assert_eq!(
             ConnectionConfig::Sqlite {
-                path: "/tmp/slate.db".into()
+                path: "/tmp/slate.db".into(),
+                statement_timeout: 0
             }
             .endpoint(),
             "/tmp/slate.db"

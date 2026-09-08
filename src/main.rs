@@ -68,6 +68,7 @@ actions!(
     slate,
     [
         RunQuery,
+        CancelQuery,
         ShowEditor,
         CycleTheme,
         SaveQuery,
@@ -163,10 +164,11 @@ impl Profile {
             root_certificate: server.and_then(|server| server.root_certificate.clone()),
             engine: Some(self.config.engine().as_str().to_string()),
             path: match &self.config {
-                ConnectionConfig::Sqlite { path } => Some(path.clone()),
+                ConnectionConfig::Sqlite { path, .. } => Some(path.clone()),
                 _ => None,
             },
             editor_font_size: Some(self.session.editor_font_size),
+            statement_timeout: Some(self.config.statement_timeout()),
             open_query: self.session.open_query.clone(),
             open_objects,
         }
@@ -641,6 +643,9 @@ struct ConnectionForm {
     /// Only reachable while the mode consults one, so the field cannot sit
     /// there filled in and doing nothing.
     root_certificate: Entity<InputState>,
+    /// Seconds, and blank is the same as 0: no limit. Every engine has one, so
+    /// unlike the credential fields it is drawn whichever chip is selected.
+    statement_timeout: Entity<InputState>,
     /// An input to focus once it has been mounted.
     ///
     /// A chip can unmount the field the user was typing in, and a window with
@@ -661,7 +666,7 @@ impl ConnectionForm {
         let value = |value: Option<&str>| value.unwrap_or_default().to_string();
         let server = config.and_then(ConnectionConfig::server);
         let file = match config {
-            Some(ConnectionConfig::Sqlite { path }) => Some(path.as_str()),
+            Some(ConnectionConfig::Sqlite { path, .. }) => Some(path.as_str()),
             _ => None,
         };
 
@@ -720,6 +725,17 @@ impl ConnectionForm {
                     server.and_then(|server| server.root_certificate.as_deref()),
                 ))
         });
+        let statement_timeout = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Seconds (0 for no limit)")
+                .default_value(
+                    config
+                        .map(ConnectionConfig::statement_timeout)
+                        .filter(|seconds| *seconds > 0)
+                        .map(|seconds| seconds.to_string())
+                        .unwrap_or_default(),
+                )
+        });
 
         Self {
             // The form is the whole window on a first launch, and a window
@@ -738,6 +754,7 @@ impl ConnectionForm {
             password,
             sslmode: server.map(|server| server.sslmode).unwrap_or_default(),
             root_certificate,
+            statement_timeout,
             error: None,
         }
     }
@@ -749,19 +766,35 @@ impl ConnectionForm {
             return Err("Display name is required.".into());
         }
 
+        let statement_timeout = self.statement_timeout(cx)?;
         let config = match self.engine {
             Engine::Sqlite => {
                 let path = read(&self.path);
                 if path.is_empty() {
                     return Err("Database file is required.".into());
                 }
-                ConnectionConfig::Sqlite { path }
+                ConnectionConfig::Sqlite {
+                    path,
+                    statement_timeout,
+                }
             }
             Engine::Postgres => ConnectionConfig::Postgres(self.server(cx)?),
             Engine::MySql => ConnectionConfig::MySql(self.server(cx)?),
         };
 
         Ok((name, config))
+    }
+
+    /// Blank is 0 is no limit, so a user who never had an opinion about it is
+    /// not made to have one.
+    fn statement_timeout(&self, cx: &App) -> Result<u32, String> {
+        let value = self.statement_timeout.read(cx).value().trim().to_string();
+        if value.is_empty() {
+            return Ok(0);
+        }
+        value
+            .parse()
+            .map_err(|_| "Statement timeout must be a whole number of seconds.".to_string())
     }
 
     fn server(&self, cx: &App) -> Result<ServerConfig, String> {
@@ -806,6 +839,7 @@ impl ConnectionForm {
             password: self.password.read(cx).unmask_value().to_string(),
             sslmode: self.sslmode,
             root_certificate,
+            statement_timeout: self.statement_timeout(cx)?,
         })
     }
 }
@@ -817,7 +851,7 @@ fn default_profile_name(config: &ConnectionConfig) -> String {
         ConnectionConfig::Postgres(server) | ConnectionConfig::MySql(server) => {
             server.database.clone()
         }
-        ConnectionConfig::Sqlite { path } => file_stem(path).to_string(),
+        ConnectionConfig::Sqlite { path, .. } => file_stem(path).to_string(),
     }
 }
 
@@ -1082,6 +1116,7 @@ impl Workspace {
         let config = match engine {
             Engine::Sqlite => ConnectionConfig::Sqlite {
                 path: stored.path.unwrap_or_default(),
+                statement_timeout: stored.statement_timeout.unwrap_or_default(),
             },
             Engine::Postgres | Engine::MySql => {
                 let server = ServerConfig {
@@ -1093,6 +1128,7 @@ impl Workspace {
                     password: String::new(),
                     sslmode,
                     root_certificate: stored.root_certificate,
+                    statement_timeout: stored.statement_timeout.unwrap_or_default(),
                 };
                 match engine {
                     Engine::MySql => ConnectionConfig::MySql(server),
@@ -1196,7 +1232,7 @@ impl Workspace {
         // throw away a half-typed connection to a different database, which the
         // user never asked to lose by pasting a URL.
         let filled = match &config {
-            ConnectionConfig::Sqlite { path } => vec![
+            ConnectionConfig::Sqlite { path, .. } => vec![
                 (&form.name, default_profile_name(&config)),
                 (&form.path, path.clone()),
             ],
@@ -2136,6 +2172,35 @@ impl Workspace {
                 .active_results()
                 .is_some_and(|results| !results.read(cx).delegate().result().columns.is_empty())
         })
+    }
+
+    /// Ask the server to stop whatever the active profile is running.
+    ///
+    /// Nothing is marked cancelled here. The statement is still in flight until
+    /// the driver returns, and what it returns — rows, or the server's own word
+    /// for having been stopped — is what the surface shows, through the same
+    /// completion every other run goes through.
+    ///
+    /// On the background executor because the Postgres path opens a socket and
+    /// spins a current-thread tokio runtime inside `cancel_query` to do it.
+    /// That is legal for exactly the reason connecting is (AGENTS.md, "Do not
+    /// add tokio"): the runtime belongs to the blocking driver and lives and
+    /// dies on the thread the driver is running on. Nothing tokio-shaped is
+    /// handed to GPUI's executor, which is the thing that panics.
+    fn cancel_query(&mut self, _: &CancelQuery, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(connection) = self.profile().and_then(Profile::connection) else {
+            return;
+        };
+        let cancel_task = cx
+            .background_executor()
+            .spawn(async move { connection.cancel() });
+
+        cx.spawn(async move |workspace, cx| {
+            if let Err(error) = cancel_task.await {
+                _ = workspace.update(cx, |workspace, cx| workspace.note(error.message, cx));
+            }
+        })
+        .detach();
     }
 
     fn run_query(&mut self, _: &RunQuery, window: &mut Window, cx: &mut Context<Self>) {
@@ -3238,6 +3303,11 @@ impl Workspace {
                                 self.form_field("Root certificate", &form.root_certificate, cx)
                             }))
                     }))
+                    // Outside the server block: every engine can stop a
+                    // statement, and this is the only place a profile has to
+                    // say for how long -- there is no settings window and is
+                    // not going to be one.
+                    .child(self.form_field("Statement timeout", &form.statement_timeout, cx))
                     .children(message.map(|message| {
                         div()
                             .text_size(px(layout::TEXT_SM))
@@ -3966,6 +4036,7 @@ impl Render for Workspace {
             // and stops this one from taking it back.
             .track_focus(&self.focus)
             .on_action(cx.listener(Self::run_query))
+            .on_action(cx.listener(Self::cancel_query))
             .on_action(cx.listener(Self::apply_edits))
             .on_action(cx.listener(Self::discard_edits))
             .on_action(cx.listener(Self::sort_column))
@@ -4668,6 +4739,8 @@ fn connection_config_from_environment() -> Result<Option<ConnectionConfig>, Stri
         password: std::env::var("PGPASSWORD").unwrap_or_default(),
         sslmode,
         root_certificate,
+        // No `PG*` variable means it, and Slate is not inventing one.
+        statement_timeout: 0,
     })))
 }
 
@@ -4859,6 +4932,7 @@ mod tests {
             password: password.to_string(),
             sslmode: SslMode::default(),
             root_certificate: None,
+            statement_timeout: 0,
         };
         let typed = ConnectionConfig::Postgres(server("hunter2"));
         assert_eq!(password_to_persist(&typed, Origin::Form), Some("hunter2"));
@@ -4873,7 +4947,8 @@ mod tests {
         assert_eq!(
             password_to_persist(
                 &ConnectionConfig::Sqlite {
-                    path: "/tmp/slate.db".to_string()
+                    path: "/tmp/slate.db".to_string(),
+                    statement_timeout: 0
                 },
                 Origin::Form
             ),
