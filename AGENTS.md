@@ -180,9 +180,22 @@ Decided, recorded in the multi-engine spec, and not to be re-litigated:
   forgetting it is silent: a double-quoted name is a *string literal* in MySQL,
   so `ORDER BY "name"` sorts every row by the same constant with no error.
 - **SQLite brackets a generated multi-row batch** in `BEGIN`/`COMMIT`, because
-  it commits each statement on its own where one Postgres or MySQL submission is
-  atomic. The brackets go in the statement text, never around it invisibly, and
-  `sql::is_generated_update` refuses a transaction it cannot see closed.
+  it commits each statement on its own where a Postgres `simple_query`
+  submission is one implicit transaction. The brackets go in the statement text,
+  never around it invisibly, and `sql::is_generated_update` refuses a
+  transaction it cannot see closed.
+- **MySQL is neither bracketed nor atomic, and this file said it was** until
+  2026-09-08. `query_iter` speaks the text protocol and MySQL autocommits each
+  statement, so a failed multi-row apply leaves every row before the failure
+  written. The engine that gets it decided in a `_ =>` catch-all at
+  `main::update_batch` — rule 4 violated in the one feature that writes to
+  the user's database. Bracketing is a question for `Engine` to answer with
+  three explicit arms, not a call site to guess at.
+- **Nothing rolls back on any engine.** `ROLLBACK` appears nowhere outside
+  tests, so a failed SQLite batch leaves its write transaction open on a
+  long-lived connection. Do not add a rollback to SQLite alone and call it
+  fixed; the bracketing and the rollback are one decision per engine. Findings
+  and fix order in `notes/release-audit-2026-09-08.md` (outside Git).
 - **`CHECK` constraints are absent** from the Structure tab on MySQL and SQLite.
   SQLite keeps them only in the `CREATE TABLE` text; MySQL's
   `information_schema.CHECK_CONSTRAINTS` only exists from 8.0.16.
