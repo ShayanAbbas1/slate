@@ -1055,14 +1055,26 @@ mod tests {
         );
     }
 
-    /// What each mode does against the compose server, which speaks TLS with a
-    /// certificate signed by nobody.
+    /// A statement the server has to work through, rather than one it waits
+    /// out.
     ///
-    /// Hard rule 7 in code, and the mode the connection form actually defaults
-    /// to. `prefer` and `require` promise encryption and no more, so a
+    /// `SELECT SLEEP(n)` is the obvious probe and it is the wrong one:
+    /// `SLEEP()` is documented to return **1 when it is interrupted** rather
+    /// than raising, so a cancelled or timed-out sleep comes back as an
+    /// ordinary one-row result. Both tests below asserted on an error and
+    /// failed against MySQL 8.4 for that reason alone -- the interrupt was
+    /// landing on time, and the probe was swallowing it.
+    ///
+    /// 25 million rows of `SHA2` is real work on real table data, so the server
+    /// is genuinely mid-statement when the interrupt arrives and answers the
+    /// way anything else would. A cartesian `COUNT(*)` is not a substitute:
+    /// the optimizer answers that one from statistics without reading a row.
+    const LIVE_SLOW_SELECT: &str =
+        "SELECT MAX(SHA2(CONCAT(a.id, b.id), 512)) FROM measurements a JOIN measurements b";
+
     #[test]
     #[ignore = "requires the repository development database configured through SLATE_MYSQL_URL"]
-    fn live_a_cancel_stops_a_sleeping_statement_without_closing_the_session() {
+    fn live_a_cancel_stops_a_running_statement_without_closing_the_session() {
         // The connection id has to have been read in `open`: asking the live
         // connection for it here would want the mutex the sleeping statement is
         // holding, and this would hang rather than fail.
@@ -1074,7 +1086,7 @@ mod tests {
         });
 
         let error = connection
-            .query("SELECT SLEEP(30)")
+            .query(LIVE_SLOW_SELECT)
             .expect_err("the statement should be cancelled");
         assert!(
             error.message.contains("interrupt"),
@@ -1098,7 +1110,7 @@ mod tests {
         .expect("connection should open");
 
         let error = connection
-            .query("SELECT SLEEP(30)")
+            .query(LIVE_SLOW_SELECT)
             .expect_err("a read-only SELECT should time out");
         assert!(error.message.contains("exceeded"), "{}", error.message);
 
@@ -1114,6 +1126,11 @@ mod tests {
         );
     }
 
+    /// What each mode does against the compose server, which speaks TLS with a
+    /// certificate signed by nobody.
+    ///
+    /// Hard rule 7 in code, and the mode the connection form actually defaults
+    /// to. `prefer` and `require` promise encryption and no more, so a
     /// certificate they cannot check is not their business. The two verifying
     /// rungs refuse it and say TLS was the reason, rather than quietly
     /// connecting anyway.
