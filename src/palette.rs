@@ -184,6 +184,9 @@ impl ListDelegate for Palette {
         Some(
             ListItem::new(ix.row)
                 .rounded(px(layout::RADIUS_CONTROL))
+                // As in the explorer tree: `ListItem`'s own text size is in
+                // `rems` and would otherwise ignore Slate's type scale.
+                .text_size(px(layout::TEXT_MD))
                 .child(
                     div()
                         .flex()

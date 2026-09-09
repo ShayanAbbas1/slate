@@ -4211,6 +4211,9 @@ impl Workspace {
                         let row = row
                             .mx(px(layout::SPACE_XS))
                             .rounded(px(layout::RADIUS_CONTROL))
+                            // `ListItem` sizes its text in `rems`, which tracks
+                            // the library's 16 rather than Slate's body size.
+                            .text_size(px(layout::TEXT_MD))
                             .pl(px(
                                 layout::SPACE_SM + entry.depth() as f32 * layout::SPACE_MD
                             ))

@@ -650,6 +650,10 @@ impl TableDelegate for ResultGrid {
                         // inside one would read as a control in a hole.
                         .appearance(false)
                         .px_0()
+                        // The cell is the frame, so take its height rather than
+                        // the control's own `rems`-based one, which is sized for
+                        // a standalone field and overflows the row.
+                        .h_full()
                         .text_size(px(layout::TEXT_MD)),
                 )
                 // The input has focus, so both keystrokes arrive here on their

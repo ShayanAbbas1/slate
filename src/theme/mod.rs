@@ -408,7 +408,14 @@ impl Theme {
         component.shadow = false;
         component.radius = gpui::px(layout::RADIUS_CONTROL);
         component.radius_lg = gpui::px(layout::RADIUS_LARGE);
-        component.font_size = gpui::px(layout::TEXT_MD);
+        // `Root` feeds this to `window.set_rem_size`, so it is the unit for
+        // every `rems()` dimension inside gpui-component -- not just a text
+        // size. Slate's own tree never reads it: every `text_size` here is an
+        // absolute `layout::TEXT_*`. Left at the library's 16 so the widgets it
+        // draws for us keep the proportions they were designed at; the
+        // completion popup in particular hardcodes `text_xs()`, which at 13
+        // resolved to a 9.75px row.
+        component.font_size = gpui::px(16.0);
         component.mono_font_size = gpui::px(layout::TEXT_MD);
         component.font_family = fonts.chrome;
         // Kept on the editor's family so that whatever inside gpui-component
@@ -426,6 +433,10 @@ impl Theme {
         component.colors.caret = self.cursor.into();
         component.colors.selection = self.selection.into();
         component.colors.ring = self.accent.into();
+        // Only the completion popup reads this, for the matched prefix of a
+        // suggestion. Left at the library default it is a blue belonging to no
+        // palette Slate ships.
+        component.colors.blue = self.accent.into();
         component.colors.muted = self.surface.into();
         component.colors.muted_foreground = self.text_muted.into();
         component.colors.popover = self.overlay.into();
@@ -444,7 +455,30 @@ impl Theme {
         component.colors.secondary_hover = control_hover.into();
         component.colors.secondary_active = control_active.into();
         // What a ghost button washes with on hover -- the tab pair lives on it.
-        component.colors.accent = self.element_hover.flatten(self.panel).into();
+        // The completion popup's selected row, and the highlight on a
+        // right-click menu item. Was `element_hover` flattened onto `panel`: a
+        // ~5% wash, and computed against the wrong plane, since both of those
+        // surfaces paint on `overlay`. A selected suggestion was therefore
+        // indistinguishable from an unselected one. `selection` is what a
+        // selected row already wears in the explorer tree and the result grid,
+        // so autocomplete now agrees with the rest of Slate.
+        //
+        // A tint rather than the accent at full strength, deliberately: the
+        // popup paints a suggestion's matched prefix in `blue` and its detail
+        // in `muted_foreground` whatever the selection state, so a saturated
+        // fill behind them would win the row and lose the text.
+        // Half strength, and the prefix is what sets it: the popup paints a
+        // suggestion's matched characters in `blue` -- Slate's accent, just
+        // above -- so an accent wash behind them is accent on accent. At full
+        // `selection` that prefix measures 2.65 against the fill in the dark
+        // theme, under the 3.0 floor for UI text; halved it reaches 3.25 while
+        // the fill still steps 13.5 sRGB levels off the popover plane, well
+        // clear of the 8 that `the_three_planes_are_told_apart_at_a_glance`
+        // treats as visible. Graded in
+        // `a_selected_suggestion_is_told_apart_from_an_unselected_one`.
+        let mut selected_row = self.selection;
+        selected_row.a *= 0.5;
+        component.colors.accent = selected_row.into();
         component.colors.accent_foreground = self.text.into();
         component.colors.danger = self.danger.into();
         component.colors.danger_foreground = self.on_accent.into();
@@ -799,6 +833,63 @@ mod tests {
                 theme.panel.relative_luminance() > theme.surface.relative_luminance(),
                 "{}: the editor's page must sit brighter than chrome",
                 theme.name
+            );
+        }
+    }
+
+    #[test]
+    fn a_selected_suggestion_is_told_apart_from_an_unselected_one() {
+        // `gpui-component` derives the completion popup's hover fill from the
+        // same token as its selected fill (`accent.opacity(0.8)` against
+        // `accent`), so the selected row cannot be separated from a hovered one
+        // by background alone. What it can be separated from -- and what was
+        // actually broken -- is the plane it sits on.
+        //
+        // Levels rather than contrast ratio, for the reason spelled out in
+        // `the_three_planes_are_told_apart_at_a_glance`. Glass is graded too
+        // here: unlike a plane-over-plane step, this one is a tint over its own
+        // popover surface, so the wallpaper cancels out.
+        let level = |c: Srgb| (c.r + c.g + c.b) / 3.0 * 255.0;
+        for t in Theme::all() {
+            // Mirrors `apply_to_components`.
+            let mut fill = t.selection;
+            fill.a *= 0.5;
+            let selected = fill.flatten(t.overlay);
+            let step = (level(selected) - level(t.overlay)).abs();
+            assert!(
+                step >= 8.0,
+                "{}: a selected suggestion steps {step:.1} levels off the \
+                 popover plane, which is not a visible selection",
+                t.name
+            );
+
+            // The three things painted over that fill regardless of selection.
+            check(
+                t,
+                "a suggestion on the selected row",
+                t.text,
+                selected,
+                AA_TEXT,
+            );
+            // The owning table or schema, set italic in `muted_foreground`
+            // beside the name. A secondary annotation on a row that is visible
+            // while a key is held, so it is graded as UI text rather than as
+            // body text -- in the dark theme, the worst of the three, it lands
+            // at 4.34 and so clears the body floor for everything but this
+            // token's own strictness.
+            check(
+                t,
+                "a suggestion's detail on the selected row",
+                t.text_muted,
+                selected,
+                AA_LARGE,
+            );
+            check(
+                t,
+                "a matched prefix on the selected row",
+                t.accent,
+                selected,
+                AA_LARGE,
             );
         }
     }
