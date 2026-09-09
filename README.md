@@ -121,4 +121,4 @@ where you can read it, never opened behind your back.
 
 ## License
 
-MIT.
+MIT. See [NOTICES.md](NOTICES.md) for third-party font licenses.

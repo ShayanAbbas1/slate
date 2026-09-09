@@ -24,6 +24,12 @@ rm -rf target/Slate.iconset
 # after its executable, not after CFBundleName.
 cp target/release/slate "$APP/Contents/MacOS/Slate"
 
+# The OFL asks that the licence travel with the fonts, and the fonts are
+# compiled into the binary above -- so the notices ship inside the bundle
+# rather than only sitting in the repository.
+cp NOTICES.md "$APP/Contents/Resources/"
+cp -R licenses "$APP/Contents/Resources/"
+
 # CFBundleIdentifier is what the Keychain scopes saved profile passwords to.
 # Changing it orphans every password already stored.
 cat > "$APP/Contents/Info.plist" <<PLIST
