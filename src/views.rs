@@ -14,8 +14,8 @@ use gpui::{
 use gpui_component::{
     IconName, InteractiveElementExt, Sizable,
     input::{Input, InputState},
-    spinner::Spinner,
     resizable::{resizable_panel, v_resizable},
+    spinner::Spinner,
     table::{Table, TableDelegate, TableState},
 };
 

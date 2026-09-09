@@ -22,7 +22,7 @@ use icondata_core::IconData;
 /// The gpui-component widgets ask for their own paths — those are Lucide names
 /// too, so they resolve here as well. Add a row when something asks for one;
 /// an unlisted path simply draws nothing.
-const ICONS: [(&str, &IconData); 32] = [
+const ICONS: [(&str, &IconData); 33] = [
     ("icons/chevron-down.svg", icondata_lu::LuChevronDown),
     ("icons/chevron-right.svg", icondata_lu::LuChevronRight),
     ("icons/chevron-left.svg", icondata_lu::LuChevronLeft),
@@ -58,6 +58,7 @@ const ICONS: [(&str, &IconData); 32] = [
     ("icons/play.svg", icondata_lu::LuPlay),
     ("icons/square-pen.svg", icondata_lu::LuSquarePen),
     ("icons/history.svg", icondata_lu::LuHistory),
+    ("icons/panel-left.svg", icondata_lu::LuPanelLeft),
 ];
 
 /// Slate's own names for the icons it draws, so a call site names a thing
@@ -66,6 +67,8 @@ pub mod icon {
     pub const CHEVRON_DOWN: &str = "icons/chevron-down.svg";
     pub const CHEVRON_RIGHT: &str = "icons/chevron-right.svg";
     pub const SWITCHER: &str = "icons/chevrons-up-down.svg";
+    /// Folds the explorer column away, and brings it back.
+    pub const SIDEBAR: &str = "icons/panel-left.svg";
     /// A column header's sort state: which way the server ordered the rows, or
     /// that it could be asked to.
     pub const SORT_UP: &str = "icons/sort-ascending.svg";
@@ -149,6 +152,7 @@ mod tests {
             icon::CHEVRON_DOWN,
             icon::CHEVRON_RIGHT,
             icon::SWITCHER,
+            icon::SIDEBAR,
             icon::SORT_UP,
             icon::SORT_DOWN,
             icon::SORTABLE,

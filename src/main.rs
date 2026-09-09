@@ -88,6 +88,7 @@ actions!(
         PaletteNext,
         PalettePrevious,
         CloseTab,
+        ToggleSidebar,
         Quit,
     ]
 );
@@ -99,6 +100,48 @@ const EDITOR_FONT_SIZE_STEP: f32 = 1.0;
 
 /// The platform's window buttons, which Slate positions but does not draw.
 const TRAFFIC_LIGHT_DIAMETER: f32 = 14.0;
+
+/// How far a swipe across the switcher has to travel, in pixels, to be worth
+/// one workspace.
+///
+/// ponytail: a fixed distance rather than velocity tracking. Raise it if a
+/// swipe overshoots into the next connection, lower it if the gesture feels
+/// stuck; momentum would need the whole scroll history, not this one number.
+const SWIPE_STEP: f32 = 60.0;
+
+/// What one line of an inexact scroll is worth in pixels, for a wheel that
+/// reports lines where a trackpad reports pixels.
+const SWIPE_LINE: f32 = 20.0;
+
+/// Folds one scroll event into `travelled`, and says which way to step when
+/// enough of them add up to a swipe.
+///
+/// A gesture that is more vertical than horizontal is ignored rather than
+/// accumulated: the switcher sits under a scrollable tree, and a flick down it
+/// should not land on another connection. The end of a gesture spends whatever
+/// did not reach a step, so two half-swipes in a row are not one whole one.
+fn swipe_step(
+    travelled: &mut f32,
+    delta: gpui::Point<f32>,
+    phase: gpui::TouchPhase,
+) -> Option<isize> {
+    if matches!(phase, gpui::TouchPhase::Ended) {
+        *travelled = 0.0;
+        return None;
+    }
+    if delta.x.abs() <= delta.y.abs() {
+        return None;
+    }
+    *travelled += delta.x;
+    if travelled.abs() < SWIPE_STEP {
+        return None;
+    }
+    // Swiping the row leftwards brings the next workspace in from the right,
+    // so the list moves the way the fingers push it.
+    let step = if *travelled < 0.0 { 1 } else { -1 };
+    *travelled = 0.0;
+    Some(step)
+}
 
 /// A connection and everything it owns.
 ///
@@ -889,6 +932,13 @@ struct Workspace {
     active: usize,
     form: Option<ConnectionForm>,
     switcher_open: bool,
+    /// Whether the explorer column is folded away. Not persisted: a hidden
+    /// sidebar is a thing done for the next minute, not a preference.
+    sidebar_hidden: bool,
+    /// Horizontal swipe over the switcher accumulated since the last step, in
+    /// pixels. One scroll event is a fraction of a gesture, so the step has to
+    /// be saved up rather than fired per event.
+    swipe: f32,
     pending_removal: Option<String>,
     next_generation: u64,
     /// The palette, built from scratch every time it opens. Its rows are a
@@ -908,6 +958,8 @@ impl Workspace {
             active: 0,
             form: None,
             switcher_open: false,
+            sidebar_hidden: false,
+            swipe: 0.0,
             pending_removal: None,
             next_generation: 0,
             palette: None,
@@ -1530,6 +1582,30 @@ impl Workspace {
         self.activate(index, cx);
     }
 
+    /// A horizontal swipe over the switcher, spent one workspace at a time.
+    ///
+    /// The gesture is only read when it is more sideways than vertical, so a
+    /// two-finger scroll that drifts across the row on its way down the tree
+    /// still scrolls rather than switching the connection underneath it.
+    fn swipe_profile(
+        &mut self,
+        delta: gpui::Point<f32>,
+        phase: gpui::TouchPhase,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(step) = swipe_step(&mut self.swipe, delta, phase) {
+            self.cycle_profile(step, cx);
+        }
+    }
+
+    fn toggle_sidebar(&mut self, _: &ToggleSidebar, _: &mut Window, cx: &mut Context<Self>) {
+        self.sidebar_hidden = !self.sidebar_hidden;
+        // A folded sidebar takes the open switcher panel with it: the panel is
+        // anchored to a row that is no longer on screen.
+        self.switcher_open = false;
+        cx.notify();
+    }
+
     fn next_profile(&mut self, _: &NextProfile, _: &mut Window, cx: &mut Context<Self>) {
         self.cycle_profile(1, cx);
     }
@@ -2112,6 +2188,7 @@ impl Workspace {
             Command::SwitchProfile(index) => self.activate(index, cx),
             Command::NewConnection => self.open_connection_form(&NewConnection, window, cx),
             Command::CycleTheme => self.cycle_theme(&CycleTheme, window, cx),
+            Command::ToggleSidebar => self.toggle_sidebar(&ToggleSidebar, window, cx),
             Command::ResetEditorZoom => self.reset_editor_zoom(&ResetEditorZoom, window, cx),
         }
     }
@@ -3729,6 +3806,7 @@ impl Workspace {
             .map(|profile| profile.name.clone())
             .unwrap_or_else(|| "Connections".into());
         let toggle_workspace = workspace.clone();
+        let swipe_workspace = workspace.clone();
 
         div()
             .relative()
@@ -3760,6 +3838,23 @@ impl Workspace {
                             workspace.switcher_open = !workspace.switcher_open;
                             workspace.pending_removal = None;
                             cx.notify();
+                        });
+                    })
+                    // Swiping the row steps between connections, the same move
+                    // the panel above it offers by name -- a database is one to
+                    // a profile, so this row is the whole workspace.
+                    .on_scroll_wheel(move |event, _, cx| {
+                        let delta = match event.delta {
+                            gpui::ScrollDelta::Pixels(delta) => {
+                                gpui::point(f32::from(delta.x), f32::from(delta.y))
+                            }
+                            gpui::ScrollDelta::Lines(delta) => {
+                                gpui::point(delta.x * SWIPE_LINE, delta.y * SWIPE_LINE)
+                            }
+                        };
+                        let phase = event.touch_phase;
+                        _ = swipe_workspace.update(cx, |workspace, cx| {
+                            workspace.swipe_profile(delta, phase, cx);
                         });
                     }),
             )
@@ -3985,7 +4080,7 @@ impl Render for Workspace {
                 .on_action(cx.listener(Self::previous_profile))
                 // Without a titlebar of its own the form has no drag handle at
                 // all, since the platform's is transparent.
-                .child(titlebar(t, None))
+                .child(titlebar(t, None, None))
                 .child(
                     div()
                         .flex_1()
@@ -4032,6 +4127,28 @@ impl Render for Workspace {
         let csv_workspace = apply_workspace.clone();
         let json_workspace = apply_workspace.clone();
 
+        let content = div()
+            // Flush, not a floating card: the split handle already draws the
+            // one seam, and the planes inside separate by tone.
+            .size_full()
+            .min_w_0()
+            .child(views::render_main_content(profile, cx));
+        // With the sidebar folded there is nothing to split, and a split with
+        // one panel still paints the handle it no longer divides anything with.
+        let main_pane = if self.sidebar_hidden {
+            content.into_any_element()
+        } else {
+            h_resizable("workspace-shell-split")
+                .child(
+                    resizable_panel()
+                        .size(px(layout::SIDEBAR_DEFAULT_WIDTH))
+                        .size_range(px(layout::SIDEBAR_MIN_WIDTH)..px(layout::SIDEBAR_MAX_WIDTH))
+                        .child(self.render_explorer(profile, cx)),
+                )
+                .child(resizable_panel().child(content))
+                .into_any_element()
+        };
+
         div()
             .id("workspace")
             .relative()
@@ -4061,6 +4178,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::command_palette))
             .on_action(cx.listener(Self::palette_next))
             .on_action(cx.listener(Self::palette_previous))
+            .on_action(cx.listener(Self::toggle_sidebar))
             .size_full()
             // The shell is the frost: titlebar, sidebar and status bar paint
             // nothing of their own, they are the glass the window root already
@@ -4070,31 +4188,24 @@ impl Render for Workspace {
             .text_size(px(layout::TEXT_MD))
             .flex()
             .flex_col()
-            .child(titlebar(t, Some(profile.name.clone())))
-            .child(
-                div().flex_1().min_h_0().child(
-                    h_resizable("workspace-shell-split")
-                        .child(
-                            resizable_panel()
-                                .size(px(layout::SIDEBAR_DEFAULT_WIDTH))
-                                .size_range(
-                                    px(layout::SIDEBAR_MIN_WIDTH)..px(layout::SIDEBAR_MAX_WIDTH),
-                                )
-                                .child(self.render_explorer(profile, cx)),
-                        )
-                        .child(
-                            // Flush, not a floating card: the split handle
-                            // already draws the one seam, and the planes
-                            // inside separate by tone.
-                            resizable_panel().child(
-                                div()
-                                    .size_full()
-                                    .min_w_0()
-                                    .child(views::render_main_content(profile, cx)),
-                            ),
-                        ),
+            .child(titlebar(
+                t,
+                Some(profile.name.clone()),
+                Some(
+                    icon_button(
+                        "toggle-sidebar",
+                        icon::SIDEBAR,
+                        Tone::Quiet,
+                        Control::Compact,
+                        t,
+                    )
+                    .on_click(cx.listener(|workspace, _, window, cx| {
+                        workspace.toggle_sidebar(&ToggleSidebar, window, cx);
+                    }))
+                    .into_any_element(),
                 ),
-            )
+            ))
+            .child(div().flex_1().min_h_0().child(main_pane))
             .child(
                 div()
                     .h(px(layout::STATUS_HEIGHT))
@@ -4370,14 +4481,12 @@ fn row_icon(t: Theme, path: &'static str) -> impl IntoElement {
 ///
 /// The system titlebar is transparent (see `main`), so this row is what runs to
 /// the top of the window and the window buttons are drawn over its leading
-/// inset. It is also the drag handle the platform no longer provides — which is
-/// why nothing interactive lives here: a drag region swallows the clicks a
-/// field or a button needs.
-fn titlebar(t: Theme, subtitle: Option<String>) -> impl IntoElement {
+/// inset. It is also the drag handle the platform no longer provides — which
+/// is why the drag region is a child covering what is left of the row rather
+/// than the row itself: a drag region swallows the clicks a button needs, so
+/// anything interactive goes in `leading`, outside it.
+fn titlebar(t: Theme, subtitle: Option<String>, leading: Option<AnyElement>) -> impl IntoElement {
     div()
-        .id("titlebar")
-        .window_control_area(gpui::WindowControlArea::Drag)
-        .on_double_click(|_, window, _| window.titlebar_double_click())
         .h(px(layout::TITLEBAR_HEIGHT))
         .w_full()
         .flex()
@@ -4386,10 +4495,15 @@ fn titlebar(t: Theme, subtitle: Option<String>) -> impl IntoElement {
         .gap(px(layout::SPACE_MD))
         .pl(px(layout::TITLEBAR_LEADING_INSET))
         .pr(px(layout::SPACE_MD))
+        .children(leading)
         .child(
             div()
+                .id("titlebar")
+                .window_control_area(gpui::WindowControlArea::Drag)
+                .on_double_click(|_, window, _| window.titlebar_double_click())
+                .flex_1()
+                .h_full()
                 .flex()
-                .flex_shrink_0()
                 .items_center()
                 .gap(px(layout::SPACE_SM))
                 .child(div().font_weight(FontWeight::SEMIBOLD).child("Slate"))
@@ -4837,6 +4951,7 @@ fn main() {
             // `cmd+c` wins there and the grid's copy never steals a text
             // selection.
             KeyBinding::new("cmd-c", CopyCell, Some("Table")),
+            KeyBinding::new("cmd-shift-s", ToggleSidebar, None),
             KeyBinding::new("cmd-q", Quit, None),
         ]);
 
@@ -4896,6 +5011,59 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_swipe_steps_once_it_has_travelled_far_enough() {
+        use gpui::{TouchPhase, point};
+
+        let mut travelled = 0.0;
+        let nudge = SWIPE_STEP / 3.0;
+
+        // Neither of the first two nudges is a swipe yet; the third one is.
+        assert_eq!(
+            swipe_step(&mut travelled, point(-nudge, 0.0), TouchPhase::Moved),
+            None
+        );
+        assert_eq!(
+            swipe_step(&mut travelled, point(-nudge, 0.0), TouchPhase::Moved),
+            None
+        );
+        assert_eq!(
+            swipe_step(&mut travelled, point(-nudge, 0.0), TouchPhase::Moved),
+            Some(1)
+        );
+        // Spent, not carried: the next step needs another full swipe.
+        assert_eq!(travelled, 0.0);
+
+        // The other way round is the other direction.
+        assert_eq!(
+            swipe_step(&mut travelled, point(SWIPE_STEP, 0.0), TouchPhase::Moved),
+            Some(-1)
+        );
+
+        // A scroll down the tree is not a swipe across the row, however far it
+        // drifts sideways.
+        assert_eq!(
+            swipe_step(
+                &mut travelled,
+                point(SWIPE_STEP, -SWIPE_STEP * 2.0),
+                TouchPhase::Moved
+            ),
+            None
+        );
+        assert_eq!(travelled, 0.0);
+
+        // A gesture that stops short leaves nothing behind for the next one.
+        assert_eq!(
+            swipe_step(&mut travelled, point(-nudge, 0.0), TouchPhase::Moved),
+            None
+        );
+        assert_eq!(
+            swipe_step(&mut travelled, point(0.0, 0.0), TouchPhase::Ended),
+            None
+        );
+        assert_eq!(travelled, 0.0);
+    }
 
     fn columns(names: &[&str]) -> Vec<db::Column> {
         names

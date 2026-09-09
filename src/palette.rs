@@ -70,6 +70,7 @@ pub enum Command {
     SwitchProfile(usize),
     NewConnection,
     CycleTheme,
+    ToggleSidebar,
     ResetEditorZoom,
 }
 
@@ -444,6 +445,14 @@ fn command_items(workspace: &Workspace, profile: &Profile, cx: &App) -> Vec<Item
         "⇧⌘T",
         icon::SWITCHER,
         Command::CycleTheme,
+    ));
+    // One row rather than a Show/Hide pair: the palette is built from the
+    // session, which does not know whether the column is folded.
+    items.push(Item::command(
+        "Toggle sidebar",
+        "⇧⌘S",
+        icon::SIDEBAR,
+        Command::ToggleSidebar,
     ));
     if matches!(session.active, Tab::Query) {
         items.push(Item::command(
