@@ -310,10 +310,9 @@ impl Connection {
         }
 
         let relations = self.internal_query(&relations_sql(&schemas))?;
-        let columns = self.internal_query(&relation_columns_sql(&schemas))?;
         // SQLite has no stored functions or procedures at all, so an empty list
         // is the true answer rather than a gap in what Slate can see.
-        assemble_catalog(relations, QueryResult::default(), columns)
+        assemble_catalog(relations, QueryResult::default())
     }
 
     /// `main`, `temp`, and anything `ATTACH`ed — under SQLite's own names for
@@ -616,38 +615,6 @@ fn relations_sql(schemas: &[String]) -> String {
 
     format!(
         "{}\nORDER BY schema_name, relation_name",
-        scans.join("\nUNION ALL\n")
-    )
-}
-
-/// The same scan again, joined to `pragma_table_info` as a table-valued
-/// function so one round trip names every column of every relation
-/// [`relations_sql`] admits.
-///
-/// `column_ordinal` is selected only so the outer `ORDER BY` can name it: a
-/// compound select can order by an output column and nothing else, and
-/// [`assemble_catalog`] appends in row order.
-fn relation_columns_sql(schemas: &[String]) -> String {
-    let scans: Vec<String> = schemas
-        .iter()
-        .map(|schema| {
-            format!(
-                "SELECT {schema_literal} AS schema_name,
-                        relation.name AS relation_name,
-                        column_info.name AS column_name,
-                        column_info.cid AS column_ordinal
-                 FROM {schema_identifier}.sqlite_master AS relation
-                 JOIN pragma_table_info(relation.name, {schema_literal}) AS column_info
-                 WHERE relation.type IN ('table', 'view')
-                   AND relation.name NOT LIKE 'sqlite\\_%' ESCAPE '\\'",
-                schema_literal = Engine::Sqlite.quote_literal(schema),
-                schema_identifier = Engine::Sqlite.quote_identifier(schema),
-            )
-        })
-        .collect();
-
-    format!(
-        "{}\nORDER BY schema_name, relation_name, column_ordinal",
         scans.join("\nUNION ALL\n")
     )
 }
@@ -1362,30 +1329,6 @@ SELECT count(*) FROM forever
                 .iter()
                 .any(|relation| relation.name == "account_overview"
                     && relation.kind == RelationKind::View)
-        );
-
-        // Also the check that the `pragma_table_info` join reaches every
-        // relation rather than only the first: completion offers these, in the
-        // table's own order.
-        let accounts = main
-            .relations
-            .iter()
-            .find(|relation| relation.name == "accounts")
-            .expect("accounts should be listed");
-        assert_eq!(
-            accounts.columns,
-            [
-                "id",
-                "external_id",
-                "name",
-                "email",
-                "plan",
-                "balance",
-                "active",
-                "tags",
-                "metadata",
-                "created_at"
-            ]
         );
     }
 

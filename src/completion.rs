@@ -21,9 +21,9 @@
 //! `ERROR` node for. The one job a scan genuinely cannot do is know it is
 //! inside a string literal, and [`suppressed`] does that job on its own.
 
-use std::{cell::RefCell, ops::Range, sync::Arc};
+use std::{cell::RefCell, collections::HashMap, ops::Range, rc::Rc, sync::Arc};
 
-use gpui::{Context, Result, Task, Window};
+use gpui::{Context, Result, Task, WeakEntity, Window};
 use gpui_component::input::{CompletionProvider, InputState, Rope, RopeExt};
 use lsp_types::{
     CompletionContext, CompletionItem, CompletionItemKind, CompletionResponse, CompletionTextEdit,
@@ -35,9 +35,42 @@ use nucleo_matcher::{
 };
 
 use crate::{
+    Workspace,
     db::{Catalog, RelationKind},
     sql,
 };
+
+/// What is known about one relation's columns.
+///
+/// The catalog does not carry them. Fetching every column of every relation at
+/// connect was the first implementation and it does not scale: on a large
+/// schema that is a multi-million-row result, buffered whole by the driver
+/// before Slate sees a row, then held for the life of the connection and
+/// duplicated into this provider's snapshot -- all of it paid before the user
+/// has typed anything, and most of it for relations they will never mention.
+///
+/// So a relation's columns are fetched when a statement first names it, and
+/// kept. What a session holds is bounded by what it actually wrote about.
+#[derive(Clone, Debug)]
+pub enum ColumnState {
+    /// Asked for, not back yet. Held so a relation is asked about once rather
+    /// than on every keystroke until it lands.
+    Loading,
+    Loaded(Vec<String>),
+    /// The fetch failed. Held for the same reason `Loading` is: a relation the
+    /// server will not describe must not be re-asked forever.
+    Failed,
+}
+
+/// Columns by schema and relation, shared between the provider that reads them
+/// and the workspace that fills them. `Rc` rather than `Arc` because both live
+/// on the foreground thread; the fetch itself is a background task that hands
+/// its result back before it touches this.
+pub type ColumnCache = Rc<RefCell<HashMap<(String, String), ColumnState>>>;
+
+/// Schema and relation pairs whose columns a completion wanted and the cache
+/// did not hold.
+type Wanted = Vec<(String, String)>;
 
 /// How many rows the popup is allowed. The list is already ranked, so the tail
 /// of a 4,000-column database is not what anyone is scrolling for.
@@ -136,37 +169,73 @@ impl Candidate {
 /// when it reloads, and so is this — see `Workspace::install_completions`.
 pub struct SchemaCompletions {
     catalog: Arc<Catalog>,
+    columns: ColumnCache,
+    /// Who to ask when a relation's columns are wanted and not yet held.
+    ///
+    /// `None` only in this module's own tests, which drive [`Self::items`]
+    /// against a pre-filled cache and never reach the fetch.
+    workspace: Option<WeakEntity<Workspace>>,
     /// `Matcher` scores through `&mut self` and the trait hands us `&self`.
     /// One matcher reused rather than one per keystroke, as the palette does.
     matcher: RefCell<Matcher>,
 }
 
 impl SchemaCompletions {
-    pub fn new(catalog: Arc<Catalog>) -> Self {
+    pub fn new(
+        catalog: Arc<Catalog>,
+        columns: ColumnCache,
+        workspace: WeakEntity<Workspace>,
+    ) -> Self {
         Self {
             catalog,
+            columns,
+            workspace: Some(workspace),
             matcher: RefCell::new(Matcher::new(Config::DEFAULT)),
         }
     }
 
-    /// The columns of a relation named anywhere in the catalog.
+    /// The columns of a relation named anywhere in the catalog, as far as they
+    /// are known, recording into `wanted` any this cache has never been asked
+    /// for.
     ///
     /// Unqualified, so two schemas with a `users` each contribute both sets.
     /// Offering a column that turns out to belong to the other schema's table
     /// is a worse answer than offering nothing only if the user cannot see
     /// which — which is what `detail` is for.
-    fn columns_of(&self, relation: &str) -> Vec<Candidate> {
-        self.catalog
-            .schemas
-            .iter()
-            .flat_map(|schema| schema.relations.iter().map(move |rel| (schema, rel)))
-            .filter(|(_, rel)| rel.name.eq_ignore_ascii_case(relation))
-            .flat_map(|(_, rel)| {
-                rel.columns.iter().map(|column| {
-                    Candidate::new(column, Some(rel.name.clone()), CompletionItemKind::FIELD)
-                })
-            })
-            .collect()
+    ///
+    /// A name the catalog does not list is never recorded. The fetch would ask
+    /// the server to describe something it has already said does not exist,
+    /// once per keystroke, for as long as the typo is on screen.
+    fn columns_of(&self, relation: &str, wanted: &mut Vec<(String, String)>) -> Vec<Candidate> {
+        let held = self.columns.borrow();
+        let mut candidates = Vec::new();
+
+        for schema in &self.catalog.schemas {
+            for named in schema
+                .relations
+                .iter()
+                .filter(|named| named.name.eq_ignore_ascii_case(relation))
+            {
+                let key = (schema.name.clone(), named.name.clone());
+                match held.get(&key) {
+                    Some(ColumnState::Loaded(columns)) => {
+                        candidates.extend(columns.iter().map(|column| {
+                            Candidate::new(
+                                column,
+                                Some(named.name.clone()),
+                                CompletionItemKind::FIELD,
+                            )
+                        }));
+                    }
+                    // In flight, or known not to answer. Neither is a reason to
+                    // ask again.
+                    Some(ColumnState::Loading | ColumnState::Failed) => {}
+                    None => wanted.push(key),
+                }
+            }
+        }
+
+        candidates
     }
 
     fn relations_in(&self, schema_name: &str) -> Vec<Candidate> {
@@ -231,7 +300,13 @@ impl SchemaCompletions {
     /// Order matters twice over: the scorer's ties are broken by it, and an
     /// empty query scores everything equally, so this order *is* the list the
     /// user sees after a `.`.
-    fn candidates(&self, statement: &str, before: &str, qualifier: Option<&str>) -> Vec<Candidate> {
+    fn candidates(
+        &self,
+        statement: &str,
+        before: &str,
+        qualifier: Option<&str>,
+        wanted: &mut Vec<(String, String)>,
+    ) -> Vec<Candidate> {
         if let Some(qualifier) = qualifier {
             // `x.` — `x` is an alias if the statement bound one, otherwise the
             // relation or schema it looks like. An alias wins: a query that
@@ -243,10 +318,14 @@ impl SchemaCompletions {
                 .map(|(_, relation)| relation)
                 .unwrap_or_else(|| qualifier.to_string());
 
-            let columns = self.columns_of(&relation);
+            let columns = self.columns_of(&relation, wanted);
             if !columns.is_empty() {
                 return columns;
             }
+            // Nothing held for it yet, which may only mean a fetch that has not
+            // landed. Offering the schema's relations is the right answer when
+            // the qualifier is a schema, and harmless when it is not: an
+            // unknown name matches nothing.
             return self.relations_in(qualifier);
         }
 
@@ -269,7 +348,7 @@ impl SchemaCompletions {
                 relations
             })
             .iter()
-            .flat_map(|relation| self.columns_of(relation))
+            .flat_map(|relation| self.columns_of(relation, wanted))
             .collect();
 
         candidates.extend(
@@ -286,15 +365,19 @@ impl SchemaCompletions {
     ///
     /// Separate from [`CompletionProvider::completions`] and taking `&str`
     /// rather than a `Rope` so the tests can reach it without a window.
-    fn items(&self, sql: &str, offset: usize) -> Vec<(Range<usize>, Candidate)> {
+    /// Returns the rows to show, and the relations whose columns are wanted and
+    /// not yet held — which the caller fetches, because this one is `&self` and
+    /// has no window to spawn from.
+    fn items(&self, sql: &str, offset: usize) -> (Vec<(Range<usize>, Candidate)>, Wanted) {
+        let mut wanted = Vec::new();
         let offset = offset.min(sql.len());
         if !sql.is_char_boundary(offset) {
-            return Vec::new();
+            return (Vec::new(), wanted);
         }
 
         let word = word_before(sql, offset);
         if suppressed(sql, word.start) {
-            return Vec::new();
+            return (Vec::new(), wanted);
         }
 
         let prefix = &sql[word.clone()];
@@ -304,7 +387,7 @@ impl SchemaCompletions {
         // whole catalog on every space would put a popup over the buffer for
         // most of the time anyone is writing in it.
         if prefix.is_empty() && qualifier.is_none() {
-            return Vec::new();
+            return (Vec::new(), wanted);
         }
 
         let statement = sql::Buffer::parse(sql)
@@ -314,11 +397,12 @@ impl SchemaCompletions {
             .unwrap_or(sql);
         let before = &sql[..word.start];
 
-        let candidates = self.candidates(statement, before, qualifier);
-        rank(candidates, prefix, &mut self.matcher.borrow_mut())
+        let candidates = self.candidates(statement, before, qualifier, &mut wanted);
+        let ranked = rank(candidates, prefix, &mut self.matcher.borrow_mut())
             .into_iter()
             .map(|candidate| (word.clone(), candidate))
-            .collect()
+            .collect();
+        (ranked, wanted)
     }
 }
 
@@ -339,7 +423,7 @@ impl CompletionProvider for SchemaCompletions {
         offset: usize,
         _: CompletionContext,
         _: &mut Window,
-        _: &mut Context<InputState>,
+        cx: &mut Context<InputState>,
     ) -> Task<Result<CompletionResponse>> {
         // ponytail: the whole buffer is copied out of the rope on every
         // keystroke, and parsed once more on top of the highlighter's own
@@ -347,9 +431,27 @@ impl CompletionProvider for SchemaCompletions {
         // the size it runs at -- hold the tokens on the provider and invalidate
         // them from `InputEvent::Change` if a very large buffer ever stutters.
         let sql = text.to_string();
+        let (items, wanted) = self.items(&sql, offset);
 
-        let items = self
-            .items(&sql, offset)
+        // Marked before the request so a second keystroke arriving while the
+        // first fetch is in flight does not ask again.
+        for key in wanted {
+            self.columns
+                .borrow_mut()
+                .insert(key.clone(), ColumnState::Loading);
+            if let Some(workspace) = &self.workspace {
+                workspace
+                    .update(cx, |workspace, cx| {
+                        workspace.load_completion_columns(key.0, key.1, cx);
+                    })
+                    .ok();
+            }
+        }
+
+        // The popup does not reopen by itself when a fetch lands: the input
+        // reconsiders the menu on an edit and nothing else. The next keystroke
+        // shows the columns, which for a name being typed is the very next one.
+        let items = items
             .into_iter()
             .map(|(word, candidate)| CompletionItem {
                 label: candidate.label.clone(),
@@ -598,23 +700,49 @@ mod tests {
     use super::*;
     use crate::db::{Relation, Routine, RoutineKind, Schema};
 
-    fn relation(name: &str, columns: &[&str]) -> Relation {
-        Relation {
-            name: name.to_string(),
-            kind: RelationKind::Table,
-            columns: columns.iter().map(|column| column.to_string()).collect(),
+    /// A provider whose cache already holds every relation's columns, as it
+    /// would once the statement had named them and the fetches had landed.
+    ///
+    /// `workspace: None` — these drive [`SchemaCompletions::items`], which
+    /// reports what it wants rather than asking for it. What is *not* held is
+    /// tested separately, in the two tests that build their own cache.
+    fn detached(catalog: Catalog, columns: &[(&str, &str, &[&str])]) -> SchemaCompletions {
+        let held = columns
+            .iter()
+            .map(|(schema, relation, columns)| {
+                (
+                    (schema.to_string(), relation.to_string()),
+                    ColumnState::Loaded(columns.iter().map(|column| column.to_string()).collect()),
+                )
+            })
+            .collect();
+        SchemaCompletions {
+            catalog: Arc::new(catalog),
+            columns: Rc::new(RefCell::new(held)),
+            workspace: None,
+            matcher: RefCell::new(Matcher::new(Config::DEFAULT)),
         }
     }
 
-    fn catalog() -> SchemaCompletions {
-        SchemaCompletions::new(Arc::new(Catalog {
+    fn relation(name: &str) -> Relation {
+        Relation {
+            name: name.to_string(),
+            kind: RelationKind::Table,
+        }
+    }
+
+    const COLUMNS: &[(&str, &str, &[&str])] = &[
+        ("public", "accounts", &["id", "email", "created_at"]),
+        ("public", "orders", &["id", "account_id", "total"]),
+        ("audit", "events", &["id", "payload"]),
+    ];
+
+    fn schemas() -> Catalog {
+        Catalog {
             schemas: vec![
                 Schema {
                     name: "public".to_string(),
-                    relations: vec![
-                        relation("accounts", &["id", "email", "created_at"]),
-                        relation("orders", &["id", "account_id", "total"]),
-                    ],
+                    relations: vec![relation("accounts"), relation("orders")],
                     routines: vec![Routine {
                         name: "recalculate_totals".to_string(),
                         kind: RoutineKind::Procedure,
@@ -626,11 +754,15 @@ mod tests {
                 },
                 Schema {
                     name: "audit".to_string(),
-                    relations: vec![relation("events", &["id", "payload"])],
+                    relations: vec![relation("events")],
                     routines: Vec::new(),
                 },
             ],
-        }))
+        }
+    }
+
+    fn catalog() -> SchemaCompletions {
+        detached(schemas(), COLUMNS)
     }
 
     /// The labels offered for a caret at `|`.
@@ -639,6 +771,7 @@ mod tests {
         let sql = sql.replace('|', "");
         catalog()
             .items(&sql, offset)
+            .0
             .into_iter()
             .map(|(_, candidate)| candidate.label)
             .collect()
@@ -770,6 +903,7 @@ mod tests {
         let sql = "SELECT * FROM acc";
         let (word, _) = catalog()
             .items(sql, sql.len())
+            .0
             .into_iter()
             .next()
             .expect("a relation was offered");
@@ -782,6 +916,7 @@ mod tests {
         let offset = sql.find(" FROM").expect("the caret sits after `tot`");
         let (word, candidate) = catalog()
             .items(sql, offset)
+            .0
             .into_iter()
             .next()
             .expect("a column was offered");
@@ -799,20 +934,68 @@ mod tests {
         let wide = (0..500)
             .map(|index| format!("column_{index}"))
             .collect::<Vec<_>>();
-        let completions = SchemaCompletions::new(Arc::new(Catalog {
-            schemas: vec![Schema {
-                name: "public".to_string(),
-                relations: vec![Relation {
-                    name: "wide".to_string(),
-                    kind: RelationKind::Table,
-                    columns: wide,
+        let names = wide.iter().map(String::as_str).collect::<Vec<_>>();
+        let completions = detached(
+            Catalog {
+                schemas: vec![Schema {
+                    name: "public".to_string(),
+                    relations: vec![relation("wide")],
+                    routines: Vec::new(),
                 }],
-                routines: Vec::new(),
-            }],
-        }));
+            },
+            &[("public", "wide", &names)],
+        );
         let sql = "SELECT wide. FROM wide";
         let offset = sql.find(' ').unwrap() + "wide.".len() + 1;
-        assert_eq!(completions.items(sql, offset).len(), MAX_ITEMS);
+        assert_eq!(completions.items(sql, offset).0.len(), MAX_ITEMS);
+    }
+
+    #[test]
+    fn a_relation_whose_columns_are_not_held_yet_is_asked_for_once() {
+        let completions = detached(schemas(), &[]);
+        let sql = "SELECT accounts.";
+
+        let (items, wanted) = completions.items(sql, sql.len());
+        assert!(items.is_empty(), "nothing is known about its columns yet");
+        assert_eq!(wanted, vec![("public".to_string(), "accounts".to_string())]);
+
+        // What the provider does on a miss, so the second keystroke asks for
+        // nothing while the first fetch is still out.
+        completions.columns.borrow_mut().insert(
+            ("public".to_string(), "accounts".to_string()),
+            ColumnState::Loading,
+        );
+        assert!(completions.items(sql, sql.len()).1.is_empty());
+    }
+
+    #[test]
+    fn a_name_the_catalog_does_not_list_is_never_asked_for() {
+        // Or a typo would put a describe on the wire for every keystroke it
+        // stays on screen.
+        let completions = detached(schemas(), &[]);
+        let sql = "SELECT accunts.";
+        assert!(completions.items(sql, sql.len()).1.is_empty());
+    }
+
+    #[test]
+    fn a_relation_the_server_would_not_describe_is_not_asked_again() {
+        let completions = detached(schemas(), &[]);
+        completions.columns.borrow_mut().insert(
+            ("public".to_string(), "accounts".to_string()),
+            ColumnState::Failed,
+        );
+        let sql = "SELECT accounts.";
+        assert!(completions.items(sql, sql.len()).1.is_empty());
+    }
+
+    #[test]
+    fn only_the_relations_a_statement_names_are_asked_for() {
+        // The whole point of the cache: writing about one table must not fetch
+        // the columns of every table in the database.
+        let completions = detached(schemas(), &[]);
+        let sql = "SELECT e FROM audit.events";
+        let (_, wanted) = completions.items(sql, sql.find(" FROM").unwrap());
+        assert_eq!(wanted, vec![("audit".to_string(), "events".to_string())]);
     }
 
     #[test]

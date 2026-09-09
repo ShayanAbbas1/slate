@@ -297,10 +297,25 @@ that is worth knowing before reading it.
 
 ### Completion
 
-`src/completion.rs` offers what the loaded catalog holds — schemas, relations,
-routines, columns — plus the keywords that carry a statement's shape. It is a
-`CompletionProvider` implementation and nothing else: the popup, its scroll and
-its keys all belong to gpui-component (see below).
+`src/completion.rs` offers the schemas, relations and routines the loaded
+catalog holds, the columns of the relations a statement actually names, and the
+keywords that carry a statement's shape. It is a `CompletionProvider`
+implementation and nothing else: the popup, its scroll and its keys all belong
+to gpui-component (see below).
+
+**Columns are not in the catalog, and must not be put there.** The first
+implementation fetched every column of every relation at connect, and that is
+unbounded: on a large schema it is a multi-million-row result the driver
+buffers whole before Slate sees a row, held for the life of the connection and
+duplicated into the provider's snapshot — all of it paid before anyone has
+asked a question. A relation's columns are fetched when a statement first names
+it, through `Connection::structure`, which the Structure tab already runs; so
+completion adds no SQL of its own to any engine, and a session holds only what
+it wrote about. `Session::completion_columns` is the cache, cleared whenever
+the catalog reloads, and a miss is marked `Loading` before the request so a
+relation is asked about once rather than once per keystroke. A name the catalog
+does not list is never fetched at all — otherwise a typo puts a describe on the
+wire for as long as it is on screen.
 
 Two rules it exists under. **It is a lexer, not a parser** — half-typed SQL is a
 parse error by definition, and `SELECT * FROM ` is both the text a user most

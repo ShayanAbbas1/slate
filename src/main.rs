@@ -210,6 +210,13 @@ struct Session {
     next_object_id: u64,
     /// Object tabs read back from disk, held until the catalog can name them.
     pending_objects: Vec<store::StoredObject>,
+    /// What completion has learned about this connection's columns.
+    ///
+    /// Not in the catalog, deliberately: fetching every column of every
+    /// relation at connect is unbounded work for a database nobody has asked a
+    /// question about yet. A relation lands here the first time a statement
+    /// names it, so what is held is bounded by what was written.
+    completion_columns: completion::ColumnCache,
     explorer_filter: Entity<InputState>,
     explorer_tree: Entity<TreeState>,
     explorer_leaves: Arc<HashMap<String, ExplorerLeaf>>,
@@ -331,6 +338,7 @@ impl Session {
             next_query_id,
             next_object_id: 0,
             pending_objects,
+            completion_columns: completion::ColumnCache::default(),
             explorer_filter,
             explorer_tree: cx.new(|cx| TreeState::new(cx)),
             explorer_leaves: Arc::new(HashMap::new()),
@@ -1658,15 +1666,76 @@ impl Workspace {
     /// loaded catalog leaves the editor with no provider at all, which is the
     /// difference between offering nothing and offering the last database's
     /// tables to a buffer written against this one.
+    /// Fetch one relation's columns for the completion cache.
+    ///
+    /// Reuses `Connection::structure`, which the Structure tab already runs, so
+    /// completion adds no SQL of its own to any engine. It asks for more than
+    /// it needs -- indexes and constraints come back too -- and that is the
+    /// trade: one extra pair of catalog queries per relation the session
+    /// actually writes about, against three more engine-specific statements to
+    /// maintain and keep in step with hard rule 4.
+    fn load_completion_columns(
+        &mut self,
+        schema: String,
+        relation: String,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(profile) = self.profile() else {
+            return;
+        };
+        let Some(connection) = profile.connection() else {
+            return;
+        };
+        let id = profile.id.clone();
+        let generation = profile.generation;
+        let columns = profile.session.completion_columns.clone();
+
+        let task = cx.background_executor().spawn({
+            let (schema, relation) = (schema.clone(), relation.clone());
+            async move { connection.structure(&schema, &relation) }
+        });
+        cx.spawn(async move |workspace, cx| {
+            let result = task.await;
+            workspace
+                .update(cx, |workspace, cx| {
+                    // A reconnect clears the cache and starts a new generation,
+                    // so a result from the old one describes a database this
+                    // profile is no longer talking to.
+                    if workspace.issued_to(&id, generation).is_none() {
+                        return;
+                    }
+                    let state = match result {
+                        Ok(structure) => completion::ColumnState::Loaded(
+                            structure
+                                .columns
+                                .into_iter()
+                                .map(|column| column.name)
+                                .collect(),
+                        ),
+                        Err(_) => completion::ColumnState::Failed,
+                    };
+                    columns.borrow_mut().insert((schema, relation), state);
+                    cx.notify();
+                })
+                .ok();
+        })
+        .detach();
+    }
+
     fn install_completions(&mut self, id: &str, cx: &mut Context<Self>) {
         let Some(profile) = self.profiles.iter().find(|profile| profile.id == id) else {
             return;
         };
+        // The catalog is new, so what was known about any relation's columns
+        // describes a schema that may no longer exist.
+        profile.session.completion_columns.borrow_mut().clear();
+
         let provider = match &profile.catalog {
-            CatalogState::Loaded(catalog) => {
-                Some(Rc::new(SchemaCompletions::new(Arc::new(catalog.clone())))
-                    as Rc<dyn CompletionProvider>)
-            }
+            CatalogState::Loaded(catalog) => Some(Rc::new(SchemaCompletions::new(
+                Arc::new(catalog.clone()),
+                profile.session.completion_columns.clone(),
+                cx.weak_entity(),
+            )) as Rc<dyn CompletionProvider>),
             _ => None,
         };
 
