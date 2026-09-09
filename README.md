@@ -68,6 +68,14 @@ rm -f dev/slate_dev.db && sqlite3 dev/slate_dev.db < dev/sqlite/001-slate-demo.s
   Profiles persist; passwords live in the Keychain.
 - **Query editor** with tree-sitter SQL highlighting. `cmd+enter` runs the
   selection, or the statement under the cursor. Errors render inline.
+- **Completion from your own schema.** Typing offers the schemas, tables,
+  views, routines and columns the connection actually has, plus the keywords
+  that carry a statement's shape. After `FROM` it offers relations; after a
+  table name or an alias and a dot, that table's columns; inside a string
+  literal or a comment, nothing at all.
+- **As many query buffers as you want.** `cmd+t` opens another, each with its
+  own results, sort state and history of what it ran. An unsaved one persists
+  by itself, so a scratch buffer survives a restart without being named.
 - **Virtualized result grid** with content-fitted draggable columns and a row
   inspector showing whole values and their types. Table previews carry a
   per-tab row limit; a query you wrote runs exactly as written, uncapped.
@@ -101,7 +109,7 @@ rm -f dev/slate_dev.db && sqlite3 dev/slate_dev.db < dev/sqlite/001-slate-demo.s
 
 ## Planned
 
-Multiple unsaved buffers · a Homebrew tap.
+A Homebrew tap.
 
 ## Not planned
 

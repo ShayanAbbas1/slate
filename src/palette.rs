@@ -371,7 +371,7 @@ fn command_items(workspace: &Workspace, profile: &Profile, cx: &App) -> Vec<Item
             icon::RUN,
             Command::RunQuery,
         ));
-        if session.open_query.is_some() {
+        if session.open_query().is_some() {
             items.push(Item::command(
                 "Rename query",
                 "",
@@ -509,7 +509,7 @@ fn command_items(workspace: &Workspace, profile: &Profile, cx: &App) -> Vec<Item
         icon::SIDEBAR,
         Command::ToggleSidebar,
     ));
-    if matches!(session.active, Tab::Query) {
+    if matches!(session.active, Tab::Query(_)) {
         items.push(Item::command(
             "Reset editor zoom",
             "⌘0",

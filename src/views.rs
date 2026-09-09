@@ -109,15 +109,21 @@ fn render_editor_surface(
 }
 
 fn render_query_surface(profile: &Profile, cx: &mut Context<Workspace>) -> AnyElement {
-    let bottom = render_results(&profile.session.query, &profile.session.results, true, cx);
+    let Some(tab) = profile.session.active_query_tab() else {
+        return div().into_any_element();
+    };
+    let bottom = render_results(&tab.query, &tab.results, true, cx);
     render_editor_surface(
+        // Keyed by the buffer rather than the profile: two query tabs are two
+        // splits, and sharing one id would carry the first one's drag position
+        // onto the second.
         gpui::ElementId::from((
             gpui::ElementId::from("query-result-split"),
-            profile.id.clone(),
+            gpui::SharedString::from(format!("{}-{}", profile.id, tab.id)),
         )),
-        &profile.session.editor,
+        &tab.editor,
         profile.session.editor_font_size,
-        &profile.session.query,
+        &tab.query,
         bottom,
         cx,
     )
@@ -654,7 +660,7 @@ fn render_tab_strip(profile: &Profile, cx: &mut Context<Workspace>) -> AnyElemen
     let t = *theme(cx);
     let workspace = cx.entity().downgrade();
     let session = &profile.session;
-    let on_query_tab = matches!(session.active, Tab::Query);
+    let on_query_tab = matches!(session.active, Tab::Query(_));
     let runnable = session.editor(session.active).is_some();
 
     let chip = |active: bool| {
@@ -686,22 +692,75 @@ fn render_tab_strip(profile: &Profile, cx: &mut Context<Workspace>) -> AnyElemen
             .child(name)
     };
 
-    let scratch_workspace = workspace.clone();
-    let mut tabs = vec![
-        chip(on_query_tab && session.open_query.is_none())
-            .id("scratch-query-tab")
-            .px(px(layout::SPACE_SM))
-            // A pen, not a file: the scratch buffer is a place to write, and
-            // the distinction is what makes the saved tabs read as files.
-            .child(row_icon(t, icon::SCRATCH_QUERY))
-            .child("New Query")
-            .on_click(move |_, window, cx| {
-                _ = scratch_workspace.update(cx, |workspace, cx| {
-                    workspace.open_scratch_query(window, cx);
-                });
-            })
-            .into_any_element(),
-    ];
+    // One chip per unsaved buffer, numbered in strip order. There used to be
+    // exactly one, because there used to be exactly one editor.
+    let unsaved_count = session
+        .queries
+        .iter()
+        .filter(|tab| tab.open_query.is_none())
+        .count();
+    let mut tabs = session
+        .queries
+        .iter()
+        .filter(|tab| tab.open_query.is_none())
+        .enumerate()
+        .map(|(index, tab)| {
+            let id = tab.id;
+            let group = format!("unsaved-query-tab-{id}");
+            let open_workspace = workspace.clone();
+            let close_workspace = workspace.clone();
+            let label = match index {
+                0 => "New Query".to_string(),
+                _ => format!("New Query {}", index + 1),
+            };
+            chip(session.active == Tab::Query(id))
+                .id(("unsaved-query-tab", id as usize))
+                .group(group.clone())
+                .pl(px(layout::SPACE_SM))
+                // The last one has no × and keeps the symmetric padding: a
+                // profile always has somewhere to write, so it has no closed
+                // state to offer.
+                .map(|chip| match unsaved_count > 1 {
+                    true => chip.pr(px(layout::SPACE_XS)),
+                    false => chip.pr(px(layout::SPACE_SM)),
+                })
+                // A pen, not a file: an unsaved buffer is a place to write, and
+                // the distinction is what makes the saved tabs read as files.
+                .child(row_icon(t, icon::SCRATCH_QUERY))
+                .child(label)
+                .when(unsaved_count > 1, |chip| {
+                    chip.child(
+                        div()
+                            .opacity(0.)
+                            .group_hover(group, |style| style.opacity(1.))
+                            .child(
+                                icon_button(
+                                    ("close-unsaved-query", id as usize),
+                                    icon::CLOSE,
+                                    Tone::Quiet,
+                                    Control::Inline,
+                                    t,
+                                )
+                                .tooltip("Close tab")
+                                .on_click(move |_, _, cx| {
+                                    // Or the chip underneath activates the tab
+                                    // this just closed, in the same click.
+                                    cx.stop_propagation();
+                                    _ = close_workspace.update(cx, |workspace, cx| {
+                                        workspace.close_buffer(id, cx);
+                                    });
+                                }),
+                            ),
+                    )
+                })
+                .on_click(move |_, _, cx| {
+                    _ = open_workspace.update(cx, |workspace, cx| {
+                        workspace.activate_tab(Tab::Query(id), cx);
+                    });
+                })
+                .into_any_element()
+        })
+        .collect::<Vec<_>>();
 
     tabs.extend(
         session
@@ -714,7 +773,9 @@ fn render_tab_strip(profile: &Profile, cx: &mut Context<Workspace>) -> AnyElemen
                 let open_workspace = workspace.clone();
                 let delete_workspace = workspace.clone();
                 let pending = session.pending_delete.as_deref() == Some(name);
-                let active = on_query_tab && session.open_query.as_deref() == Some(name);
+                let active = session
+                    .tab_holding(name)
+                    .is_some_and(|id| session.active == Tab::Query(id));
                 chip(active)
                     .id(("saved-query", index))
                     .group(format!("query-tab-{index}"))
@@ -752,17 +813,13 @@ fn render_tab_strip(profile: &Profile, cx: &mut Context<Workspace>) -> AnyElemen
                                     ))
                                 })
                                 .tooltip("Delete query")
-                                .on_click(move |_, window, cx| {
+                                .on_click(move |_, _, cx| {
                                     // Or the chip underneath opens the query in
                                     // the same click, and the confirmation this
                                     // arms is cleared before it can be seen.
                                     cx.stop_propagation();
                                     _ = delete_workspace.update(cx, |workspace, cx| {
-                                        workspace.arm_delete_saved_query(
-                                            delete_name.clone(),
-                                            window,
-                                            cx,
-                                        );
+                                        workspace.arm_delete_saved_query(delete_name.clone(), cx);
                                     });
                                 }),
                             ),
@@ -831,7 +888,7 @@ fn render_tab_strip(profile: &Profile, cx: &mut Context<Workspace>) -> AnyElemen
     }));
 
     let confirm_workspace = workspace.clone();
-    let naming_a_rename = on_query_tab && session.open_query.is_some();
+    let naming_a_rename = on_query_tab && session.open_query().is_some();
     let naming = session.naming.then(|| {
         div()
             .w(px(240.))
@@ -920,7 +977,7 @@ fn render_tab_strip(profile: &Profile, cx: &mut Context<Workspace>) -> AnyElemen
     });
 
     let zoom = editor_zoom_percent(session.editor_font_size);
-    let named = on_query_tab && session.open_query.is_some();
+    let named = on_query_tab && session.open_query().is_some();
     let new_workspace = workspace.clone();
     let save_workspace = workspace.clone();
     let rename_workspace = workspace.clone();

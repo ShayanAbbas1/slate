@@ -9,7 +9,9 @@ use serde::{Deserialize, Serialize};
 
 const PROFILES_FILE: &str = "profiles.toml";
 const KEYCHAIN_SERVICE: &str = "Slate";
-const SCRATCH_FILE: &str = ".scratch.sql";
+/// The buffer file a build before per-tab buffers wrote. Read-only now, and
+/// only for tab 0 -- see [`read_scratch`].
+const LEGACY_SCRATCH_FILE: &str = ".scratch.sql";
 const HISTORY_FILE: &str = ".history.jsonl";
 /// How far back the history reads.
 ///
@@ -24,7 +26,7 @@ pub const HISTORY_DEPTH: usize = 200;
 const ITEM_NOT_FOUND: i32 = -25300;
 
 /// Field order is load-bearing: TOML cannot emit a scalar after a table, so
-/// every scalar has to precede `open_objects`.
+/// every scalar has to precede the `open_queries` and `open_objects` arrays.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct StoredProfile {
     pub id: String,
@@ -58,10 +60,29 @@ pub struct StoredProfile {
     /// no limit is exactly what it was running with.
     #[serde(default)]
     pub statement_timeout: Option<u32>,
+    /// The name of the one query buffer a profile had, before a profile could
+    /// have several. Read only: nothing writes it any more, and it is kept
+    /// because every profile on disk today carries its open query here and
+    /// removing the field would drop it on the next save.
     #[serde(default)]
     pub open_query: Option<String>,
+    /// The query buffers this profile had open, in strip order.
+    #[serde(default)]
+    pub open_queries: Vec<StoredQueryTab>,
     #[serde(default)]
     pub open_objects: Vec<StoredObject>,
+}
+
+/// One query buffer in the strip. The SQL itself is not here: a saved buffer
+/// lives in its query file and an unsaved one in its scratch file.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct StoredQueryTab {
+    pub id: u64,
+    /// The saved query in this buffer, or absent for an unsaved one.
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub active: bool,
 }
 
 /// An opened table, view or routine, stored by name rather than by content: the
@@ -285,12 +306,35 @@ pub fn validate_query_name(name: &str) -> Result<(), String> {
     }
 }
 
-pub fn read_scratch(profile_id: &str) -> Result<Option<String>, String> {
-    read_file(&query_directory(profile_id)?.join(SCRATCH_FILE))
+/// The unsaved buffer for one tab. Tab 0 falls back to the single file a build
+/// before per-tab buffers wrote, so a profile from such a build comes back with
+/// its buffer rather than an empty editor.
+///
+/// The legacy file is read, never removed: the next write lands in the new
+/// name, and deleting the old one would take the buffer away from an older
+/// build run against the same directory afterwards.
+pub fn read_scratch(profile_id: &str, tab: u64) -> Result<Option<String>, String> {
+    let directory = query_directory(profile_id)?;
+    match read_file(&directory.join(scratch_file(tab)))? {
+        Some(sql) => Ok(Some(sql)),
+        None if tab == 0 => read_file(&directory.join(LEGACY_SCRATCH_FILE)),
+        None => Ok(None),
+    }
 }
 
-pub fn write_scratch(profile_id: &str, sql: &str) -> Result<(), String> {
-    write_file(&query_directory(profile_id)?.join(SCRATCH_FILE), sql)
+pub fn write_scratch(profile_id: &str, tab: u64, sql: &str) -> Result<(), String> {
+    write_file(&query_directory(profile_id)?.join(scratch_file(tab)), sql)
+}
+
+/// A file that is not there is not a failure: closing a buffer nothing was ever
+/// typed into leaves no file to delete.
+pub fn delete_scratch(profile_id: &str, tab: u64) -> Result<(), String> {
+    let path = query_directory(profile_id)?.join(scratch_file(tab));
+    match fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("Could not delete {}: {error}", path.display())),
+    }
 }
 
 /// One statement on its way into a profile's history, newest at the end.
@@ -370,6 +414,10 @@ fn query_directory(profile_id: &str) -> Result<PathBuf, String> {
     Ok(slate_directory()?.join("queries").join(profile_id))
 }
 
+fn scratch_file(tab: u64) -> String {
+    format!(".scratch-{tab}.sql")
+}
+
 fn query_path(profile_id: &str, name: &str) -> Result<PathBuf, String> {
     validate_query_name(name)?;
     Ok(query_directory(profile_id)?.join(format!("{name}.sql")))
@@ -415,6 +463,33 @@ fn secure(path: &Path) -> Result<(), String> {
 mod tests {
     use super::*;
 
+    /// `HOME` is process-wide and the tests run in threads, so the ones that
+    /// touch the disk take turns and each gets its own directory to be the
+    /// whole of Slate's storage for the length of the test.
+    fn with_home<T>(body: impl FnOnce() -> T) -> T {
+        static LOCK: std::sync::Mutex<u32> = std::sync::Mutex::new(0);
+
+        let mut counter = LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        *counter += 1;
+        let home = std::env::temp_dir().join(format!("slate-store-test-{}", *counter));
+        let _ = fs::remove_dir_all(&home);
+        fs::create_dir_all(&home).expect("the test home must be creatable");
+
+        let previous = std::env::var_os("HOME");
+        // SAFETY: the lock above is what makes this the only thread reading or
+        // writing the environment for as long as `body` runs.
+        unsafe { std::env::set_var("HOME", &home) };
+        let outcome = body();
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("HOME", value),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+        let _ = fs::remove_dir_all(&home);
+        outcome
+    }
+
     fn ids(names: &[&str]) -> Vec<String> {
         names.iter().map(|name| (*name).to_string()).collect()
     }
@@ -437,6 +512,7 @@ mod tests {
             editor_font_size: Some(16.0),
             statement_timeout: Some(30),
             open_query: Some("daily".into()),
+            open_queries: Vec::new(),
             open_objects: vec![
                 StoredObject {
                     schema: "public".into(),
@@ -516,6 +592,7 @@ open_objects = []
             editor_font_size: Some(14.0),
             statement_timeout: None,
             open_query: None,
+            open_queries: Vec::new(),
             open_objects: vec![StoredObject {
                 schema: "main".into(),
                 name: "accounts".into(),
@@ -581,6 +658,7 @@ open_objects = []
             editor_font_size: None,
             statement_timeout: Some(30),
             open_query: None,
+            open_queries: Vec::new(),
             open_objects: vec![StoredObject {
                 schema: "main".into(),
                 name: "accounts".into(),
@@ -689,6 +767,173 @@ open_objects = []
             .permissions()
             .mode();
         assert_eq!(mode & 0o777, 0o600);
+    }
+
+    #[test]
+    fn each_tab_keeps_its_own_scratch_buffer() {
+        with_home(|| {
+            write_scratch("dev", 0, "SELECT 1").expect("tab 0 must write");
+            write_scratch("dev", 7, "SELECT 7").expect("tab 7 must write");
+
+            assert_eq!(read_scratch("dev", 0), Ok(Some("SELECT 1".to_string())));
+            assert_eq!(read_scratch("dev", 7), Ok(Some("SELECT 7".to_string())));
+            assert_eq!(read_scratch("dev", 3), Ok(None));
+        });
+    }
+
+    #[test]
+    fn tab_zero_reads_the_buffer_an_older_build_left_behind() {
+        // The single `.scratch.sql` is every profile on disk today. Read as tab
+        // 0's buffer until a write moves it, and preferred against only when
+        // the new name exists -- otherwise a person's unsaved work is an empty
+        // editor after an upgrade.
+        with_home(|| {
+            let legacy = query_directory("dev")
+                .expect("the id must be safe")
+                .join(LEGACY_SCRATCH_FILE);
+            write_file(&legacy, "SELECT legacy").expect("the legacy file must write");
+
+            assert_eq!(
+                read_scratch("dev", 0),
+                Ok(Some("SELECT legacy".to_string()))
+            );
+            // Only tab 0 inherits it.
+            assert_eq!(read_scratch("dev", 1), Ok(None));
+
+            write_scratch("dev", 0, "SELECT new").expect("tab 0 must write");
+
+            assert_eq!(read_scratch("dev", 0), Ok(Some("SELECT new".to_string())));
+            assert!(legacy.exists(), "the legacy file must be left alone");
+        });
+    }
+
+    #[test]
+    fn deleting_one_tabs_scratch_leaves_the_others() {
+        with_home(|| {
+            write_scratch("dev", 0, "SELECT 0").expect("tab 0 must write");
+            write_scratch("dev", 1, "SELECT 1").expect("tab 1 must write");
+
+            assert_eq!(delete_scratch("dev", 1), Ok(()));
+
+            assert_eq!(read_scratch("dev", 0), Ok(Some("SELECT 0".to_string())));
+            assert_eq!(read_scratch("dev", 1), Ok(None));
+        });
+    }
+
+    #[test]
+    fn deleting_a_scratch_that_was_never_written_is_not_a_failure() {
+        // Closing a buffer nobody typed into deletes nothing, and that is the
+        // ordinary case rather than an error.
+        with_home(|| {
+            assert_eq!(delete_scratch("dev", 4), Ok(()));
+        });
+    }
+
+    #[test]
+    fn removing_a_profile_takes_every_tabs_scratch_with_it() {
+        // A profile id derives from its name, so a recreated profile can be
+        // handed a dead one's id -- and a leftover buffer would open as
+        // somebody else's SQL.
+        with_home(|| {
+            write_scratch("dev", 0, "SELECT 0").expect("tab 0 must write");
+            write_scratch("dev", 2, "SELECT 2").expect("tab 2 must write");
+            let legacy = query_directory("dev")
+                .expect("the id must be safe")
+                .join(LEGACY_SCRATCH_FILE);
+            write_file(&legacy, "SELECT legacy").expect("the legacy file must write");
+
+            delete_queries("dev").expect("the profile's queries must be removable");
+
+            assert_eq!(read_scratch("dev", 0), Ok(None));
+            assert_eq!(read_scratch("dev", 2), Ok(None));
+            assert!(!legacy.exists(), "the legacy file must go too");
+        });
+    }
+
+    #[test]
+    fn a_profile_written_before_open_queries_existed_keeps_its_open_query() {
+        // The file on disk for anyone running Slate today: one buffer, named in
+        // `open_query`. Dropping either the field or the decode loses it.
+        let (profiles, ..) = decode_profiles(
+            "\
+[[profiles]]
+id = \"slate-dev\"
+name = \"slate_dev\"
+host = \"127.0.0.1\"
+port = 55432
+database = \"slate_dev\"
+user = \"slate\"
+sslmode = \"prefer\"
+open_query = \"daily\"
+open_objects = []
+",
+        )
+        .expect("a profile predating open_queries must load");
+
+        let [profile] = &profiles[..] else {
+            panic!("expected exactly one profile, got {}", profiles.len());
+        };
+        assert_eq!(profile.open_query.as_deref(), Some("daily"));
+        assert_eq!(profile.open_queries, vec![]);
+    }
+
+    #[test]
+    fn open_queries_and_open_objects_both_survive_the_round_trip() {
+        // Two arrays of tables in one profile: every scalar has to precede
+        // both, and this is the encode that fails if one moves after them.
+        let profile = StoredProfile {
+            id: "dev".into(),
+            name: "Dev".into(),
+            host: "127.0.0.1".into(),
+            port: Some(5432),
+            database: "slate_dev".into(),
+            user: "slate".into(),
+            sslmode: None,
+            root_certificate: None,
+            engine: Some("postgres".into()),
+            path: None,
+            editor_font_size: Some(15.0),
+            statement_timeout: Some(30),
+            open_query: Some("daily".into()),
+            open_queries: vec![
+                StoredQueryTab {
+                    id: 0,
+                    name: None,
+                    active: false,
+                },
+                StoredQueryTab {
+                    id: 4,
+                    name: Some("daily".into()),
+                    active: true,
+                },
+            ],
+            open_objects: vec![StoredObject {
+                schema: "public".into(),
+                name: "accounts".into(),
+                routine: false,
+                active: true,
+            }],
+        };
+        let text = toml::to_string_pretty(&ProfileFile {
+            active: Some("dev".into()),
+            fonts: None,
+            profiles: vec![profile.clone()],
+        })
+        .expect("profiles must encode");
+
+        let decoded: ProfileFile = toml::from_str(&text).expect("profiles must decode");
+        assert_eq!(decoded.profiles, vec![profile]);
+
+        let timeout_at = text
+            .find("statement_timeout = ")
+            .expect("statement_timeout must be written");
+        let open_queries_at = text
+            .find("[[profiles.open_queries]]")
+            .expect("open_queries must be written as a table");
+        assert!(
+            timeout_at < open_queries_at,
+            "statement_timeout after open_queries:\n{text}"
+        );
     }
 
     #[test]

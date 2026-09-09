@@ -172,7 +172,16 @@ impl Profile {
             },
             editor_font_size: Some(self.session.editor_font_size),
             statement_timeout: Some(self.config.statement_timeout()),
-            open_query: self.session.open_query.clone(),
+            // Nothing writes the legacy scalar any more; a buffer's name is a
+            // property of its tab now. Kept on the stored shape only so a
+            // profile written by an older build still loads with its buffer.
+            open_query: None,
+            open_queries: self
+                .session
+                .queries
+                .iter()
+                .map(|tab| tab.stored(self.session.active == Tab::Query(tab.id)))
+                .collect(),
             open_objects,
         }
     }
@@ -191,13 +200,13 @@ enum ProfileState {
 /// create, and the connection resolves on a task that has none — so this is
 /// built before the spawn and moved in once the connection opens.
 struct Session {
-    editor: Entity<InputState>,
-    /// The editor's own grid. Every object tab owns another, so switching tabs
-    /// cannot leave one surface's rows sitting under another's heading.
-    results: Entity<TableState<ResultGrid>>,
-    query: QueryState,
+    /// The open query buffers, in strip order. Never empty: a profile always
+    /// has somewhere to write, so the last unsaved buffer has no closed state
+    /// to go to.
+    queries: Vec<QueryTab>,
     objects: Vec<ObjectTab>,
     active: Tab,
+    next_query_id: u64,
     next_object_id: u64,
     /// Object tabs read back from disk, held until the catalog can name them.
     pending_objects: Vec<store::StoredObject>,
@@ -210,7 +219,6 @@ struct Session {
     /// The same hazard for the name field: an unfocused input asks for a name
     /// nobody can type into.
     save_name_needs_focus: bool,
-    open_query: Option<String>,
     saved_queries: Vec<String>,
     /// The statements this profile has run, newest first. Held rather than read
     /// off disk when the palette opens, for the reason `saved_queries` is: the
@@ -228,13 +236,6 @@ struct Session {
     pending_close: Option<String>,
     notice: Option<String>,
     editor_font_size: f32,
-    /// The statement behind the query tab's grid.
-    ///
-    /// Held rather than derived from the buffer, unlike the sort path, and a
-    /// deliberate exception to that rule (in-grid editing spec, §4): applying
-    /// edits appends the `UPDATE` to the buffer, so the cursor no longer sits on
-    /// the `SELECT` and the text can no longer say where these rows came from.
-    last_query: Option<String>,
     /// The generated batch a relation tab is showing before it runs. That tab
     /// has no buffer to put SQL in, so the modal is where the statement is on
     /// screen — and nothing runs until Run.
@@ -252,7 +253,7 @@ struct ApplyReview {
 impl Session {
     fn new(
         id: String,
-        open_query: Option<String>,
+        stored_queries: Vec<store::StoredQueryTab>,
         editor_font_size: f32,
         pending_objects: Vec<store::StoredObject>,
         window: &mut Window,
@@ -285,31 +286,49 @@ impl Session {
         .detach();
 
         let saved_queries = store::saved_queries(&id);
-        let open_query = open_query.filter(|name| saved_queries.contains(name));
-        let stored_sql = match &open_query {
-            Some(name) => store::read_query(&id, name),
-            None => store::read_scratch(&id),
-        };
-        // A buffer that could not be read is left empty either way, so the
-        // notice is the only thing between that and a session that looks like
-        // it never held anything.
-        let (sql, notice) = match stored_sql {
-            Ok(sql) => (sql.unwrap_or_default(), None),
-            Err(message) => (String::new(), Some(message)),
-        };
+        // A tab naming a query whose file has gone comes back as the unsaved
+        // buffer it now is, rather than as a tab pointing at nothing.
+        let mut stored_queries = stored_queries
+            .into_iter()
+            .map(|mut stored| {
+                stored.name = stored.name.filter(|name| saved_queries.contains(name));
+                stored
+            })
+            .collect::<Vec<_>>();
+        if stored_queries.is_empty() {
+            stored_queries.push(store::StoredQueryTab {
+                id: 0,
+                name: None,
+                active: true,
+            });
+        }
+
+        let active = stored_queries
+            .iter()
+            .find(|stored| stored.active)
+            .unwrap_or(&stored_queries[0])
+            .id;
+        let next_query_id = stored_queries
+            .iter()
+            .map(|stored| stored.id + 1)
+            .max()
+            .unwrap_or(0);
+
+        let mut notice = None;
+        let queries = stored_queries
+            .iter()
+            .map(|stored| {
+                let (tab, failure) = QueryTab::restore(&id, stored, window, cx);
+                notice = notice.take().or(failure);
+                tab
+            })
+            .collect();
 
         Self {
-            editor: cx.new(|cx| {
-                InputState::new(window, cx)
-                    .code_editor("sql")
-                    .soft_wrap(false)
-                    .placeholder("Write SQL…")
-                    .default_value(sql)
-            }),
-            results: result_grid(window, cx),
-            query: QueryState::Idle,
+            queries,
             objects: Vec::new(),
-            active: Tab::Query,
+            active: Tab::Query(active),
+            next_query_id,
             next_object_id: 0,
             pending_objects,
             explorer_filter,
@@ -317,7 +336,6 @@ impl Session {
             explorer_leaves: Arc::new(HashMap::new()),
             editor_needs_focus: true,
             save_name_needs_focus: false,
-            open_query,
             saved_queries,
             history: store::history(&id),
             save_name,
@@ -326,15 +344,44 @@ impl Session {
             pending_close: None,
             notice,
             editor_font_size,
-            last_query: None,
             apply_review: None,
         }
+    }
+
+    fn query_tab(&self, id: u64) -> Option<&QueryTab> {
+        self.queries.iter().find(|tab| tab.id == id)
+    }
+
+    fn query_tab_mut(&mut self, id: u64) -> Option<&mut QueryTab> {
+        self.queries.iter_mut().find(|tab| tab.id == id)
+    }
+
+    /// The query buffer in front, or `None` when an object tab is.
+    fn active_query_tab(&self) -> Option<&QueryTab> {
+        match self.active {
+            Tab::Query(id) => self.query_tab(id),
+            Tab::Object(_) => None,
+        }
+    }
+
+    /// The tab a buffer holding `name` is in, if one is open.
+    fn tab_holding(&self, name: &str) -> Option<u64> {
+        self.queries
+            .iter()
+            .find(|tab| tab.open_query.as_deref() == Some(name))
+            .map(|tab| tab.id)
+    }
+
+    /// The name of the buffer in front, when it has one.
+    fn open_query(&self) -> Option<&str> {
+        self.active_query_tab()
+            .and_then(|tab| tab.open_query.as_deref())
     }
 
     fn active_object(&self) -> Option<&ObjectTab> {
         match self.active {
             Tab::Object(id) => self.objects.iter().find(|tab| tab.id == id),
-            Tab::Query => None,
+            Tab::Query(_) => None,
         }
     }
 
@@ -342,7 +389,7 @@ impl Session {
     /// runs nothing — a routine is read, never executed by being opened.
     fn active_query(&self) -> Option<&QueryState> {
         match self.active_object() {
-            None => Some(&self.query),
+            None => self.active_query_tab().map(|tab| &tab.query),
             Some(tab) => match &tab.body {
                 ObjectBody::Relation { query, .. } => Some(query),
                 ObjectBody::Routine(_) => None,
@@ -354,7 +401,7 @@ impl Session {
     /// read, not run.
     fn active_results(&self) -> Option<&Entity<TableState<ResultGrid>>> {
         match self.active_object() {
-            None => Some(&self.results),
+            None => self.active_query_tab().map(|tab| &tab.results),
             Some(tab) => match &tab.body {
                 ObjectBody::Relation { results, .. } => Some(results),
                 ObjectBody::Routine(_) => None,
@@ -366,7 +413,7 @@ impl Session {
     /// shows an object: there is no SQL in front of the user to run.
     fn editor(&self, tab: Tab) -> Option<Entity<InputState>> {
         match tab {
-            Tab::Query => Some(self.editor.clone()),
+            Tab::Query(id) => self.query_tab(id).map(|tab| tab.editor.clone()),
             Tab::Object(_) => None,
         }
     }
@@ -375,7 +422,11 @@ impl Session {
     /// keeps a result from landing in one tab's grid with another tab's status.
     fn slot(&mut self, tab: Tab) -> Option<(&mut QueryState, Entity<TableState<ResultGrid>>)> {
         match tab {
-            Tab::Query => Some((&mut self.query, self.results.clone())),
+            Tab::Query(id) => {
+                let tab = self.query_tab_mut(id)?;
+                let results = tab.results.clone();
+                Some((&mut tab.query, results))
+            }
             Tab::Object(id) => match &mut self.objects.iter_mut().find(|tab| tab.id == id)?.body {
                 ObjectBody::Relation { query, results, .. } => Some((query, results.clone())),
                 ObjectBody::Routine(_) => None,
@@ -429,12 +480,12 @@ enum CatalogState {
     Failed(String),
 }
 
-/// Which surface the main pane is showing, and what a run targets. Object tabs
-/// are addressed by id rather than by index, so closing one cannot land an
-/// in-flight result in its neighbour's grid.
+/// Which surface the main pane is showing, and what a run targets. Both kinds
+/// of tab are addressed by id rather than by index, so closing one cannot land
+/// an in-flight result in its neighbour's grid.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Tab {
-    Query,
+    Query(u64),
     Object(u64),
 }
 
@@ -447,15 +498,96 @@ enum CloseTarget {
     /// Ask first. A saved query is listed while its file exists and gone when
     /// it does not, so closing its tab is deleting it.
     SavedQuery(String),
+    /// Close it. An unsaved buffer that is not the last one is a scratch pad
+    /// someone is done with; its text goes with it, which is what closing an
+    /// unnamed buffer means everywhere else.
+    Buffer(u64),
 }
 
-/// `None` for the scratch buffer, which is always in the strip: there is no
-/// closed state for it to go to, so `cmd+w` on it does nothing rather than
-/// inventing one.
-fn close_target(active: Tab, open_query: Option<&str>) -> Option<CloseTarget> {
-    match active {
-        Tab::Object(id) => Some(CloseTarget::Object(id)),
-        Tab::Query => open_query.map(|name| CloseTarget::SavedQuery(name.to_string())),
+/// `None` for the last unsaved buffer, which is always in the strip: a profile
+/// always has somewhere to write, so there is no closed state for it to go to
+/// and `cmd+w` on it does nothing rather than inventing one.
+fn close_target(active: Tab, open_query: Option<&str>, unsaved: usize) -> Option<CloseTarget> {
+    match (active, open_query) {
+        (Tab::Object(id), _) => Some(CloseTarget::Object(id)),
+        (Tab::Query(_), Some(name)) => Some(CloseTarget::SavedQuery(name.to_string())),
+        (Tab::Query(id), None) => (unsaved > 1).then_some(CloseTarget::Buffer(id)),
+    }
+}
+
+/// One query buffer, and everything that belongs to it.
+///
+/// There used to be exactly one of these per profile, held directly on
+/// `Session`, and opening a saved query swapped its text in place. That is why
+/// `cmd+t` on a dirty scratch buffer persisted it and then cleared it: there
+/// was nowhere else for it to be. A buffer is a tab now, the same way an object
+/// is, and for the same reason -- addressed by id, so closing one cannot land
+/// another's result in its grid.
+struct QueryTab {
+    id: u64,
+    editor: Entity<InputState>,
+    results: Entity<TableState<ResultGrid>>,
+    query: QueryState,
+    /// The saved query this buffer holds, or `None` while it is unsaved.
+    ///
+    /// It is also which file the buffer persists to: a name means the query
+    /// file, no name means this tab's own scratch file.
+    open_query: Option<String>,
+    /// The statement behind this tab's grid.
+    ///
+    /// Held rather than derived from the buffer, unlike the sort path, and a
+    /// deliberate exception to that rule (in-grid editing spec, §4): applying
+    /// edits appends the `UPDATE` to the buffer, so the cursor no longer sits on
+    /// the `SELECT` and the text can no longer say where these rows came from.
+    last_query: Option<String>,
+}
+
+impl QueryTab {
+    /// Read one stored buffer back off disk.
+    ///
+    /// Returns the message rather than reporting it: several tabs are restored
+    /// at once and the session shows one notice, so the caller decides which
+    /// failure is the one worth saying. A buffer that could not be read is
+    /// empty either way, and silence would make it look like it never held
+    /// anything.
+    fn restore(
+        profile_id: &str,
+        stored: &store::StoredQueryTab,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) -> (Self, Option<String>) {
+        let text = match &stored.name {
+            Some(name) => store::read_query(profile_id, name),
+            None => store::read_scratch(profile_id, stored.id),
+        };
+        let (sql, notice) = match text {
+            Ok(sql) => (sql.unwrap_or_default(), None),
+            Err(message) => (String::new(), Some(message)),
+        };
+
+        let tab = Self {
+            id: stored.id,
+            editor: cx.new(|cx| {
+                InputState::new(window, cx)
+                    .code_editor("sql")
+                    .soft_wrap(false)
+                    .placeholder("Write SQL…")
+                    .default_value(sql)
+            }),
+            results: result_grid(window, cx),
+            query: QueryState::Idle,
+            open_query: stored.name.clone(),
+            last_query: None,
+        };
+        (tab, notice)
+    }
+
+    fn stored(&self, active: bool) -> store::StoredQueryTab {
+        store::StoredQueryTab {
+            id: self.id,
+            name: self.open_query.clone(),
+            active,
+        }
     }
 }
 
@@ -1163,9 +1295,20 @@ impl Workspace {
                 }
             }
         };
+        // A profile written before a buffer was a tab carries one buffer, whose
+        // name is in the legacy scalar and whose text `read_scratch` migrates.
+        let stored_queries = if stored.open_queries.is_empty() {
+            vec![store::StoredQueryTab {
+                id: 0,
+                name: stored.open_query.clone(),
+                active: true,
+            }]
+        } else {
+            stored.open_queries
+        };
         let mut session = Session::new(
             stored.id.clone(),
-            stored.open_query,
+            stored_queries,
             restored_editor_font_size(stored.editor_font_size),
             stored.open_objects,
             window,
@@ -1209,7 +1352,7 @@ impl Workspace {
         let id = store::profile_id(&name, &existing);
         let session = Session::new(
             id.clone(),
-            None,
+            Vec::new(),
             EDITOR_FONT_SIZE_DEFAULT,
             Vec::new(),
             window,
@@ -1527,9 +1670,13 @@ impl Workspace {
             _ => None,
         };
 
-        profile.session.editor.update(cx, |editor, _| {
-            editor.lsp.completion_provider = provider;
-        });
+        // Every buffer, not just the one in front: a tab switch must not be a
+        // moment where completion quietly stops working.
+        for tab in &profile.session.queries {
+            tab.editor.update(cx, |editor, _| {
+                editor.lsp.completion_provider = provider.clone();
+            });
+        }
     }
 
     fn refresh_explorer(&mut self, id: &str, cx: &mut Context<Self>) {
@@ -1924,8 +2071,10 @@ impl Workspace {
     fn close_object(&mut self, id: u64, cx: &mut Context<Self>) {
         if let Some(profile) = self.profile_mut() {
             profile.session.objects.retain(|tab| tab.id != id);
-            if profile.session.active == Tab::Object(id) {
-                profile.session.active = Tab::Query;
+            if profile.session.active == Tab::Object(id)
+                && let Some(first) = profile.session.queries.first().map(|tab| tab.id)
+            {
+                profile.session.active = Tab::Query(first);
                 profile.session.editor_needs_focus = true;
             }
         }
@@ -2028,7 +2177,7 @@ impl Workspace {
             cx.notify();
             return;
         }
-        if matches!(profile.session.active, Tab::Query) {
+        if matches!(profile.session.active, Tab::Query(_)) {
             // Nothing of Slate's is stacked over the editor, so the keystroke
             // is not ours. Handing it on is what lets the completion popup --
             // which is the input's, not Slate's -- close on `escape`; this
@@ -2036,7 +2185,10 @@ impl Workspace {
             cx.propagate();
             return;
         }
-        profile.session.active = Tab::Query;
+        let Some(&QueryTab { id, .. }) = profile.session.queries.first() else {
+            return;
+        };
+        profile.session.active = Tab::Query(id);
         profile.session.editor_needs_focus = true;
         self.remember_profiles(cx);
         cx.notify();
@@ -2059,8 +2211,14 @@ impl Workspace {
             return;
         };
         let session = &profile.session;
-        match close_target(session.active, session.open_query.as_deref()) {
+        let unsaved = session
+            .queries
+            .iter()
+            .filter(|tab| tab.open_query.is_none())
+            .count();
+        match close_target(session.active, session.open_query(), unsaved) {
             Some(CloseTarget::Object(id)) => self.close_object(id, cx),
+            Some(CloseTarget::Buffer(id)) => self.close_buffer(id, cx),
             Some(CloseTarget::SavedQuery(name)) => {
                 if let Some(profile) = self.profile_mut() {
                     profile.session.pending_close = Some(name);
@@ -2352,7 +2510,7 @@ impl Workspace {
 
         match profile.session.active {
             Tab::Object(id) => self.relation_sort(id, column, cx),
-            Tab::Query => self.query_sort(column, window, cx),
+            Tab::Query(_) => self.query_sort(column, window, cx),
         }
     }
 
@@ -2364,8 +2522,12 @@ impl Workspace {
         let Some(profile) = self.profile() else {
             return;
         };
-        let editor = profile.session.editor.clone();
-        let results = profile.session.results.clone();
+        let Some(tab) = profile.session.active_query_tab() else {
+            return;
+        };
+        let tab_id = tab.id;
+        let editor = tab.editor.clone();
+        let results = tab.results.clone();
 
         let Some(expression) =
             sort_expression(engine, results.read(cx).delegate().columns(), column)
@@ -2398,7 +2560,7 @@ impl Workspace {
         let mut replaced = text.clone();
         replaced.replace_range(range, &sorted);
         editor.update(cx, |editor, cx| editor.set_value(replaced, window, cx));
-        self.execute_sql(sorted, Tab::Query, cx);
+        self.execute_sql(sorted, Tab::Query(tab_id), cx);
     }
 
     /// `Enter` on the active cell opens an input on it. Everything after this
@@ -2508,8 +2670,8 @@ impl Workspace {
             Some(tab) => tab.name.clone(),
             None => profile
                 .session
-                .open_query
-                .clone()
+                .open_query()
+                .map(str::to_string)
                 .unwrap_or_else(|| "results".to_string()),
         };
         let id = profile.id.clone();
@@ -2606,7 +2768,7 @@ impl Workspace {
         }
 
         match tab {
-            Tab::Query => self.apply_in_buffer(batch, window, cx),
+            Tab::Query(_) => self.apply_in_buffer(batch, window, cx),
             Tab::Object(_) => {
                 if let Some(profile) = self.profile_mut() {
                     profile.session.apply_review = Some(ApplyReview { tab, sql: batch });
@@ -2626,8 +2788,11 @@ impl Workspace {
         let Some(profile) = self.profile() else {
             return;
         };
-        let editor = profile.session.editor.clone();
-        let Some(select) = profile.session.last_query.clone() else {
+        let Some(tab) = profile.session.active_query_tab() else {
+            return;
+        };
+        let (id, editor) = (tab.id, tab.editor.clone());
+        let Some(select) = tab.last_query.clone() else {
             self.note(
                 "Slate does not know which statement produced these rows.".into(),
                 cx,
@@ -2638,7 +2803,7 @@ impl Workspace {
         let text = editor.read(cx).value().to_string();
         let appended = appended_statement(&text, &batch);
         editor.update(cx, |editor, cx| editor.set_value(appended, window, cx));
-        self.execute_and_then(batch, Tab::Query, Some(Refresh::Statement(select)), cx);
+        self.execute_and_then(batch, Tab::Query(id), Some(Refresh::Statement(select)), cx);
     }
 
     /// Run the batch a relation tab is showing. The modal stays up until it
@@ -2725,14 +2890,15 @@ impl Workspace {
     /// does: it holds SQL Slate wrote, not a file the user opened.
     fn named(&self) -> bool {
         self.profile().is_some_and(|profile| {
-            matches!(profile.session.active, Tab::Query) && profile.session.open_query.is_some()
+            matches!(profile.session.active, Tab::Query(_))
+                && profile.session.open_query().is_some()
         })
     }
 
     fn rename_query(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(name) = self
             .profile()
-            .and_then(|profile| profile.session.open_query.clone())
+            .and_then(|profile| profile.session.open_query().map(str::to_string))
         else {
             return;
         };
@@ -2776,7 +2942,10 @@ impl Workspace {
         // The name the buffer is leaving behind, if it had one. Present only
         // for a rename, since `cmd+s` on a named query never asks.
         let previous = match tab {
-            Tab::Query => profile.session.open_query.clone(),
+            Tab::Query(id) => profile
+                .session
+                .query_tab(id)
+                .and_then(|tab| tab.open_query.clone()),
             Tab::Object(_) => None,
         };
         if previous.as_deref() != Some(name.as_str())
@@ -2811,9 +2980,11 @@ impl Workspace {
                 self.close_object(object, cx);
                 self.open_saved_query(name.clone(), window, cx);
             }
-            Tab::Query => {
+            Tab::Query(id) => {
                 if let Some(profile) = self.profile_mut() {
-                    profile.session.open_query = Some(name.clone());
+                    if let Some(tab) = profile.session.query_tab_mut(id) {
+                        tab.open_query = Some(name.clone());
+                    }
                     profile.session.editor_needs_focus = true;
                 }
             }
@@ -2825,6 +2996,11 @@ impl Workspace {
         cx.notify();
     }
 
+    /// A new empty buffer, beside the ones already open.
+    ///
+    /// It used to clear the buffer in front, which is why a dirty scratch was
+    /// persisted and then emptied: one editor meant a new query had nowhere to
+    /// go but on top of the old one.
     fn new_query(&mut self, _: &NewQuery, window: &mut Window, cx: &mut Context<Self>) {
         if let Err(message) = self.persist_buffer(cx) {
             self.note(message, cx);
@@ -2833,23 +3009,72 @@ impl Workspace {
         let Some(profile) = self.profile_mut() else {
             return;
         };
-        profile.session.open_query = None;
-        profile.session.query = QueryState::Idle;
+        let id = profile.session.next_query_id;
+        profile.session.next_query_id += 1;
         profile.session.naming = false;
         profile.session.notice = None;
-        profile
-            .session
-            .editor
-            .update(cx, |editor, cx| editor.set_value("", window, cx));
-        self.activate_tab(Tab::Query, cx);
+        let profile_id = profile.id.clone();
+
+        let (tab, _) = QueryTab::restore(
+            &profile_id,
+            &store::StoredQueryTab {
+                id,
+                name: None,
+                active: true,
+            },
+            window,
+            cx,
+        );
+        let Some(profile) = self.profile_mut() else {
+            return;
+        };
+        let profile_id = profile.id.clone();
+        profile.session.queries.push(tab);
+        self.install_completions(&profile_id, cx);
+        self.activate_tab(Tab::Query(id), cx);
     }
 
+    /// Close an unsaved buffer. Its scratch file goes with it: an unnamed
+    /// buffer is its text, and closing one is discarding both.
+    fn close_buffer(&mut self, id: u64, cx: &mut Context<Self>) {
+        let Some(profile) = self.profile_mut() else {
+            return;
+        };
+        let position = profile.session.queries.iter().position(|tab| tab.id == id);
+        let Some(position) = position else {
+            return;
+        };
+        profile.session.queries.remove(position);
+        let profile_id = profile.id.clone();
+
+        if profile.session.active == Tab::Query(id) {
+            // The neighbour on the left, or the one that slid into this slot.
+            let next = profile
+                .session
+                .queries
+                .get(position.saturating_sub(1))
+                .map(|tab| tab.id);
+            if let Some(next) = next {
+                profile.session.active = Tab::Query(next);
+                profile.session.editor_needs_focus = true;
+            }
+        }
+
+        if let Err(message) = store::delete_scratch(&profile_id, id) {
+            self.note(message, cx);
+        }
+        self.remember_profiles(cx);
+        cx.notify();
+    }
+
+    /// Bring a saved query up: its own tab if one is already open, a new one
+    /// otherwise. It never lands on top of a buffer someone is writing in.
     fn open_saved_query(&mut self, name: String, window: &mut Window, cx: &mut Context<Self>) {
-        if self
+        if let Some(id) = self
             .profile()
-            .is_some_and(|profile| profile.session.open_query.as_deref() == Some(&name))
+            .and_then(|profile| profile.session.tab_holding(&name))
         {
-            self.activate_tab(Tab::Query, cx);
+            self.activate_tab(Tab::Query(id), cx);
             return;
         }
         if let Err(message) = self.persist_buffer(cx) {
@@ -2859,10 +3084,13 @@ impl Workspace {
         let Some(profile) = self.profile_mut() else {
             return;
         };
-        let sql = match store::read_query(&profile.id, &name) {
-            Ok(Some(sql)) => sql,
+        let profile_id = profile.id.clone();
+        // Read before the tab is built, so a query whose file has gone since
+        // the strip was drawn says so instead of opening an empty buffer.
+        match store::read_query(&profile_id, &name) {
+            Ok(Some(_)) => {}
             Ok(None) => {
-                profile.session.saved_queries = store::saved_queries(&profile.id);
+                profile.session.saved_queries = store::saved_queries(&profile_id);
                 profile.session.notice = Some(format!("{name} no longer exists."));
                 cx.notify();
                 return;
@@ -2872,15 +3100,29 @@ impl Workspace {
                 cx.notify();
                 return;
             }
-        };
-        profile
-            .session
-            .editor
-            .update(cx, |editor, cx| editor.set_value(sql, window, cx));
-        profile.session.open_query = Some(name);
-        profile.session.query = QueryState::Idle;
+        }
+
+        let id = profile.session.next_query_id;
+        profile.session.next_query_id += 1;
         profile.session.notice = None;
-        self.activate_tab(Tab::Query, cx);
+
+        let (tab, notice) = QueryTab::restore(
+            &profile_id,
+            &store::StoredQueryTab {
+                id,
+                name: Some(name),
+                active: true,
+            },
+            window,
+            cx,
+        );
+        let Some(profile) = self.profile_mut() else {
+            return;
+        };
+        profile.session.queries.push(tab);
+        profile.session.notice = notice;
+        self.install_completions(&profile_id, cx);
+        self.activate_tab(Tab::Query(id), cx);
     }
 
     /// A statement out of the history, back in the buffer.
@@ -2894,7 +3136,10 @@ impl Workspace {
         let Some(profile) = self.profile() else {
             return;
         };
-        let editor = profile.session.editor.clone();
+        let Some(tab) = profile.session.active_query_tab() else {
+            return;
+        };
+        let (id, editor) = (tab.id, tab.editor.clone());
         let text = editor.read(cx).value().to_string();
         let appended = appended_statement(&text, &sql);
         let line = appended.lines().count().saturating_sub(sql.lines().count()) as u32;
@@ -2902,64 +3147,32 @@ impl Workspace {
             editor.set_value(appended, window, cx);
             editor.set_cursor_position(Position::new(line, 0), window, cx);
         });
-        self.activate_tab(Tab::Query, cx);
+        self.activate_tab(Tab::Query(id), cx);
     }
 
-    fn open_scratch_query(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self
-            .profile()
-            .is_some_and(|profile| profile.session.open_query.is_none())
-        {
-            self.activate_tab(Tab::Query, cx);
-            return;
-        }
-        if let Err(message) = self.persist_buffer(cx) {
-            self.note(message, cx);
-            return;
-        }
-        if let Some(profile) = self.profile_mut() {
-            profile.session.notice = None;
-        }
-        self.load_scratch_buffer(window, cx);
-        self.activate_tab(Tab::Query, cx);
-    }
-
-    /// Put the scratch file in the editor, whatever the buffer was showing.
+    /// The first unsaved buffer, or a new one when every open tab has a name.
     ///
-    /// Deliberately does not write the buffer out first, unlike every other
-    /// swap. Its callers have either just persisted it or just deleted the file
-    /// it came from, and in the second case a write would put a deleted query's
-    /// text into the scratch file — over whatever was actually in there.
-    fn load_scratch_buffer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(profile) = self.profile_mut() else {
-            return;
-        };
-        let sql = match store::read_scratch(&profile.id) {
-            Ok(sql) => sql.unwrap_or_default(),
-            Err(message) => {
-                profile.session.notice = Some(message);
-                cx.notify();
-                return;
-            }
-        };
-        profile
-            .session
-            .editor
-            .update(cx, |editor, cx| editor.set_value(sql, window, cx));
-        profile.session.open_query = None;
-        profile.session.query = QueryState::Idle;
-        cx.notify();
+    /// It used to swap the scratch file into the single editor, which is what
+    /// made "New Query" a place rather than a tab.
+    fn open_scratch_query(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let unsaved = self.profile().and_then(|profile| {
+            profile
+                .session
+                .queries
+                .iter()
+                .find(|tab| tab.open_query.is_none())
+                .map(|tab| tab.id)
+        });
+        match unsaved {
+            Some(id) => self.activate_tab(Tab::Query(id), cx),
+            None => self.new_query(&NewQuery, window, cx),
+        }
     }
 
     /// The chip's own delete: the first click arms it and the second one means
     /// it. Quieter than the dialog `cmd+w` raises, because the trash icon is
     /// already an unambiguous ask and the tab it belongs to is right there.
-    fn arm_delete_saved_query(
-        &mut self,
-        name: String,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn arm_delete_saved_query(&mut self, name: String, cx: &mut Context<Self>) {
         let Some(profile) = self.profile_mut() else {
             return;
         };
@@ -2968,17 +3181,17 @@ impl Workspace {
             cx.notify();
             return;
         }
-        self.delete_saved_query(name, window, cx);
+        self.delete_saved_query(name, cx);
     }
 
-    fn delete_saved_query(&mut self, name: String, window: &mut Window, cx: &mut Context<Self>) {
+    fn delete_saved_query(&mut self, name: String, cx: &mut Context<Self>) {
         let Some(profile) = self.profile() else {
             return;
         };
         let id = profile.id.clone();
-        // Read before the delete, because afterwards the buffer is showing a
-        // file that no longer exists and only this says so.
-        let was_open = profile.session.open_query.as_deref() == Some(&name);
+        // Read before the delete, because afterwards nothing on the session
+        // still points at the file and only this says which tab did.
+        let was_open = profile.session.tab_holding(&name);
         if let Err(message) = store::delete_query(&id, &name) {
             self.note(message, cx);
             return;
@@ -2988,13 +3201,26 @@ impl Workspace {
             profile.session.pending_delete = None;
             profile.session.pending_close = None;
             profile.session.notice = Some(format!("Deleted {name}."));
-        }
-        // Dropping the name alone would leave the deleted query's text sitting
-        // in the buffer as the scratch buffer's contents — and the next save
-        // would write it over the scratch file, taking unsaved work with a
-        // deletion that was never asked to touch it.
-        if was_open {
-            self.load_scratch_buffer(window, cx);
+
+            // The tab goes with the file. Its text was the query, and the query
+            // is what was deleted -- keeping it in an untitled buffer would
+            // leave `cmd+w` looking like it had done nothing.
+            if let Some(open) = was_open {
+                if profile.session.queries.len() > 1 {
+                    profile.session.queries.retain(|tab| tab.id != open);
+                    if profile.session.active == Tab::Query(open)
+                        && let Some(next) = profile.session.queries.first().map(|tab| tab.id)
+                    {
+                        profile.session.active = Tab::Query(next);
+                        profile.session.editor_needs_focus = true;
+                    }
+                } else if let Some(tab) = profile.session.query_tab_mut(open) {
+                    // The only buffer. A profile always has somewhere to write,
+                    // so it is unnamed from here rather than closed, and the
+                    // strip keeps a place to type in.
+                    tab.open_query = None;
+                }
+            }
         }
         self.remember_profiles(cx);
         cx.notify();
@@ -3070,7 +3296,7 @@ impl Workspace {
         let keys = keys.unwrap_or_default();
         // Kept only where it is read back: the query tab's grid has to be able
         // to say which statement produced it.
-        let statement = matches!(tab, Tab::Query).then(|| sql.clone());
+        let statement = matches!(tab, Tab::Query(_)).then(|| sql.clone());
         // Recorded on the way out rather than on the way back: the history is
         // what the user ran, and a statement that failed is exactly the one
         // worth getting back. Only the buffer's — a relation's preview is SQL
@@ -3128,8 +3354,12 @@ impl Workspace {
                         // so it is not the statement to go back to — which is
                         // what keeps an applied UPDATE from becoming the query
                         // an apply re-runs.
-                        if produced_grid && let Some(statement) = statement {
-                            profile.session.last_query = Some(statement);
+                        if produced_grid
+                            && let Some(statement) = statement
+                            && let Tab::Query(query) = tab
+                            && let Some(tab) = profile.session.query_tab_mut(query)
+                        {
+                            tab.last_query = Some(statement);
                         }
                         // Nothing left to read once the batch it was showing has
                         // run.
@@ -3537,13 +3767,9 @@ impl Workspace {
                                         t,
                                     )
                                     .on_click(
-                                        move |_, window, cx| {
+                                        move |_, _, cx| {
                                             _ = delete_workspace.update(cx, |workspace, cx| {
-                                                workspace.delete_saved_query(
-                                                    deleted.clone(),
-                                                    window,
-                                                    cx,
-                                                );
+                                                workspace.delete_saved_query(deleted.clone(), cx);
                                             });
                                         },
                                     ),
@@ -3996,7 +4222,7 @@ impl Render for Workspace {
             // workspace along the focused element's dispatch path, so a
             // surface with nothing focused makes every keybinding dead.
             let focus = match profile.session.active {
-                Tab::Query => Focus::Buffer(profile.session.editor.clone()),
+                Tab::Query(id) => Focus::Buffer(profile.session.query_tab(id)?.editor.clone()),
                 Tab::Object(id) => {
                     let tab = profile.session.objects.iter().find(|tab| tab.id == id)?;
                     match &tab.body {
@@ -4434,12 +4660,27 @@ fn object_icon(kind: ObjectKind) -> &'static str {
     }
 }
 
-/// Write a profile's editor back to whichever file it came from.
+/// Write every one of a profile's buffers back to whichever file it came from.
+///
+/// All of them rather than the one in front: a buffer that is not visible is
+/// still someone's unsaved work, and a tab switch is no longer the moment it
+/// gets written. The first failure is the one reported and the rest are still
+/// attempted — a full disk must not cost more buffers than it has to.
 fn write_buffer(profile: &Profile, cx: &App) -> Result<(), String> {
-    let sql = profile.session.editor.read(cx).value().to_string();
-    match &profile.session.open_query {
-        Some(name) => store::write_query(&profile.id, name, &sql),
-        None => store::write_scratch(&profile.id, &sql),
+    let mut failure = None;
+    for tab in &profile.session.queries {
+        let sql = tab.editor.read(cx).value().to_string();
+        let written = match &tab.open_query {
+            Some(name) => store::write_query(&profile.id, name, &sql),
+            None => store::write_scratch(&profile.id, tab.id, &sql),
+        };
+        if let Err(message) = written {
+            failure = failure.or(Some(message));
+        }
+    }
+    match failure {
+        Some(message) => Err(message),
+        None => Ok(()),
     }
 }
 
@@ -5031,17 +5272,26 @@ mod tests {
         let saved = |name: &str| Some(CloseTarget::SavedQuery(name.to_string()));
 
         assert_eq!(
-            close_target(Tab::Object(3), None),
+            close_target(Tab::Object(3), None, 1),
             Some(CloseTarget::Object(3))
         );
-        assert_eq!(close_target(Tab::Query, Some("daily")), saved("daily"));
-        // The scratch buffer is always in the strip, so there is nothing here
-        // for `cmd+w` to close and nothing to ask about.
-        assert_eq!(close_target(Tab::Query, None), None);
+        assert_eq!(
+            close_target(Tab::Query(0), Some("daily"), 1),
+            saved("daily")
+        );
+        // A profile always has somewhere to write, so the last unsaved buffer
+        // has nothing for `cmd+w` to close and nothing to ask about.
+        assert_eq!(close_target(Tab::Query(0), None, 1), None);
+        // One of several, though, is a scratch pad someone is done with: it
+        // goes without a question, the way an unnamed buffer does everywhere.
+        assert_eq!(
+            close_target(Tab::Query(7), None, 2),
+            Some(CloseTarget::Buffer(7))
+        );
         // What the query tab happens to be holding says nothing about an
         // object tab, which is the one in front.
         assert_eq!(
-            close_target(Tab::Object(3), Some("daily")),
+            close_target(Tab::Object(3), Some("daily"), 2),
             Some(CloseTarget::Object(3))
         );
     }
