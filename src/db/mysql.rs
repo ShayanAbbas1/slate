@@ -62,6 +62,18 @@ WHERE TABLE_SCHEMA NOT IN {system}
 ORDER BY TABLE_SCHEMA, TABLE_NAME
 ";
 
+// The same schema filter `RELATIONS_SQL` uses, so the columns offered are the
+// columns of relations the tree actually shows. `information_schema.COLUMNS`
+// describes only tables and views, which is the same set already.
+const RELATION_COLUMNS_SQL: &str = "
+SELECT TABLE_SCHEMA AS schema_name,
+       TABLE_NAME AS relation_name,
+       COLUMN_NAME AS column_name
+FROM information_schema.COLUMNS
+WHERE TABLE_SCHEMA NOT IN {system}
+ORDER BY TABLE_SCHEMA, TABLE_NAME, ORDINAL_POSITION
+";
+
 // Every column is coalesced because the assembler refuses a null, and several of
 // these are null for reasons that are not errors: `ROUTINE_DEFINITION` is null
 // for a user without the privilege to read bodies, and `DTD_IDENTIFIER` is null
@@ -473,7 +485,9 @@ impl Connection {
     pub fn catalog(&self) -> Result<Catalog, DbError> {
         let relations = self.internal_query(&RELATIONS_SQL.replace("{system}", SYSTEM_SCHEMAS))?;
         let routines = self.internal_query(&ROUTINES_SQL.replace("{system}", SYSTEM_SCHEMAS))?;
-        assemble_catalog(relations, routines)
+        let columns =
+            self.internal_query(&RELATION_COLUMNS_SQL.replace("{system}", SYSTEM_SCHEMAS))?;
+        assemble_catalog(relations, routines, columns)
     }
 
     pub fn structure(&self, schema: &str, relation: &str) -> Result<Structure, DbError> {
@@ -1234,6 +1248,28 @@ mod tests {
         assert!(schema.routines.iter().any(
             |routine| routine.name == "account_label" && routine.kind == RoutineKind::Function
         ));
+
+        // Completion offers these, so the order is the table's own.
+        let accounts = schema
+            .relations
+            .iter()
+            .find(|relation| relation.name == "accounts")
+            .expect("accounts should be listed");
+        assert_eq!(
+            accounts.columns,
+            [
+                "id",
+                "external_id",
+                "name",
+                "email",
+                "plan",
+                "balance",
+                "active",
+                "tags",
+                "metadata",
+                "created_at"
+            ]
+        );
         // The four schemas the server owns are not the user's.
         assert!(
             !catalog

@@ -444,6 +444,16 @@ pub enum RelationKind {
 pub struct Relation {
     pub name: String,
     pub kind: RelationKind,
+    /// The relation's column names, in ordinal order.
+    ///
+    /// Names only. Completion needs the identifier, and a type tag would double
+    /// the payload of the largest catalog query for something the popup does not
+    /// show.
+    //
+    // ponytail: one more round trip at connect, and on a database with very
+    // many relations it is the largest of the three. Fetch it lazily on the
+    // first completion request if it ever shows up in connect timings.
+    pub columns: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -556,8 +566,10 @@ impl std::error::Error for DbError {}
 pub(super) fn assemble_catalog(
     relations: QueryResult,
     routines: QueryResult,
+    columns: QueryResult,
 ) -> Result<Catalog, DbError> {
     let mut schemas = std::collections::BTreeMap::<String, Schema>::new();
+    let mut positions = std::collections::HashMap::<(&str, &str), usize>::new();
 
     for row in &relations.rows {
         let schema_name = required_cell(&relations, row, "schema_name")?;
@@ -571,10 +583,30 @@ pub(super) fn assemble_catalog(
             kind => return Err(unexpected_catalog_value("relation kind", kind)),
         };
 
-        schema(&mut schemas, schema_name).relations.push(Relation {
+        let relations = &mut schema(&mut schemas, schema_name).relations;
+        positions.insert((schema_name, name), relations.len());
+        relations.push(Relation {
             name: name.to_string(),
             kind,
+            columns: Vec::new(),
         });
+    }
+
+    for row in &columns.rows {
+        let schema_name = required_cell(&columns, row, "schema_name")?;
+        let relation_name = required_cell(&columns, row, "relation_name")?;
+        let column_name = required_cell(&columns, row, "column_name")?;
+
+        // A column row naming a relation the relations result did not list is
+        // skipped rather than refused: the two are separate round trips, and a
+        // relation dropped between them must not fail the whole catalog.
+        if let Some(index) = positions.get(&(schema_name, relation_name))
+            && let Some(relation) = schemas
+                .get_mut(schema_name)
+                .and_then(|schema| schema.relations.get_mut(*index))
+        {
+            relation.columns.push(column_name.to_string());
+        }
     }
 
     for row in &routines.rows {
@@ -907,7 +939,7 @@ mod tests {
             ],
         );
 
-        let catalog = assemble_catalog(relations, routines).unwrap();
+        let catalog = assemble_catalog(relations, routines, QueryResult::default()).unwrap();
 
         assert_eq!(catalog.schemas.len(), 2);
         assert_eq!(catalog.schemas[0].name, "analytics");
@@ -916,6 +948,9 @@ mod tests {
             vec![Relation {
                 name: "events".into(),
                 kind: RelationKind::PartitionedTable,
+                // No columns result, so every relation has an empty list rather
+                // than a missing one.
+                columns: Vec::new(),
             }]
         );
         assert_eq!(catalog.schemas[0].routines[0].kind, RoutineKind::Procedure);
@@ -972,11 +1007,49 @@ mod tests {
             &[&[Some("public"), Some("mystery"), Some("unknown")]],
         );
 
-        let error = assemble_catalog(relations, QueryResult::default()).unwrap_err();
+        let error = assemble_catalog(relations, QueryResult::default(), QueryResult::default())
+            .unwrap_err();
 
         assert_eq!(
             error.message,
             "Catalog query returned unknown relation kind unknown."
         );
+    }
+
+    #[test]
+    fn catalog_attaches_each_column_to_its_own_relation_in_ordinal_order() {
+        let relations = result(
+            &["schema_name", "relation_name", "relation_kind"],
+            &[
+                &[Some("analytics"), Some("events"), Some("table")],
+                &[Some("public"), Some("accounts"), Some("table")],
+            ],
+        );
+        // Rows arrive ordered by schema, relation and ordinal position, so
+        // appending in row order is what preserves the ordinal order.
+        let columns = result(
+            &["schema_name", "relation_name", "column_name"],
+            &[
+                &[Some("analytics"), Some("events"), Some("occurred_at")],
+                &[Some("analytics"), Some("events"), Some("account_id")],
+                &[Some("public"), Some("accounts"), Some("id")],
+                &[Some("public"), Some("accounts"), Some("name")],
+                // A relation dropped between the two round trips. Skipped, not
+                // an error, and it must not derail the rows around it.
+                &[Some("public"), Some("gone"), Some("id")],
+                &[Some("nowhere"), Some("accounts"), Some("id")],
+            ],
+        );
+
+        let catalog = assemble_catalog(relations, QueryResult::default(), columns).unwrap();
+
+        assert_eq!(
+            catalog.schemas[0].relations[0].columns,
+            vec!["occurred_at", "account_id"]
+        );
+        assert_eq!(catalog.schemas[1].relations[0].columns, vec!["id", "name"]);
+        // The unknown relations created nothing of their own either.
+        assert_eq!(catalog.schemas.len(), 2);
+        assert_eq!(catalog.schemas[1].relations.len(), 1);
     }
 }

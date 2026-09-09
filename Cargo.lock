@@ -5741,6 +5741,7 @@ dependencies = [
  "hex",
  "icondata_core",
  "icondata_lu",
+ "lsp-types",
  "mysql",
  "nucleo-matcher",
  "postgres",

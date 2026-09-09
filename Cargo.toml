@@ -23,6 +23,14 @@ gpui-component = { version = "=0.5.1", features = ["tree-sitter-languages"] }
 tree-sitter = "=0.25.10"
 tree-sitter-sequel = "=0.3.11"
 
+# The vocabulary gpui-component's completion provider speaks, and nothing more:
+# no language server is started, and none could be -- the completions come from
+# the catalog Slate already loaded. The library re-exports `Position` but not
+# `CompletionItem`, so this is a direct dependency on a crate already in the
+# graph. Pinned exactly to the version gpui-component resolves, so the trait we
+# implement and the types we hand it are the same crate rather than two copies.
+lsp-types = "=0.97.0"
+
 # Blocking client, deliberately. GPUI's executor is async-task over Grand
 # Central Dispatch with no reactor, so a tokio future panics on it. This owns
 # its runtime and runs on the background executor. See AGENTS.md.

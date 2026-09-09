@@ -190,6 +190,7 @@ mod tests {
                     relations: vec![Relation {
                         name: "events".into(),
                         kind: RelationKind::Table,
+                        columns: Vec::new(),
                     }],
                     routines: Vec::new(),
                 },
@@ -199,10 +200,12 @@ mod tests {
                         Relation {
                             name: "active_accounts".into(),
                             kind: RelationKind::View,
+                            columns: Vec::new(),
                         },
                         Relation {
                             name: "accounts".into(),
                             kind: RelationKind::Table,
+                            columns: Vec::new(),
                         },
                     ],
                     routines: vec![

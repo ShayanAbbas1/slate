@@ -1,3 +1,4 @@
+mod completion;
 mod db;
 mod explorer;
 mod export;
@@ -11,7 +12,7 @@ mod icons;
 mod theme;
 mod tls;
 
-use std::{borrow::Cow, collections::HashMap, path::PathBuf, sync::Arc};
+use std::{borrow::Cow, collections::HashMap, path::PathBuf, rc::Rc, sync::Arc};
 
 use gpui::{
     Action, AnyElement, App, AppContext, Application, ClickEvent, ClipboardItem, Context, Entity,
@@ -23,7 +24,7 @@ use gpui::{
 use gpui_component::{
     Disableable, IndexPath, InteractiveElementExt, Root,
     button::{Button, ButtonVariants},
-    input::{Input, InputEvent, InputState, Position},
+    input::{CompletionProvider, Input, InputEvent, InputState, Position},
     kbd::Kbd,
     list::{List, ListEvent, ListItem, ListState},
     resizable::{h_resizable, resizable_panel},
@@ -32,6 +33,7 @@ use gpui_component::{
 };
 use serde::Deserialize;
 
+use completion::SchemaCompletions;
 use db::{
     Catalog, Connection, ConnectionConfig, DbError, Engine, RelationKind, Routine, RoutineKind,
     ServerConfig, SslMode, Structure,
@@ -1496,12 +1498,38 @@ impl Workspace {
                         Ok(catalog) => CatalogState::Loaded(catalog),
                         Err(error) => CatalogState::Failed(error.message),
                     };
+                    workspace.install_completions(&id, cx);
                     workspace.refresh_explorer(&id, cx);
                     cx.notify();
                 })
                 .ok();
         })
         .detach();
+    }
+
+    /// Point this profile's editor at what its catalog now holds.
+    ///
+    /// The provider is replaced whole rather than kept and mutated: a catalog
+    /// arrives as one value and is never patched, so a snapshot behind an `Rc`
+    /// needs no interior mutability and cannot be half-updated. Anything but a
+    /// loaded catalog leaves the editor with no provider at all, which is the
+    /// difference between offering nothing and offering the last database's
+    /// tables to a buffer written against this one.
+    fn install_completions(&mut self, id: &str, cx: &mut Context<Self>) {
+        let Some(profile) = self.profiles.iter().find(|profile| profile.id == id) else {
+            return;
+        };
+        let provider = match &profile.catalog {
+            CatalogState::Loaded(catalog) => {
+                Some(Rc::new(SchemaCompletions::new(Arc::new(catalog.clone())))
+                    as Rc<dyn CompletionProvider>)
+            }
+            _ => None,
+        };
+
+        profile.session.editor.update(cx, |editor, _| {
+            editor.lsp.completion_provider = provider;
+        });
     }
 
     fn refresh_explorer(&mut self, id: &str, cx: &mut Context<Self>) {
@@ -2001,6 +2029,11 @@ impl Workspace {
             return;
         }
         if matches!(profile.session.active, Tab::Query) {
+            // Nothing of Slate's is stacked over the editor, so the keystroke
+            // is not ours. Handing it on is what lets the completion popup --
+            // which is the input's, not Slate's -- close on `escape`; this
+            // binding is unscoped and would otherwise win it at every depth.
+            cx.propagate();
             return;
         }
         profile.session.active = Tab::Query;

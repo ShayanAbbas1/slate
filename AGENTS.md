@@ -230,7 +230,29 @@ Decided, recorded in the multi-engine spec, and not to be re-litigated:
 Use these rather than hand-rolling: `InputMode::CodeEditor` (rope-backed
 multi-line editor, IME, line numbers), `src/highlighter/` (tree-sitter; SQL via
 `tree_sitter_sequel`), `src/table/` (grid virtualized on both axes),
-`src/dock/` (panels, tab bars), `Root` dialog layers (modal overlays).
+`src/dock/` (panels, tab bars), `Root` dialog layers (modal overlays), and
+`src/input/lsp/` plus `src/input/popovers/` (the completion provider trait and
+the caret-anchored popup it drives).
+
+**It does ship completion infrastructure, and this file said otherwise until
+2026-09-09.** `input/lsp/completions.rs` defines `CompletionProvider`, two
+required methods, and `InputState::lsp.completion_provider` is a public field.
+No language server is involved -- `lsp_types` is the vocabulary and nothing
+starts a process. `Render for InputState` draws the menu itself, so a provider
+is the whole integration: nothing to render, nothing to anchor, and `up`,
+`down`, `enter` and `escape` are already routed to the menu when it is open and
+to the cursor when it is not.
+
+Do not hand-roll a popup beside it. The caret's pixel position it would need --
+`LastLayout::cursor_bounds`, `InputState::last_layout`,
+`line_and_position_for_offset` -- is `pub(super)` with no accessor, so an
+anchored overlay of our own is fork-only, and forking is out (spec §7.1).
+
+One consequence worth knowing before writing an `escape` handler: the library
+binds `escape` scoped to `Input`, Slate binds it unscoped, and an unscoped
+binding ties at every depth and wins on registration order. `show_editor` must
+therefore `cx.propagate()` on the paths where Slate has nothing stacked to
+close, or the completion popup cannot be dismissed.
 
 It does **not** provide a fuzzy matcher or a command palette. Those are ours —
 `src/palette.rs` scores with `nucleo-matcher` and presents through the

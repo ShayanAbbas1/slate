@@ -1,0 +1,828 @@
+//! What the editor offers while you type.
+//!
+//! gpui-component's input already owns the whole completion surface — the
+//! popup under the caret, its scroll, the arrow keys, `enter` to accept and
+//! `escape` to dismiss — behind one trait with two required methods. None of
+//! it needs a language server; `lsp_types` is only the vocabulary. So this
+//! module is the part that is Slate's: which identifiers are worth offering
+//! for the text in front of the cursor.
+//!
+//! Everything offered comes from the catalog the explorer already loaded, so
+//! the popup can never name a relation the tree does not show. Nothing here
+//! runs SQL and nothing here edits the buffer: an accepted row is a
+//! [`TextEdit`] over the word being typed, and the input applies it.
+//!
+//! **This is a lexer, not a parser.** Which identifiers make sense at a
+//! caret is decided by the last keyword before it and by the relations named
+//! in the statement, both found by scanning tokens. A parse tree would be the
+//! principled answer and is the wrong tool here: half-typed SQL is a parse
+//! error by definition — `SELECT * FROM ` is exactly the text a user most
+//! wants completed and exactly the text `tree_sitter_sequel` returns an
+//! `ERROR` node for. The one job a scan genuinely cannot do is know it is
+//! inside a string literal, and [`suppressed`] does that job on its own.
+
+use std::{cell::RefCell, ops::Range, sync::Arc};
+
+use gpui::{Context, Result, Task, Window};
+use gpui_component::input::{CompletionProvider, InputState, Rope, RopeExt};
+use lsp_types::{
+    CompletionContext, CompletionItem, CompletionItemKind, CompletionResponse, CompletionTextEdit,
+    TextEdit,
+};
+use nucleo_matcher::{
+    Config, Matcher, Utf32Str,
+    pattern::{CaseMatching, Normalization, Pattern},
+};
+
+use crate::{
+    db::{Catalog, RelationKind},
+    sql,
+};
+
+/// How many rows the popup is allowed. The list is already ranked, so the tail
+/// of a 4,000-column database is not what anyone is scrolling for.
+const MAX_ITEMS: usize = 50;
+
+/// The keywords worth completing: the ones that carry a statement's shape.
+///
+/// Deliberately not the full reserved-word list of three engines. A completion
+/// list is a menu, and a menu of four hundred keywords is a wall — these are
+/// the ones long enough to be worth not typing and common enough to be worth
+/// ranking above a column that happens to fuzzy-match.
+const KEYWORDS: &[&str] = &[
+    "AND",
+    "AS",
+    "ASC",
+    "BETWEEN",
+    "BY",
+    "CASE",
+    "CAST",
+    "COALESCE",
+    "CROSS JOIN",
+    "DESC",
+    "DISTINCT",
+    "ELSE",
+    "END",
+    "EXCEPT",
+    "EXISTS",
+    "FALSE",
+    "FROM",
+    "FULL JOIN",
+    "GROUP BY",
+    "HAVING",
+    "ILIKE",
+    "IN",
+    "INNER JOIN",
+    "INSERT INTO",
+    "INTERSECT",
+    "IS NOT NULL",
+    "IS NULL",
+    "JOIN",
+    "LATERAL",
+    "LEFT JOIN",
+    "LIKE",
+    "LIMIT",
+    "NOT",
+    "NULL",
+    "NULLS FIRST",
+    "NULLS LAST",
+    "OFFSET",
+    "ON",
+    "OR",
+    "ORDER BY",
+    "OVER",
+    "PARTITION BY",
+    "RETURNING",
+    "RIGHT JOIN",
+    "SELECT",
+    "SET",
+    "THEN",
+    "TRUE",
+    "UNION",
+    "UNION ALL",
+    "UPDATE",
+    "USING",
+    "VALUES",
+    "WHEN",
+    "WHERE",
+    "WITH",
+];
+
+/// Keywords after which an identifier names a relation.
+const SOURCE_KEYWORDS: &[&str] = &["from", "join", "update", "into", "table"];
+
+/// A completion the popup can offer, before it is ranked.
+struct Candidate {
+    label: String,
+    /// The grey text beside the label — the schema a relation is in, the
+    /// relation a column belongs to. What tells two `id`s apart.
+    detail: Option<String>,
+    kind: CompletionItemKind,
+}
+
+impl Candidate {
+    fn new(label: impl Into<String>, detail: Option<String>, kind: CompletionItemKind) -> Self {
+        Self {
+            label: label.into(),
+            detail,
+            kind,
+        }
+    }
+}
+
+/// The completion source for a connected profile's editor.
+///
+/// Holds a snapshot rather than a live handle. The catalog is replaced whole
+/// when it reloads, and so is this — see `Workspace::install_completions`.
+pub struct SchemaCompletions {
+    catalog: Arc<Catalog>,
+    /// `Matcher` scores through `&mut self` and the trait hands us `&self`.
+    /// One matcher reused rather than one per keystroke, as the palette does.
+    matcher: RefCell<Matcher>,
+}
+
+impl SchemaCompletions {
+    pub fn new(catalog: Arc<Catalog>) -> Self {
+        Self {
+            catalog,
+            matcher: RefCell::new(Matcher::new(Config::DEFAULT)),
+        }
+    }
+
+    /// The columns of a relation named anywhere in the catalog.
+    ///
+    /// Unqualified, so two schemas with a `users` each contribute both sets.
+    /// Offering a column that turns out to belong to the other schema's table
+    /// is a worse answer than offering nothing only if the user cannot see
+    /// which — which is what `detail` is for.
+    fn columns_of(&self, relation: &str) -> Vec<Candidate> {
+        self.catalog
+            .schemas
+            .iter()
+            .flat_map(|schema| schema.relations.iter().map(move |rel| (schema, rel)))
+            .filter(|(_, rel)| rel.name.eq_ignore_ascii_case(relation))
+            .flat_map(|(_, rel)| {
+                rel.columns.iter().map(|column| {
+                    Candidate::new(column, Some(rel.name.clone()), CompletionItemKind::FIELD)
+                })
+            })
+            .collect()
+    }
+
+    fn relations_in(&self, schema_name: &str) -> Vec<Candidate> {
+        self.catalog
+            .schemas
+            .iter()
+            .filter(|schema| schema.name.eq_ignore_ascii_case(schema_name))
+            .flat_map(|schema| {
+                schema.relations.iter().map(|rel| {
+                    Candidate::new(
+                        &rel.name,
+                        Some(schema.name.clone()),
+                        relation_kind(rel.kind),
+                    )
+                })
+            })
+            .collect()
+    }
+
+    fn all_relations(&self) -> Vec<Candidate> {
+        self.catalog
+            .schemas
+            .iter()
+            .flat_map(|schema| {
+                schema.relations.iter().map(|rel| {
+                    Candidate::new(
+                        &rel.name,
+                        Some(schema.name.clone()),
+                        relation_kind(rel.kind),
+                    )
+                })
+            })
+            .collect()
+    }
+
+    fn all_routines(&self) -> Vec<Candidate> {
+        self.catalog
+            .schemas
+            .iter()
+            .flat_map(|schema| {
+                schema.routines.iter().map(|routine| {
+                    Candidate::new(
+                        &routine.name,
+                        Some(schema.name.clone()),
+                        CompletionItemKind::FUNCTION,
+                    )
+                })
+            })
+            .collect()
+    }
+
+    fn schema_names(&self) -> Vec<Candidate> {
+        self.catalog
+            .schemas
+            .iter()
+            .map(|schema| Candidate::new(&schema.name, None, CompletionItemKind::MODULE))
+            .collect()
+    }
+
+    /// What to offer, in preference order, before ranking narrows it.
+    ///
+    /// Order matters twice over: the scorer's ties are broken by it, and an
+    /// empty query scores everything equally, so this order *is* the list the
+    /// user sees after a `.`.
+    fn candidates(&self, statement: &str, before: &str, qualifier: Option<&str>) -> Vec<Candidate> {
+        if let Some(qualifier) = qualifier {
+            // `x.` — `x` is an alias if the statement bound one, otherwise the
+            // relation or schema it looks like. An alias wins: a query that
+            // says `FROM orders o` has made `o` mean something here, and a
+            // table elsewhere in the database called `o` has not.
+            let relation = bindings(statement)
+                .into_iter()
+                .find(|(binding, _)| binding.eq_ignore_ascii_case(qualifier))
+                .map(|(_, relation)| relation)
+                .unwrap_or_else(|| qualifier.to_string());
+
+            let columns = self.columns_of(&relation);
+            if !columns.is_empty() {
+                return columns;
+            }
+            return self.relations_in(qualifier);
+        }
+
+        if expects_relation(before) {
+            let mut candidates = self.all_relations();
+            candidates.extend(self.schema_names());
+            return candidates;
+        }
+
+        // Columns of the relations this statement actually names come first:
+        // in a statement about `accounts`, `email` is a better guess than
+        // every other `email` in the database, and than `EXISTS`.
+        let mut candidates: Vec<Candidate> = bindings(statement)
+            .into_iter()
+            .map(|(_, relation)| relation)
+            .fold(Vec::new(), |mut relations, relation| {
+                if !relations.iter().any(|held| held == &relation) {
+                    relations.push(relation);
+                }
+                relations
+            })
+            .iter()
+            .flat_map(|relation| self.columns_of(relation))
+            .collect();
+
+        candidates.extend(
+            KEYWORDS
+                .iter()
+                .map(|keyword| Candidate::new(*keyword, None, CompletionItemKind::KEYWORD)),
+        );
+        candidates.extend(self.all_relations());
+        candidates.extend(self.all_routines());
+        candidates
+    }
+
+    /// The whole decision, from buffer text to the rows the popup shows.
+    ///
+    /// Separate from [`CompletionProvider::completions`] and taking `&str`
+    /// rather than a `Rope` so the tests can reach it without a window.
+    fn items(&self, sql: &str, offset: usize) -> Vec<(Range<usize>, Candidate)> {
+        let offset = offset.min(sql.len());
+        if !sql.is_char_boundary(offset) {
+            return Vec::new();
+        }
+
+        let word = word_before(sql, offset);
+        if suppressed(sql, word.start) {
+            return Vec::new();
+        }
+
+        let prefix = &sql[word.clone()];
+        let qualifier = qualifier_before(sql, word.start);
+
+        // Nothing typed and nothing to qualify is not a question. Opening the
+        // whole catalog on every space would put a popup over the buffer for
+        // most of the time anyone is writing in it.
+        if prefix.is_empty() && qualifier.is_none() {
+            return Vec::new();
+        }
+
+        let statement = sql::Buffer::parse(sql)
+            .statement_at(offset)
+            .filter(|range| range.contains(&word.start) || range.end >= word.start)
+            .map(|range| &sql[range])
+            .unwrap_or(sql);
+        let before = &sql[..word.start];
+
+        let candidates = self.candidates(statement, before, qualifier);
+        rank(candidates, prefix, &mut self.matcher.borrow_mut())
+            .into_iter()
+            .map(|candidate| (word.clone(), candidate))
+            .collect()
+    }
+}
+
+impl CompletionProvider for SchemaCompletions {
+    /// Every edit asks, and [`SchemaCompletions::items`] decides.
+    ///
+    /// Answering `false` here would leave an open popup standing, because the
+    /// input only reconsiders the menu when the provider is consulted. An
+    /// empty answer from `completions` hides it, so there is one place that
+    /// decides whether a popup belongs and it is the one that knows.
+    fn is_completion_trigger(&self, _: usize, _: &str, _: &mut Context<InputState>) -> bool {
+        true
+    }
+
+    fn completions(
+        &self,
+        text: &Rope,
+        offset: usize,
+        _: CompletionContext,
+        _: &mut Window,
+        _: &mut Context<InputState>,
+    ) -> Task<Result<CompletionResponse>> {
+        // ponytail: the whole buffer is copied out of the rope on every
+        // keystroke, and parsed once more on top of the highlighter's own
+        // parse. A query buffer is a screen or two of text, so this is free at
+        // the size it runs at -- hold the tokens on the provider and invalidate
+        // them from `InputEvent::Change` if a very large buffer ever stutters.
+        let sql = text.to_string();
+
+        let items = self
+            .items(&sql, offset)
+            .into_iter()
+            .map(|(word, candidate)| CompletionItem {
+                label: candidate.label.clone(),
+                detail: candidate.detail,
+                kind: Some(candidate.kind),
+                // The edit is given explicitly rather than left to the input's
+                // own guess at where the word started. That guess is taken on
+                // the first keystroke of a run and not revised, so a word typed
+                // one character at a time replaces the wrong span -- and the
+                // wrong span here is a corrupted statement.
+                text_edit: Some(CompletionTextEdit::Edit(TextEdit {
+                    range: lsp_types::Range {
+                        start: text.offset_to_position(word.start),
+                        end: text.offset_to_position(word.end),
+                    },
+                    new_text: candidate.label,
+                })),
+                ..Default::default()
+            })
+            .collect::<Vec<_>>();
+
+        Task::ready(Ok(CompletionResponse::Array(items)))
+    }
+}
+
+fn relation_kind(kind: RelationKind) -> CompletionItemKind {
+    match kind {
+        RelationKind::Table | RelationKind::PartitionedTable | RelationKind::ForeignTable => {
+            CompletionItemKind::STRUCT
+        }
+        RelationKind::View | RelationKind::MaterializedView => CompletionItemKind::INTERFACE,
+    }
+}
+
+/// Score every candidate against what has been typed, best first.
+///
+/// The same scorer the palette uses, for the same reason: a fuzzy match is
+/// what people expect from a list that narrows as they type. An empty query
+/// scores everything at zero and the sort is stable, so the order
+/// [`SchemaCompletions::candidates`] built survives.
+fn rank(candidates: Vec<Candidate>, prefix: &str, matcher: &mut Matcher) -> Vec<Candidate> {
+    let pattern = Pattern::parse(prefix, CaseMatching::Ignore, Normalization::Smart);
+    let mut buffer = Vec::new();
+    let mut scored = candidates
+        .into_iter()
+        .filter_map(|candidate| {
+            let label = Utf32Str::new(&candidate.label, &mut buffer);
+            pattern
+                .score(label, matcher)
+                .map(|score| (score, candidate))
+        })
+        .collect::<Vec<_>>();
+    scored.sort_by_key(|(score, _)| std::cmp::Reverse(*score));
+    scored.truncate(MAX_ITEMS);
+    scored.into_iter().map(|(_, candidate)| candidate).collect()
+}
+
+fn is_ident_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'$'
+}
+
+/// The identifier being typed, as a range ending at the cursor. Empty when the
+/// cursor does not follow one.
+///
+/// Byte-wise, and safe to be: every byte of a multi-byte character is `>= 0x80`
+/// and no ASCII test matches one, so a scan can never stop mid-character.
+fn word_before(sql: &str, offset: usize) -> Range<usize> {
+    let bytes = sql.as_bytes();
+    let mut start = offset;
+    while start > 0 && is_ident_byte(bytes[start - 1]) {
+        start -= 1;
+    }
+    start..offset
+}
+
+/// The identifier before the `.` that precedes the word being typed — the `o`
+/// of `o.`, the `public` of `public.acc`.
+fn qualifier_before(sql: &str, word_start: usize) -> Option<&str> {
+    let bytes = sql.as_bytes();
+    if word_start == 0 || bytes[word_start - 1] != b'.' {
+        return None;
+    }
+
+    let dot = word_start - 1;
+    let mut start = dot;
+    while start > 0 && is_ident_byte(bytes[start - 1]) {
+        start -= 1;
+    }
+    (start < dot).then(|| &sql[start..dot])
+}
+
+/// Whether `at` falls inside a string literal or a comment.
+///
+/// The one thing a keyword scan cannot get right by itself, and the one place
+/// a wrong completion does real damage: accepting a row inside a literal
+/// rewrites data rather than a query.
+///
+/// ponytail: `'` for strings, `--` and the block form for comments, and
+/// nothing else. Double quotes are deliberately absent -- Postgres reads them
+/// as a quoted identifier, where completing is exactly right, and MySQL reads
+/// them as a string, where it is not, and no scan can tell which server is
+/// listening. Dollar-quoted bodies are absent for a smaller reason: the text
+/// inside one is SQL too. Teach it the engine if a MySQL user is ever bitten.
+fn suppressed(sql: &str, at: usize) -> bool {
+    let bytes = sql.as_bytes();
+    let at = at.min(bytes.len());
+    let mut index = 0;
+
+    while index < at {
+        match bytes[index] {
+            b'\'' => {
+                index += 1;
+                loop {
+                    if index >= at || index >= bytes.len() {
+                        return true;
+                    }
+                    if bytes[index] == b'\'' {
+                        // Doubled, so it is an escaped quote and not the end.
+                        if bytes.get(index + 1) == Some(&b'\'') {
+                            index += 2;
+                            continue;
+                        }
+                        index += 1;
+                        break;
+                    }
+                    index += 1;
+                }
+            }
+            b'-' if bytes.get(index + 1) == Some(&b'-') => {
+                let end = sql[index..]
+                    .find('\n')
+                    .map_or(bytes.len(), |offset| index + offset);
+                if at <= end {
+                    return true;
+                }
+                index = end + 1;
+            }
+            b'/' if bytes.get(index + 1) == Some(&b'*') => {
+                let end = sql[index + 2..]
+                    .find("*/")
+                    .map_or(bytes.len(), |offset| index + 2 + offset + 2);
+                if at < end {
+                    return true;
+                }
+                index = end;
+            }
+            _ => index += 1,
+        }
+    }
+
+    false
+}
+
+/// The word-shaped tokens of a statement, in order. Dots are kept inside a
+/// token so `public.accounts` stays one name rather than becoming two.
+fn tokens(sql: &str) -> Vec<&str> {
+    let bytes = sql.as_bytes();
+    let mut tokens = Vec::new();
+    let mut index = 0;
+
+    while index < bytes.len() {
+        if is_ident_byte(bytes[index]) || bytes[index] == b'.' {
+            let start = index;
+            while index < bytes.len() && (is_ident_byte(bytes[index]) || bytes[index] == b'.') {
+                index += 1;
+            }
+            tokens.push(&sql[start..index]);
+        } else {
+            index += 1;
+        }
+    }
+
+    tokens
+}
+
+fn is_keyword(token: &str) -> bool {
+    KEYWORDS.iter().any(|keyword| {
+        keyword
+            .split(' ')
+            .any(|word| word.eq_ignore_ascii_case(token))
+    }) || SOURCE_KEYWORDS
+        .iter()
+        .any(|keyword| keyword.eq_ignore_ascii_case(token))
+}
+
+/// Whether the caret sits where a relation name belongs — straight after
+/// `FROM`, `JOIN`, `UPDATE`, `INSERT INTO` or `TABLE`.
+fn expects_relation(before: &str) -> bool {
+    tokens(before).last().is_some_and(|last| {
+        SOURCE_KEYWORDS
+            .iter()
+            .any(|keyword| last.eq_ignore_ascii_case(keyword))
+    })
+}
+
+/// Every name this statement binds to a relation: the relation's own name, and
+/// its alias where it has one.
+///
+/// Returned as pairs rather than a map because the same alias can legitimately
+/// be bound twice in one buffer and the first binding is the one in scope.
+fn bindings(statement: &str) -> Vec<(String, String)> {
+    let tokens = tokens(statement);
+    let mut bindings = Vec::new();
+    let mut index = 0;
+
+    while index < tokens.len() {
+        let is_source = SOURCE_KEYWORDS
+            .iter()
+            .any(|keyword| tokens[index].eq_ignore_ascii_case(keyword));
+
+        let Some(name) = tokens.get(index + 1).filter(|_| is_source) else {
+            index += 1;
+            continue;
+        };
+        if is_keyword(name) {
+            index += 1;
+            continue;
+        }
+
+        // A schema-qualified name binds under its last segment: `FROM
+        // public.accounts` puts `accounts.` in reach, which is what anyone
+        // types next.
+        let relation = name.rsplit('.').next().unwrap_or(name).to_string();
+        bindings.push((relation.clone(), relation.clone()));
+
+        let alias = if tokens
+            .get(index + 2)
+            .is_some_and(|token| token.eq_ignore_ascii_case("as"))
+        {
+            tokens.get(index + 3)
+        } else {
+            tokens.get(index + 2)
+        };
+        if let Some(alias) = alias.filter(|alias| !is_keyword(alias)) {
+            bindings.push(((*alias).to_string(), relation));
+        }
+
+        index += 2;
+    }
+
+    bindings
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::{Relation, Routine, RoutineKind, Schema};
+
+    fn relation(name: &str, columns: &[&str]) -> Relation {
+        Relation {
+            name: name.to_string(),
+            kind: RelationKind::Table,
+            columns: columns.iter().map(|column| column.to_string()).collect(),
+        }
+    }
+
+    fn catalog() -> SchemaCompletions {
+        SchemaCompletions::new(Arc::new(Catalog {
+            schemas: vec![
+                Schema {
+                    name: "public".to_string(),
+                    relations: vec![
+                        relation("accounts", &["id", "email", "created_at"]),
+                        relation("orders", &["id", "account_id", "total"]),
+                    ],
+                    routines: vec![Routine {
+                        name: "recalculate_totals".to_string(),
+                        kind: RoutineKind::Procedure,
+                        identity_arguments: String::new(),
+                        result_type: String::new(),
+                        language: "plpgsql".to_string(),
+                        definition: String::new(),
+                    }],
+                },
+                Schema {
+                    name: "audit".to_string(),
+                    relations: vec![relation("events", &["id", "payload"])],
+                    routines: Vec::new(),
+                },
+            ],
+        }))
+    }
+
+    /// The labels offered for a caret at `|`.
+    fn labels(sql: &str) -> Vec<String> {
+        let offset = sql.find('|').expect("the test must mark the caret");
+        let sql = sql.replace('|', "");
+        catalog()
+            .items(&sql, offset)
+            .into_iter()
+            .map(|(_, candidate)| candidate.label)
+            .collect()
+    }
+
+    #[test]
+    fn after_from_it_offers_relations() {
+        let offered = labels("SELECT * FROM acc|");
+        assert_eq!(offered.first().map(String::as_str), Some("accounts"));
+    }
+
+    #[test]
+    fn after_from_it_offers_no_keywords() {
+        let offered = labels("SELECT * FROM a|");
+        assert!(
+            !offered.iter().any(|label| label == "AND"),
+            "a relation position offered a keyword: {offered:?}"
+        );
+    }
+
+    #[test]
+    fn it_offers_schemas_where_a_relation_belongs() {
+        assert!(labels("SELECT * FROM aud|").contains(&"audit".to_string()));
+    }
+
+    #[test]
+    fn a_schema_qualifier_offers_its_relations() {
+        assert_eq!(labels("SELECT * FROM audit.|"), vec!["events".to_string()]);
+    }
+
+    #[test]
+    fn a_relation_qualifier_offers_its_columns() {
+        assert_eq!(
+            labels("SELECT accounts.| FROM accounts"),
+            vec![
+                "id".to_string(),
+                "email".to_string(),
+                "created_at".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn an_alias_offers_the_relations_columns() {
+        assert_eq!(
+            labels("SELECT o.| FROM orders o"),
+            vec![
+                "id".to_string(),
+                "account_id".to_string(),
+                "total".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn an_as_alias_is_read_the_same_way() {
+        assert_eq!(
+            labels("SELECT o.| FROM orders AS o"),
+            vec![
+                "id".to_string(),
+                "account_id".to_string(),
+                "total".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn an_alias_beats_a_relation_of_the_same_name() {
+        // `orders o` makes `o` mean orders. Nothing else may claim it.
+        assert!(labels("SELECT o.| FROM orders o").contains(&"total".to_string()));
+    }
+
+    #[test]
+    fn an_unknown_qualifier_offers_nothing() {
+        assert!(labels("SELECT nothing.| FROM accounts").is_empty());
+    }
+
+    #[test]
+    fn columns_of_the_named_relation_come_before_keywords() {
+        let offered = labels("SELECT e| FROM accounts");
+        let email = offered.iter().position(|label| label == "email");
+        let end = offered.iter().position(|label| label == "END");
+        assert!(
+            email < end,
+            "a column of the statement's own relation ranked below a keyword: {offered:?}"
+        );
+    }
+
+    #[test]
+    fn a_schema_qualified_relation_still_binds_its_columns() {
+        assert!(labels("SELECT accounts.| FROM public.accounts").contains(&"email".to_string()));
+    }
+
+    #[test]
+    fn nothing_typed_and_nothing_qualified_offers_nothing() {
+        assert!(labels("SELECT * FROM |").is_empty());
+        assert!(labels("|").is_empty());
+    }
+
+    #[test]
+    fn a_string_literal_suppresses_everything() {
+        assert!(labels("SELECT * FROM accounts WHERE email = 'acc|'").is_empty());
+    }
+
+    #[test]
+    fn a_closed_string_does_not_suppress_what_follows() {
+        assert!(!labels("SELECT * FROM accounts WHERE email = 'x' AND ema|").is_empty());
+    }
+
+    #[test]
+    fn an_escaped_quote_does_not_end_the_literal() {
+        assert!(labels("SELECT * FROM accounts WHERE email = 'it''s acc|'").is_empty());
+    }
+
+    #[test]
+    fn a_line_comment_suppresses_to_the_end_of_the_line() {
+        assert!(labels("-- pick the acc|\nSELECT 1").is_empty());
+        assert!(!labels("-- a note\nSELECT * FROM acc|").is_empty());
+    }
+
+    #[test]
+    fn a_block_comment_suppresses_until_it_closes() {
+        assert!(labels("/* acc| */ SELECT 1").is_empty());
+        assert!(!labels("/* a note */ SELECT * FROM acc|").is_empty());
+    }
+
+    #[test]
+    fn the_edit_replaces_exactly_the_word_being_typed() {
+        let sql = "SELECT * FROM acc";
+        let (word, _) = catalog()
+            .items(sql, sql.len())
+            .into_iter()
+            .next()
+            .expect("a relation was offered");
+        assert_eq!(&sql[word], "acc");
+    }
+
+    #[test]
+    fn a_qualified_edit_replaces_the_word_and_not_the_qualifier() {
+        let sql = "SELECT o.tot FROM orders o";
+        let offset = sql.find(" FROM").expect("the caret sits after `tot`");
+        let (word, candidate) = catalog()
+            .items(sql, offset)
+            .into_iter()
+            .next()
+            .expect("a column was offered");
+        assert_eq!(&sql[word], "tot");
+        assert_eq!(candidate.label, "total");
+    }
+
+    #[test]
+    fn a_routine_is_offered() {
+        assert!(labels("SELECT recalc|").contains(&"recalculate_totals".to_string()));
+    }
+
+    #[test]
+    fn the_list_is_capped() {
+        let wide = (0..500)
+            .map(|index| format!("column_{index}"))
+            .collect::<Vec<_>>();
+        let completions = SchemaCompletions::new(Arc::new(Catalog {
+            schemas: vec![Schema {
+                name: "public".to_string(),
+                relations: vec![Relation {
+                    name: "wide".to_string(),
+                    kind: RelationKind::Table,
+                    columns: wide,
+                }],
+                routines: Vec::new(),
+            }],
+        }));
+        let sql = "SELECT wide. FROM wide";
+        let offset = sql.find(' ').unwrap() + "wide.".len() + 1;
+        assert_eq!(completions.items(sql, offset).len(), MAX_ITEMS);
+    }
+
+    #[test]
+    fn a_second_statement_does_not_borrow_the_first_statements_relations() {
+        // Each statement is its own scope: the `accounts` in the first one must
+        // not put `email` under the caret in the second.
+        let offered = labels("SELECT * FROM accounts;\nSELECT ema| FROM audit.events");
+        assert!(
+            !offered.contains(&"email".to_string()),
+            "a column leaked across a statement boundary: {offered:?}"
+        );
+    }
+}

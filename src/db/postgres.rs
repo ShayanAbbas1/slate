@@ -32,6 +32,27 @@ WHERE class.relkind IN ('r', 'p', 'v', 'm', 'f')
 ORDER BY namespace.nspname, class.relname
 ";
 
+// Filtered to exactly the relations `RELATIONS_SQL` admits: a column of a
+// relation the tree does not show is a completion for something the user cannot
+// see.
+const RELATION_COLUMNS_SQL: &str = "
+SELECT
+    namespace.nspname AS schema_name,
+    class.relname AS relation_name,
+    attribute.attname AS column_name
+FROM pg_catalog.pg_attribute AS attribute
+JOIN pg_catalog.pg_class AS class
+    ON class.oid = attribute.attrelid
+JOIN pg_catalog.pg_namespace AS namespace
+    ON namespace.oid = class.relnamespace
+WHERE class.relkind IN ('r', 'p', 'v', 'm', 'f')
+    AND attribute.attnum > 0
+    AND NOT attribute.attisdropped
+    AND namespace.nspname <> 'information_schema'
+    AND namespace.nspname NOT LIKE 'pg\\_%' ESCAPE '\\'
+ORDER BY namespace.nspname, class.relname, attribute.attnum
+";
+
 const ROUTINES_SQL: &str = "
 SELECT
     namespace.nspname AS schema_name,
@@ -432,7 +453,8 @@ impl Connection {
     pub fn catalog(&self) -> Result<Catalog, DbError> {
         let relations = self.internal_query(RELATIONS_SQL)?;
         let routines = self.internal_query(ROUTINES_SQL)?;
-        assemble_catalog(relations, routines)
+        let columns = self.internal_query(RELATION_COLUMNS_SQL)?;
+        assemble_catalog(relations, routines, columns)
     }
 
     pub fn structure(&self, schema: &str, relation: &str) -> Result<Structure, DbError> {
@@ -1695,6 +1717,29 @@ mod tests {
         assert!(public.relations.iter().any(|relation| {
             relation.name == "account_overview" && relation.kind == RelationKind::View
         }));
+
+        // Completion offers these, so the order is the table's own and a
+        // dropped or system column must not appear among them.
+        let accounts = public
+            .relations
+            .iter()
+            .find(|relation| relation.name == "accounts")
+            .expect("accounts should be listed");
+        assert_eq!(
+            accounts.columns,
+            [
+                "id",
+                "external_id",
+                "name",
+                "email",
+                "plan",
+                "balance",
+                "active",
+                "tags",
+                "metadata",
+                "created_at"
+            ]
+        );
 
         assert!(
             public
