@@ -101,48 +101,6 @@ const EDITOR_FONT_SIZE_STEP: f32 = 1.0;
 /// The platform's window buttons, which Slate positions but does not draw.
 const TRAFFIC_LIGHT_DIAMETER: f32 = 14.0;
 
-/// How far a swipe across the switcher has to travel, in pixels, to be worth
-/// one workspace.
-///
-/// ponytail: a fixed distance rather than velocity tracking. Raise it if a
-/// swipe overshoots into the next connection, lower it if the gesture feels
-/// stuck; momentum would need the whole scroll history, not this one number.
-const SWIPE_STEP: f32 = 60.0;
-
-/// What one line of an inexact scroll is worth in pixels, for a wheel that
-/// reports lines where a trackpad reports pixels.
-const SWIPE_LINE: f32 = 20.0;
-
-/// Folds one scroll event into `travelled`, and says which way to step when
-/// enough of them add up to a swipe.
-///
-/// A gesture that is more vertical than horizontal is ignored rather than
-/// accumulated: the switcher sits under a scrollable tree, and a flick down it
-/// should not land on another connection. The end of a gesture spends whatever
-/// did not reach a step, so two half-swipes in a row are not one whole one.
-fn swipe_step(
-    travelled: &mut f32,
-    delta: gpui::Point<f32>,
-    phase: gpui::TouchPhase,
-) -> Option<isize> {
-    if matches!(phase, gpui::TouchPhase::Ended) {
-        *travelled = 0.0;
-        return None;
-    }
-    if delta.x.abs() <= delta.y.abs() {
-        return None;
-    }
-    *travelled += delta.x;
-    if travelled.abs() < SWIPE_STEP {
-        return None;
-    }
-    // Swiping the row leftwards brings the next workspace in from the right,
-    // so the list moves the way the fingers push it.
-    let step = if *travelled < 0.0 { 1 } else { -1 };
-    *travelled = 0.0;
-    Some(step)
-}
-
 /// A connection and everything it owns.
 ///
 /// The editor, results, explorer and query state live here rather than on
@@ -935,10 +893,6 @@ struct Workspace {
     /// Whether the explorer column is folded away. Not persisted: a hidden
     /// sidebar is a thing done for the next minute, not a preference.
     sidebar_hidden: bool,
-    /// Horizontal swipe over the switcher accumulated since the last step, in
-    /// pixels. One scroll event is a fraction of a gesture, so the step has to
-    /// be saved up rather than fired per event.
-    swipe: f32,
     pending_removal: Option<String>,
     next_generation: u64,
     /// The palette, built from scratch every time it opens. Its rows are a
@@ -959,7 +913,6 @@ impl Workspace {
             form: None,
             switcher_open: false,
             sidebar_hidden: false,
-            swipe: 0.0,
             pending_removal: None,
             next_generation: 0,
             palette: None,
@@ -1580,22 +1533,6 @@ impl Workspace {
         let count = self.profiles.len() as isize;
         let index = (self.active as isize + step).rem_euclid(count) as usize;
         self.activate(index, cx);
-    }
-
-    /// A horizontal swipe over the switcher, spent one workspace at a time.
-    ///
-    /// The gesture is only read when it is more sideways than vertical, so a
-    /// two-finger scroll that drifts across the row on its way down the tree
-    /// still scrolls rather than switching the connection underneath it.
-    fn swipe_profile(
-        &mut self,
-        delta: gpui::Point<f32>,
-        phase: gpui::TouchPhase,
-        cx: &mut Context<Self>,
-    ) {
-        if let Some(step) = swipe_step(&mut self.swipe, delta, phase) {
-            self.cycle_profile(step, cx);
-        }
     }
 
     fn toggle_sidebar(&mut self, _: &ToggleSidebar, _: &mut Window, cx: &mut Context<Self>) {
@@ -3806,7 +3743,6 @@ impl Workspace {
             .map(|profile| profile.name.clone())
             .unwrap_or_else(|| "Connections".into());
         let toggle_workspace = workspace.clone();
-        let swipe_workspace = workspace.clone();
 
         div()
             .relative()
@@ -3838,23 +3774,6 @@ impl Workspace {
                             workspace.switcher_open = !workspace.switcher_open;
                             workspace.pending_removal = None;
                             cx.notify();
-                        });
-                    })
-                    // Swiping the row steps between connections, the same move
-                    // the panel above it offers by name -- a database is one to
-                    // a profile, so this row is the whole workspace.
-                    .on_scroll_wheel(move |event, _, cx| {
-                        let delta = match event.delta {
-                            gpui::ScrollDelta::Pixels(delta) => {
-                                gpui::point(f32::from(delta.x), f32::from(delta.y))
-                            }
-                            gpui::ScrollDelta::Lines(delta) => {
-                                gpui::point(delta.x * SWIPE_LINE, delta.y * SWIPE_LINE)
-                            }
-                        };
-                        let phase = event.touch_phase;
-                        _ = swipe_workspace.update(cx, |workspace, cx| {
-                            workspace.swipe_profile(delta, phase, cx);
                         });
                     }),
             )
@@ -5011,59 +4930,6 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn a_swipe_steps_once_it_has_travelled_far_enough() {
-        use gpui::{TouchPhase, point};
-
-        let mut travelled = 0.0;
-        let nudge = SWIPE_STEP / 3.0;
-
-        // Neither of the first two nudges is a swipe yet; the third one is.
-        assert_eq!(
-            swipe_step(&mut travelled, point(-nudge, 0.0), TouchPhase::Moved),
-            None
-        );
-        assert_eq!(
-            swipe_step(&mut travelled, point(-nudge, 0.0), TouchPhase::Moved),
-            None
-        );
-        assert_eq!(
-            swipe_step(&mut travelled, point(-nudge, 0.0), TouchPhase::Moved),
-            Some(1)
-        );
-        // Spent, not carried: the next step needs another full swipe.
-        assert_eq!(travelled, 0.0);
-
-        // The other way round is the other direction.
-        assert_eq!(
-            swipe_step(&mut travelled, point(SWIPE_STEP, 0.0), TouchPhase::Moved),
-            Some(-1)
-        );
-
-        // A scroll down the tree is not a swipe across the row, however far it
-        // drifts sideways.
-        assert_eq!(
-            swipe_step(
-                &mut travelled,
-                point(SWIPE_STEP, -SWIPE_STEP * 2.0),
-                TouchPhase::Moved
-            ),
-            None
-        );
-        assert_eq!(travelled, 0.0);
-
-        // A gesture that stops short leaves nothing behind for the next one.
-        assert_eq!(
-            swipe_step(&mut travelled, point(-nudge, 0.0), TouchPhase::Moved),
-            None
-        );
-        assert_eq!(
-            swipe_step(&mut travelled, point(0.0, 0.0), TouchPhase::Ended),
-            None
-        );
-        assert_eq!(travelled, 0.0);
-    }
 
     fn columns(names: &[&str]) -> Vec<db::Column> {
         names
