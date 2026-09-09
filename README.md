@@ -119,9 +119,23 @@ rm -f dev/slate_dev.db && sqlite3 dev/slate_dev.db < dev/sqlite/001-slate-demo.s
   certificate failed and why. SQLite has no transport to secure, so it has no
   such setting.
 
+## Installing
+
+There are no downloads. Build it:
+
+```sh
+dev/bundle.sh
+```
+
+That produces `/Applications/Slate.app` — release build, icon, signature and
+all. It is signed ad-hoc unless you give it an identity, which is fine for the
+machine that compiled it and no good on any other: there is no Developer ID and
+no notarization yet, so this is a build-it-yourself app rather than one to pass
+around.
+
 ## Planned
 
-A Homebrew tap.
+Notarized builds, and a Homebrew tap.
 
 ## Not planned
 

@@ -213,6 +213,33 @@ sqlite3 dev/slate_dev.db < dev/sqlite/001-slate-demo.sql
 database looks exactly like a good one. Check a row count, not the status —
 `live_the_development_database_is_fully_seeded` is that check.
 
+### Bundling
+
+`dev/bundle.sh` builds `--release`, generates the icon, writes `Info.plist`,
+signs, and installs to `/Applications/Slate.app`. It is the only way to get a
+real app rather than a binary, and it replaces what is installed and restarts
+the Dock, so do not run it while someone is using the app.
+
+Three things in it are load-bearing:
+
+- **`CFBundleIdentifier` scopes the Keychain.** Every saved profile password
+  belongs to `com.shayanabbas.slate`. Changing it orphans all of them.
+- **The signature is not optional on arm64.** An unsigned arm64 binary will not
+  launch, and copying the binary into the bundle invalidates the signature
+  rustc left. `SLATE_SIGN_ID` takes a real identity; `dev/identity.sh`'s
+  self-signed one is what stops the Keychain re-prompting after every rebuild;
+  ad-hoc is the fallback and runs, but prompts.
+- **The font licences ship inside the bundle**, because the fonts are compiled
+  into the binary and the OFL asks the licence to travel with them.
+
+**There is no notarization and no Developer ID.** The bundle is fine to build
+and run locally — a binary compiled on the machine it runs on is never
+quarantined — but it is not something to hand to anyone else: an ad-hoc
+signature fails Gatekeeper on every machine but this one. That decision is open
+and deliberate; see the release audit named in `HANDOFF.md` before revisiting
+it, and note the warning there that gpui may need `allow-jit` entitlements
+under a hardened runtime, which is untested.
+
 ### Engine divergences
 
 Decided, recorded in the multi-engine spec, and not to be re-litigated:
