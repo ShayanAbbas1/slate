@@ -13,6 +13,10 @@ notes, not something to publish. Read them if they are on your disk; the
 `spec §` references in the source comments point into them. A clone will not
 have them, and nothing in the repository should come to depend on them.
 
+`HANDOFF.md` at the root points at the private operational notes — the current
+handoff, the worklog and the release and feature audits — for the same reason
+and under the same caveat.
+
 ---
 
 ## Hard rules
@@ -93,17 +97,50 @@ require it, stop and raise it instead.
 
 ## Stack
 
+Every direct dependency, because a list that omits some is a list nobody
+trusts. `Cargo.toml` carries the full reasoning; this is the shape of it.
+
 ```toml
 gpui = "=0.2.2"
 gpui-component = { version = "=0.5.1", features = ["tree-sitter-languages"] }
+
+tree-sitter = "=0.25.10"        # statement boundaries; the library keeps its tree private
+tree-sitter-sequel = "=0.3.11"  # the SQL grammar. A CORRECTNESS pin -- see below
+
 postgres = "0.19"          # blocking client, NOT tokio-postgres
-rusqlite = "0.40"          # bundled + column_metadata + column_decltype
-mysql = "28"               # rust-mysql-simple, blocking; rustls-tls-ring NOT rustls-tls
+mysql = "28"               # rust-mysql-simple, blocking. default-features = false
+rusqlite = "0.40"          # bundled + column_metadata + column_decltype. dff = false
+
+rustls = "0.23"            # TLS; the driver ships none. default-features = false
+rustls-native-certs = "0.8"     # the Keychain, for Postgres verify-full
+rustls-pemfile = "2"            # a named root certificate
+tokio-postgres-rustls = "0.14"
+security-framework = "3"        # the Keychain, for passwords
+
+lsp-types = "=0.97.0"      # the completion provider's vocabulary. No server is started
 nucleo-matcher = "=0.3.1"  # fuzzy scoring; gpui-component ships no scorer
 icondata_lu = "=0.1.0"     # Lucide icon data; gpui-component ships no icon files
-rustls = "0.23"            # TLS; the driver ships none. default-features = false
-tokio-postgres-rustls = "0.14"
+icondata_core = "=0.1.0"
+guic-gpui-assets = "=0.2.0"     # the bundled fonts
+
+geozero = "=0.15.1"        # WKB to WKT, so PostGIS geometry renders as text
+hex = "=0.4.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.9"               # profiles.toml
+url = "2"
 ```
+
+**The two tree-sitter pins are correctness, not formatting.** The grammar
+decides where every statement boundary falls, which statements `sql.rs` will
+splice an `ORDER BY` into, and what `is_generated_update` accepts as a closed
+transaction. A bump changes what Slate sends to the server. Treat them like the
+driver pins.
+
+**Build profiles are deliberate.** `[profile.dev.package."*"] opt-level = 3`
+builds dependencies optimized so a debug Slate is usable on real data; deleting
+it makes the grid crawl. `[profile.release]` sets `lto = "thin"` and
+`codegen-units = 1`.
 
 **`default-features = false` on `rustls` is load-bearing.** Its defaults select
 the `aws-lc-rs` provider; `ring` is what is already linked through gpui. Every
@@ -116,6 +153,12 @@ reasoning.
 **Pins are exact and the lockfile is committed. Do not bump without being asked.**
 gpui is pre-1.0 and breaks on minor bumps; `main` has declared `0.2.2` for ten
 months, which is a stalled version field rather than parity with the release.
+
+**`default-features = false` on `mysql` is load-bearing too**, with
+`minimal-rust` among its features: that takes flate2's pure-Rust backend over
+zlib, the same "no C for something already solved in the graph" rule as the
+provider choice above. `rustls-tls-ring` rather than `rustls-tls` for exactly
+the `aws-lc-rs` reason.
 
 **`default-features = false` on `rusqlite` is load-bearing too.** 0.40's
 defaults pull in `ffi-sqlite-wasm-rs`, a WASM backend with no business in a
@@ -225,10 +268,57 @@ Decided, recorded in the multi-engine spec, and not to be re-litigated:
 - **Geometry is Postgres-only.** MySQL has a `GEOMETRY` type; rendering it is a
   separate decision nobody has asked for.
 
+### Session and tabs
+
+The shape a change to the main pane has to fit, and the one thing in `main.rs`
+that is worth knowing before reading it.
+
+- **A profile owns a `Session`**, and a session owns two lists of tabs:
+  `queries: Vec<QueryTab>` and `objects: Vec<ObjectTab>`. `Tab` is
+  `Query(u64) | Object(u64)` and `active: Tab` says which is in front.
+- **Both kinds are addressed by id, never by index.** A result comes back
+  carrying the `Tab` it was issued for, and an id that no longer resolves drops
+  the result rather than landing it somewhere. Indexing would put a slow query's
+  rows into whatever tab had slid into that slot.
+- **A `QueryTab` owns its own editor, grid, `QueryState`, name and
+  `last_query`.** There used to be exactly one editor per profile, which is why
+  `cmd+t` on a dirty scratch buffer persisted it and then cleared it — there was
+  nowhere else for a second buffer to be. Do not reintroduce a single shared
+  editor for anything.
+- **`queries` is never empty.** A profile always has somewhere to write, so the
+  last unsaved buffer has no closed state: `close_target` returns `None` for it,
+  and deleting the saved query in the only tab empties and unnames that tab
+  rather than closing it.
+- **A named buffer persists to its query file, an unnamed one to its own
+  `.scratch-{id}.sql`.** Every buffer is written on quit, not just the visible
+  one. `store::read_scratch(id, 0)` migrates the single `.scratch.sql` an older
+  build left behind, and `StoredProfile::open_query` is still read for the same
+  reason and never written.
+
+### Completion
+
+`src/completion.rs` offers what the loaded catalog holds — schemas, relations,
+routines, columns — plus the keywords that carry a statement's shape. It is a
+`CompletionProvider` implementation and nothing else: the popup, its scroll and
+its keys all belong to gpui-component (see below).
+
+Two rules it exists under. **It is a lexer, not a parser** — half-typed SQL is a
+parse error by definition, and `SELECT * FROM ` is both the text a user most
+wants completed and the text the grammar returns an `ERROR` node for, so
+context comes from scanning tokens. And **it must offer nothing inside a string
+literal or a comment**, which is the one thing a token scan cannot do by itself
+and the one place accepting a row rewrites data rather than a query.
+
+The provider is a snapshot, replaced whole when the catalog reloads
+(`Workspace::install_completions`), and installed on every buffer rather than
+the visible one.
+
 ### What gpui-component provides
 
-Use these rather than hand-rolling: `InputMode::CodeEditor` (rope-backed
-multi-line editor, IME, line numbers), `src/highlighter/` (tree-sitter; SQL via
+Use these rather than hand-rolling: `InputState::new(window, cx).code_editor("sql")`
+(rope-backed multi-line editor, IME, line numbers — the `InputMode` enum behind
+it is `pub(crate)` in the library and cannot be named from here),
+`src/highlighter/` (tree-sitter; SQL via
 `tree_sitter_sequel`), `src/table/` (grid virtualized on both axes),
 `src/dock/` (panels, tab bars), `Root` dialog layers (modal overlays), and
 `src/input/lsp/` plus `src/input/popovers/` (the completion provider trait and
@@ -255,7 +345,8 @@ therefore `cx.propagate()` on the paths where Slate has nothing stacked to
 close, or the completion popup cannot be dismissed.
 
 It does **not** provide a fuzzy matcher or a command palette. Those are ours —
-`src/palette.rs` scores with `nucleo-matcher` and presents through the
+`src/palette.rs` and `src/completion.rs` both score with `nucleo-matcher`, and
+the palette presents through the
 library's `ListState`, which owns the search field, the virtualized scroll and
 the click-to-confirm. A palette row carries a `Command`; `Workspace::run_command`
 routes every one of them into the method its button or keystroke already calls,
@@ -288,8 +379,10 @@ Hard-won and easy to rediscover. Read before writing any animated element.
 
 - **A repeating `with_animation` element requests a redraw every display frame
   while mounted.** One spinner has been measured pinning a window at 120Hz and
-  36% CPU. Any query-in-flight indicator must use a single shared throttled clock
-  with per-view leases, reaping stale leases and parking when the list empties.
+  36% CPU. The remedy is a single shared throttled clock with per-view leases,
+  reaping stale leases and parking when the list empties. **Slate does not have
+  one**, and the shipped query spinner is subject to this — see "Animation" at
+  the end of this file before adding a second animated element.
 - **`with_animation` replays from zero on remount.** Anything that must survive
   being unmounted mid-animation needs a wall-clock-driven tween evaluated fresh
   each render, not an element-id-keyed animation.
@@ -300,8 +393,9 @@ Hard-won and easy to rediscover. Read before writing any animated element.
   fade plus translate.
 - **`translateY` is a relative-position inset** applied after layout, so siblings
   do not shift.
-- **`.hover()` snaps with no transition.** Colour fades are manual — see the
-  ported `motion.rs` hover-fade system.
+- **`.hover()` snaps with no transition.** There is no fade: `motion.rs` was
+  planned and never landed, and hover states are instant everywhere by
+  consequence. A colour fade would have to be hand-driven from a wall clock.
 
 Two more that are not about animation, and cost a round each to find:
 
@@ -342,14 +436,32 @@ Two more that are not about animation, and cost a round each to find:
 
 ---
 
----
+## Animation: one spinner, and it is the hazard
 
-## No animation in v1
+**This section said "no animation in v1" until 2026-09-09, and that had been
+wrong since `40f3c11`.** Read it before adding anything else that moves.
 
-There is no motion system, no transitions, no easing curves. Hover states are
-instant. A query in flight is shown with static text and a disabled control, not
-a spinner.
+There is still no motion system of Slate's own: no transitions, no easing
+curves, no `with_animation` anywhere in `src/`, and hover states are instant.
+Spec §7.4 is otherwise intact.
 
-This is deliberate — see the spec §7.4. It also means none of the GPUI animation
-hazards above are currently reachable. Do not introduce `with_animation` without
-raising it first.
+The exception is the query-in-flight indicator. `src/views.rs:256` builds
+gpui-component's `Spinner`, shown while a query runs and beside a live **Cancel**
+button — not the static text and disabled control this section used to promise.
+`Spinner` is `Animation::new(speed).repeat()` internally, which makes it exactly
+the first hazard in the list above: a repeating animation requests a redraw
+every display frame while it is mounted.
+
+**The throttled-clock requirement in that hazard is not met.** There is no
+shared clock and no leases; there is one library spinner per running tab,
+mounted while `QueryState::Running` and dropped when the result lands. That is
+tolerable because it is transient and because at most a handful of tabs can be
+running at once — but it is an unmeasured ceiling, not a solved problem, and the
+120Hz/36% measurement behind that hazard was taken on a spinner just like this
+one. One case is already not transient: a preview tab sitting in
+`QueryState::Idle` shows the same spinner (`views.rs:276`), so a preview that
+never runs spins forever.
+
+Anything beyond this one indicator still needs raising first, and if a second
+animated element ever ships, the shared throttled clock is what both should be
+moved onto.

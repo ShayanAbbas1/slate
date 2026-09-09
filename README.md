@@ -91,13 +91,25 @@ rm -f dev/slate_dev.db && sqlite3 dev/slate_dev.db < dev/sqlite/001-slate-demo.s
 - **`cmd+p` and `cmd+shift+p`.** One flat fuzzy list over every table, view,
   routine and saved query the connection has, and one over the verbs that apply
   to what is on screen. Every row runs the same code the buttons do.
+- **Cancel, and a statement timeout.** A running query has a Cancel button that
+  reaches the statement itself, and each profile can carry a timeout applied at
+  connect. What each engine buys with that differs and Slate does not pretend
+  otherwise: on MySQL the timeout bounds read-only `SELECT`s only, and SQLite's
+  is wall clock rather than work done.
+- **Export** the result set in front of you to CSV or JSON. It writes what the
+  tab already holds — no second fetch, no generated SQL — and the file extension
+  picks the format.
 - **Query history**, per profile and appended to on every run — a failed
   statement included, since that is the one worth getting back. Reach it from
   the command palette; recalling a statement appends it to the buffer with the
   cursor on it, so `cmd+enter` sends what you are looking at.
 - **`cmd+w`** closes the tab in front. A saved query is listed while its file
   exists, so closing that one is deleting it and it asks first; everything else
-  just goes.
+  just goes. The exception is the last unsaved buffer, which stays — a profile
+  always has somewhere to write.
+- **Two themes and a glass one**, cycled with `cmd+shift+t`, and the sidebar,
+  the editor and the grid each pick their own font. `cmd+shift+s` folds the
+  sidebar away; `cmd+±` and `cmd+0` size the editor.
 - **TLS, with libpq's five `sslmode` rungs** — `disable`, `prefer`, `require`,
   `verify-ca`, `verify-full` — selectable per connection and carried through to
   both server engines. `verify-full` checks the certificate against the macOS
@@ -119,9 +131,10 @@ assumes you write SQL.
 **Slate will never write a `DELETE`, `DROP` or `TRUNCATE`** — not on request, not
 by accident. Generated statements pass a whitelist gate that admits `UPDATE` and
 nothing else, so the guarantee is structural rather than a list of names someone
-remembered to check. On SQLite, where each statement commits on its own, a
-multi-row edit is bracketed with `BEGIN`/`COMMIT` — written into the buffer
-where you can read it, never opened behind your back.
+remembered to check. On MySQL and SQLite, where each statement commits on its
+own, a multi-row edit is bracketed with `BEGIN`/`COMMIT` — written into the
+buffer where you can read it, never opened behind your back. A batch that fails
+part way is rolled back, and the error says which state the data is in.
 
 ## License
 
