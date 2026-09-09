@@ -45,7 +45,7 @@ use icons::{Icons, icon};
 use palette::{Command, Mode as PaletteMode, Palette};
 use result_grid::{PendingRow, ResultGrid};
 use sql::{Buffer, SortKey};
-use theme::{Theme, layout, theme};
+use theme::{FontSlot, Fonts, Theme, fonts, layout, theme};
 
 /// A header click. The column is the one in the grid; which statement it
 /// belongs to is whatever surface is in front, because that is the grid the
@@ -921,7 +921,11 @@ impl Workspace {
 
         let mut load_failure = None;
         match store::load_profiles() {
-            Ok((profiles, active)) => {
+            Ok((profiles, active, stored_fonts)) => {
+                // Before the first frame, so the window is drawn in the faces
+                // the user picked rather than repainted into them.
+                let available = cx.text_system().all_font_names();
+                install_fonts(restored_fonts(stored_fonts, &available), cx);
                 for stored in profiles {
                     workspace.restore_profile(stored, window, cx);
                 }
@@ -1077,6 +1081,16 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Written through for the same reason the zoom is: a font that resets on
+    /// relaunch is a setting the user has to make again every morning.
+    fn set_font(&mut self, slot: FontSlot, family: String, cx: &mut Context<Self>) {
+        let mut picked = fonts(cx).clone();
+        picked.set(slot, family.into());
+        install_fonts(picked, cx);
+        self.remember_profiles(cx);
+        cx.refresh_windows();
+    }
+
     fn remember_profiles(&mut self, cx: &mut Context<Self>) {
         let profiles = self
             .profiles
@@ -1084,7 +1098,13 @@ impl Workspace {
             .map(Profile::stored)
             .collect::<Vec<_>>();
         let active = self.profile().map(|profile| profile.id.clone());
-        if let Err(message) = store::save_profiles(&profiles, active.as_deref()) {
+        let picked = fonts(cx);
+        let fonts = store::StoredFonts {
+            chrome: Some(picked.chrome.to_string()),
+            editor: Some(picked.editor.to_string()),
+            grid: Some(picked.grid.to_string()),
+        };
+        if let Err(message) = store::save_profiles(&profiles, active.as_deref(), &fonts) {
             self.note(message, cx);
         }
     }
@@ -2125,6 +2145,8 @@ impl Workspace {
             Command::SwitchProfile(index) => self.activate(index, cx),
             Command::NewConnection => self.open_connection_form(&NewConnection, window, cx),
             Command::CycleTheme => self.cycle_theme(&CycleTheme, window, cx),
+            Command::PickFont(slot) => self.open_palette(PaletteMode::Font(slot), window, cx),
+            Command::SetFont(slot, family) => self.set_font(slot, family, cx),
             Command::ToggleSidebar => self.toggle_sidebar(&ToggleSidebar, window, cx),
             Command::ResetEditorZoom => self.reset_editor_zoom(&ResetEditorZoom, window, cx),
         }
@@ -3510,7 +3532,7 @@ impl Workspace {
     /// only remaining copy of what was attempted.
     fn render_apply_review(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let t = *theme(cx);
-        let mono = gpui_component::Theme::global(cx).mono_font_family.clone();
+        let code = fonts(cx).editor.clone();
         let profile = self.profile()?;
         let review = profile.session.apply_review.as_ref()?;
         if review.tab != profile.session.active {
@@ -3542,7 +3564,7 @@ impl Workspace {
                                 .id("apply-review-sql")
                                 .max_h(px(220.))
                                 .overflow_y_scroll()
-                                .font_family(mono)
+                                .font_family(code)
                                 .text_size(px(layout::TEXT_SM))
                                 // Line by line: a single child carrying newlines
                                 // is one run of text to the layout.
@@ -4686,6 +4708,32 @@ fn restored_editor_font_size(stored: Option<f32>) -> f32 {
         .unwrap_or(EDITOR_FONT_SIZE_DEFAULT)
 }
 
+/// Push a font choice everywhere it is read from: the global the views render
+/// against, and gpui-component's own theme, which carries the chrome family.
+fn install_fonts(picked: Fonts, cx: &mut App) {
+    cx.set_global(picked);
+    let theme = *theme(cx);
+    theme.apply_to_components(cx);
+}
+
+/// Fonts read back from disk. A family the text system cannot resolve falls
+/// back to the default rather than being trusted: gpui matches a family it does
+/// not know to nothing, so a font uninstalled between launches would otherwise
+/// render the surface it was picked for blank.
+fn restored_fonts(stored: Option<store::StoredFonts>, available: &[String]) -> Fonts {
+    let stored = stored.unwrap_or_default();
+    let pick = |family: Option<String>, default: &'static str| -> gpui::SharedString {
+        family
+            .filter(|family| available.iter().any(|name| name == family))
+            .map_or_else(|| default.into(), gpui::SharedString::from)
+    };
+    Fonts {
+        chrome: pick(stored.chrome, Fonts::DEFAULT_CHROME),
+        editor: pick(stored.editor, Fonts::DEFAULT_EDITOR),
+        grid: pick(stored.grid, Fonts::DEFAULT_GRID),
+    }
+}
+
 fn editor_zoom_percent(font_size: f32) -> u32 {
     (font_size / EDITOR_FONT_SIZE_DEFAULT * 100.0).round() as u32
 }
@@ -4834,6 +4882,10 @@ fn main() {
             )
             .expect("bundled fonts must be loadable");
         gpui_component::init(cx);
+        // The defaults stand in until `Workspace::new` has read the file; the
+        // theme is applied through them, and `apply_to_components` reads the
+        // global rather than naming a family itself.
+        cx.set_global(Fonts::default());
         let theme = Theme::default();
         theme.apply_to_components(cx);
         cx.set_global(theme);
@@ -5383,5 +5435,26 @@ mod tests {
             appended_statement("SELECT 1\n\n  ", "UPDATE t SET a = 1"),
             "SELECT 1;\n\nUPDATE t SET a = 1"
         );
+    }
+
+    #[test]
+    fn a_stored_font_family_survives_only_while_it_is_still_installed() {
+        // The file is the user's to edit and the font is theirs to uninstall,
+        // and gpui draws an unresolvable family as nothing at all -- so a name
+        // that is gone has to read back as the default, not as blank text.
+        let available = ["Lilex".to_string(), "SF Mono".to_string()];
+        let restored = restored_fonts(
+            Some(store::StoredFonts {
+                chrome: Some("Uninstalled Sans".into()),
+                editor: Some("SF Mono".into()),
+                grid: None,
+            }),
+            &available,
+        );
+
+        assert_eq!(restored.chrome, Fonts::DEFAULT_CHROME);
+        assert_eq!(restored.editor, "SF Mono");
+        assert_eq!(restored.grid, Fonts::DEFAULT_GRID);
+        assert_eq!(restored_fonts(None, &available), Fonts::default());
     }
 }

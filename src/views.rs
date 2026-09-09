@@ -31,7 +31,7 @@ use crate::{
     key_hint, object_icon, result_grid,
     result_grid::ResultGrid,
     result_pane_is_expanded, row_icon, section_label,
-    theme::{layout, theme},
+    theme::{fonts, layout, theme},
 };
 
 pub fn render_main_content(profile: &Profile, cx: &mut Context<Workspace>) -> AnyElement {
@@ -63,7 +63,7 @@ fn render_editor_surface(
     cx: &mut Context<Workspace>,
 ) -> AnyElement {
     let t = *theme(cx);
-    let mono = gpui_component::Theme::global(cx).mono_font_family.clone();
+    let code = fonts(cx).editor.clone();
 
     // The editor is the prompt, one tone behind its results -- and one step
     // more transparent, since it is also one step further from the data.
@@ -71,7 +71,7 @@ fn render_editor_surface(
         .size_full()
         .bg(t.panel_glass())
         .p(px(layout::SPACE_LG))
-        .font_family(mono)
+        .font_family(code)
         .child(
             Input::new(editor)
                 .h_full()
@@ -153,7 +153,7 @@ fn render_object(tab: &ObjectTab, cx: &mut Context<Workspace>) -> AnyElement {
 
 fn render_routine(tab: &ObjectTab, cx: &mut Context<Workspace>) -> AnyElement {
     let t = *theme(cx);
-    let mono = gpui_component::Theme::global(cx).mono_font_family.clone();
+    let code = fonts(cx).editor.clone();
     let ObjectBody::Routine(routine) = &tab.body else {
         return div().into_any_element();
     };
@@ -205,7 +205,7 @@ fn render_routine(tab: &ObjectTab, cx: &mut Context<Workspace>) -> AnyElement {
                 .min_h_0()
                 .overflow_y_scroll()
                 .p(px(layout::SPACE_LG))
-                .font_family(mono)
+                .font_family(code)
                 .child(routine.definition.clone()),
         )
         .into_any_element()
@@ -226,7 +226,8 @@ fn render_results(
     cx: &mut Context<Workspace>,
 ) -> AnyElement {
     let t = *theme(cx);
-    let mono = gpui_component::Theme::global(cx).mono_font_family.clone();
+    let code = fonts(cx).editor.clone();
+    let grid = fonts(cx).grid.clone();
     let centered = |child: AnyElement| {
         div()
             .size_full()
@@ -294,7 +295,7 @@ fn render_results(
             div()
                 .size_full()
                 .p(px(layout::SPACE_LG))
-                .font_family(mono)
+                .font_family(code)
                 .text_color(t.danger)
                 .child(format!("{}{position}", error.message))
                 .into_any_element()
@@ -309,7 +310,9 @@ fn render_results(
         })),
         // Values are read by comparing them down a column, which only lines
         // up in a monospaced face -- and the header inherits it, so the
-        // heading of a column sits in the same rhythm as its values.
+        // heading of a column sits in the same rhythm as its values. The
+        // library's table sets no family of its own, so this is where the
+        // cells and their headings get theirs.
         _ => div()
             .size_full()
             .flex()
@@ -319,7 +322,7 @@ fn render_results(
                     .flex_1()
                     .min_w_0()
                     .h_full()
-                    .font_family(mono)
+                    .font_family(grid)
                     // The grid's own delegate has no key hook and the focused
                     // element is the table root, so `enter` is caught here on
                     // its way out of the Table context.
@@ -354,7 +357,7 @@ fn render_row_inspector(
     cx: &mut Context<Workspace>,
 ) -> Option<AnyElement> {
     let t = *theme(cx);
-    let mono = gpui_component::Theme::global(cx).mono_font_family.clone();
+    let grid = fonts(cx).grid.clone();
 
     let (row_ix, rows, fields) = {
         let table = results.read(cx);
@@ -457,7 +460,7 @@ fn render_row_inspector(
                             )
                             .child(
                                 div()
-                                    .font_family(mono.clone())
+                                    .font_family(grid.clone())
                                     .text_size(px(layout::TEXT_SM))
                                     .map(|value| match field.value {
                                         Some(text) => value.text_color(t.text).child(text),
@@ -541,7 +544,7 @@ fn row_limit_chip(rows: usize, selected: bool, cx: &mut Context<Workspace>) -> A
 
 fn render_structure(state: &StructureState, cx: &mut Context<Workspace>) -> AnyElement {
     let t = *theme(cx);
-    let mono = gpui_component::Theme::global(cx).mono_font_family.clone();
+    let code = fonts(cx).editor.clone();
 
     let structure = match state {
         StructureState::Loading => {
@@ -597,7 +600,7 @@ fn render_structure(state: &StructureState, cx: &mut Context<Workspace>) -> AnyE
         .size_full()
         .overflow_y_scroll()
         .p(px(layout::SPACE_LG))
-        .font_family(mono)
+        .font_family(code)
         .flex()
         .flex_col()
         .gap(px(layout::SPACE_XS))

@@ -26,7 +26,7 @@ use crate::{
     export::Format,
     icons::icon,
     object_icon, routine_name, row_icon,
-    theme::{layout, theme},
+    theme::{FontSlot, fonts, layout, theme},
 };
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -37,6 +37,10 @@ pub enum Mode {
     Commands,
     /// The statements this profile has run, reached from the command palette.
     History,
+    /// Every family the text system knows, for one of the three slots. One mode
+    /// with the slot in it rather than three: the list is the same list, and
+    /// only the row's destination differs.
+    Font(FontSlot),
 }
 
 /// What a row does when it is confirmed.
@@ -70,6 +74,10 @@ pub enum Command {
     SwitchProfile(usize),
     NewConnection,
     CycleTheme,
+    /// Put the palette back up over the font list for this slot, the way
+    /// [`Command::QueryHistory`] does for the history.
+    PickFont(FontSlot),
+    SetFont(FontSlot, String),
     ToggleSidebar,
     ResetEditorZoom,
 }
@@ -112,6 +120,7 @@ impl Palette {
                 Mode::Jump => jump_items(profile),
                 Mode::Commands => command_items(workspace, profile, cx),
                 Mode::History => history_items(profile),
+                Mode::Font(slot) => font_items(slot, cx),
             },
             None => Vec::new(),
         };
@@ -141,6 +150,7 @@ impl Palette {
             Mode::Jump => "Go to a table, view, routine or saved query…",
             Mode::Commands => "Run a command…",
             Mode::History => "Recall a statement you have run…",
+            Mode::Font(_) => "Pick a font…",
         }
     }
 }
@@ -301,6 +311,39 @@ fn history_items(profile: &Profile) -> Vec<Item> {
         .collect()
 }
 
+/// Every family the text system can resolve, for one slot.
+///
+/// The leading-dot names are dropped: those are the platform's own internal
+/// faces and gpui's aliases, and a row nobody should pick is a row to read
+/// past. Sorted, because the unfiltered list is the list in the order it was
+/// built and an install has hundreds of families in it.
+///
+/// ponytail: every row is drawn in the chrome face, and nothing here knows
+/// which families are monospaced -- so a face is picked by name, and the grid
+/// slot will take a proportional one. Render each label in its own family and
+/// filter the grid's list by advance width if picking blind starts to cost.
+fn font_items(slot: FontSlot, cx: &App) -> Vec<Item> {
+    let current = fonts(cx).family(slot).clone();
+    let mut names = cx.text_system().all_font_names();
+    names.sort();
+    names.dedup();
+    names
+        .into_iter()
+        .filter(|name| !name.starts_with('.'))
+        .map(|name| Item {
+            hint: if name.as_str() == current.as_ref() {
+                "current"
+            } else {
+                ""
+            }
+            .into(),
+            icon: icon::FONT,
+            command: Command::SetFont(slot, name.clone()),
+            label: name,
+        })
+        .collect()
+}
+
 /// A statement as a row: one line, however many it was written across. The
 /// label is what the matcher scores as well as what the row reads as, so
 /// collapsing the whitespace is also what makes `select from accounts` find a
@@ -446,6 +489,18 @@ fn command_items(workspace: &Workspace, profile: &Profile, cx: &App) -> Vec<Item
         icon::SWITCHER,
         Command::CycleTheme,
     ));
+    for (label, slot) in [
+        ("Sidebar font", FontSlot::Chrome),
+        ("Editor font", FontSlot::Editor),
+        ("Grid font", FontSlot::Grid),
+    ] {
+        items.push(Item::command(
+            label,
+            "",
+            icon::FONT,
+            Command::PickFont(slot),
+        ));
+    }
     // One row rather than a Show/Hide pair: the palette is built from the
     // session, which does not know whether the column is folded.
     items.push(Item::command(

@@ -127,6 +127,75 @@ pub fn theme(cx: &gpui::App) -> &Theme {
     cx.global::<Theme>()
 }
 
+/// Which of the three faces a family is being set for. Slate's type does three
+/// different jobs: chrome labels itself, the editor is code, and the grid is
+/// columns of values that only line up in a monospaced face.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FontSlot {
+    /// Sidebar, tabs, titlebar, status bar.
+    Chrome,
+    /// The SQL buffer, and the other views that are showing code.
+    Editor,
+    /// Result cells, their headers, and the row inspector's values.
+    Grid,
+}
+
+/// The three families in use.
+///
+/// A global of its own rather than fields on [`Theme`]: a theme is a palette
+/// Slate ships and a font is the user's pick, so cycling one must not reset the
+/// other.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Fonts {
+    pub chrome: gpui::SharedString,
+    pub editor: gpui::SharedString,
+    pub grid: gpui::SharedString,
+}
+
+impl Fonts {
+    /// The bundled families, under their real names rather than gpui's
+    /// `.ZedSans` and `.ZedMono` aliases. A pick is a family name, and a
+    /// default the user cannot name is a default they cannot get back to.
+    pub const DEFAULT_CHROME: &'static str = "IBM Plex Sans";
+    pub const DEFAULT_EDITOR: &'static str = "Lilex";
+    pub const DEFAULT_GRID: &'static str = "Lilex";
+
+    pub fn family(&self, slot: FontSlot) -> &gpui::SharedString {
+        match slot {
+            FontSlot::Chrome => &self.chrome,
+            FontSlot::Editor => &self.editor,
+            FontSlot::Grid => &self.grid,
+        }
+    }
+
+    pub fn set(&mut self, slot: FontSlot, family: gpui::SharedString) {
+        match slot {
+            FontSlot::Chrome => self.chrome = family,
+            FontSlot::Editor => self.editor = family,
+            FontSlot::Grid => self.grid = family,
+        }
+    }
+}
+
+impl Default for Fonts {
+    fn default() -> Self {
+        Self {
+            chrome: Self::DEFAULT_CHROME.into(),
+            editor: Self::DEFAULT_EDITOR.into(),
+            grid: Self::DEFAULT_GRID.into(),
+        }
+    }
+}
+
+impl gpui::Global for Fonts {}
+
+/// Read the families in use. Panics until `cx.set_global` has run, the same as
+/// [`theme`], and for the same reason: a missing font global is a wiring
+/// mistake in `main`, not a state the UI should paint around.
+pub fn fonts(cx: &gpui::App) -> &Fonts {
+    cx.global::<Fonts>()
+}
+
 impl From<Srgb> for gpui::Hsla {
     fn from(c: Srgb) -> Self {
         c.opaque().into()
@@ -331,15 +400,21 @@ impl Theme {
         }
     }
 
+    /// Reads the [`Fonts`] global, so that has to be set first -- `main` does,
+    /// and `Workspace::new` sets it again from disk before the first frame.
     pub fn apply_to_components(self, cx: &mut gpui::App) {
+        let fonts = fonts(cx).clone();
         let component = gpui_component::Theme::global_mut(cx);
         component.shadow = false;
         component.radius = gpui::px(layout::RADIUS_CONTROL);
         component.radius_lg = gpui::px(layout::RADIUS_LARGE);
         component.font_size = gpui::px(layout::TEXT_MD);
         component.mono_font_size = gpui::px(layout::TEXT_MD);
-        component.font_family = ".ZedSans".into();
-        component.mono_font_family = ".ZedMono".into();
+        component.font_family = fonts.chrome;
+        // Kept on the editor's family so that whatever inside gpui-component
+        // reads the mono slot renders in the face Slate is already using for
+        // code, rather than in a third one nobody picked.
+        component.mono_font_family = fonts.editor;
 
         // The one plane painted below Slate's own tree, by `Root`. It is the
         // frost, so removing a `bg` from a chrome element uncovers glass rather
