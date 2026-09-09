@@ -490,7 +490,7 @@ fn command_items(workspace: &Workspace, profile: &Profile, cx: &App) -> Vec<Item
         Command::CycleTheme,
     ));
     for (label, slot) in [
-        ("Sidebar font", FontSlot::Chrome),
+        ("Chrome font", FontSlot::Chrome),
         ("Editor font", FontSlot::Editor),
         ("Grid font", FontSlot::Grid),
     ] {
