@@ -8,10 +8,6 @@ on. Keyboard-first, minimal, and built to stay at display refresh rate on real
 data.
 
 > **Status: early development.** Everything below under "What works" runs today.
->
-> Design: [`docs/specs/2026-08-17-slate-design.md`](docs/specs/2026-08-17-slate-design.md),
-> amended by [`docs/specs/2026-08-23-in-grid-editing-design.md`](docs/specs/2026-08-23-in-grid-editing-design.md)
-> and [`docs/specs/2026-08-26-multi-engine-design.md`](docs/specs/2026-08-26-multi-engine-design.md).
 
 ## Development databases
 

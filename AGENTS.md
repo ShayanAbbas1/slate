@@ -4,11 +4,14 @@ Slate is a native macOS SQL client in Rust on GPUI, speaking Postgres, MySQL
 and SQLite. A SQL editor that shows results — not a database browser with an editor
 bolted on.
 
-**Read `docs/specs/2026-08-17-slate-design.md` before doing anything.** It carries
-the reasoning behind every decision below, including the rejected alternatives.
-`docs/specs/2026-08-26-multi-engine-design.md` carries the second and third, and
-supersedes the first spec's §4.1 on what the boundary looks like. This file is
-the operational summary; the specs are the source of truth.
+**Read this file before doing anything.** It is the source of truth for how
+Slate is built and why.
+
+The design documents behind it live in `docs/specs/` and are deliberately not
+version-controlled — the reasoning and the rejected alternatives are working
+notes, not something to publish. Read them if they are on your disk; the
+`spec §` references in the source comments point into them. A clone will not
+have them, and nothing in the repository should come to depend on them.
 
 ---
 
@@ -40,8 +43,8 @@ require it, stop and raise it instead.
    why "silently" is still the word that carries the rule.
 
 2. **No code path leads from the grid to a destructive statement.** The grid can
-   now write an `UPDATE` — see `docs/specs/2026-08-23-in-grid-editing-design.md`
-   — and `sql::is_generated_update` is the single gate every generated statement
+   now write an `UPDATE`, and `sql::is_generated_update` is the single gate
+   every generated statement
    passes first. It is a whitelist, so `DROP`, `TRUNCATE` and `DELETE` are
    refused structurally rather than by name. Do not add a second path that
    bypasses it.

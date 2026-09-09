@@ -159,7 +159,7 @@ SELECT
 FROM series;
 
 -- Geometry columns (`point`, `boundary`) are PostGIS-only; MySQL geometry
--- support is out of scope (see docs/specs/2026-08-26-multi-engine-design.md §10).
+-- support is out of scope.
 CREATE TABLE locations (
     id INT PRIMARY KEY,
     name TEXT NOT NULL
