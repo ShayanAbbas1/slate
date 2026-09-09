@@ -12,8 +12,9 @@ use gpui::{
     ParentElement, StatefulInteractiveElement, Styled, div, prelude::FluentBuilder, px,
 };
 use gpui_component::{
-    InteractiveElementExt, Sizable,
+    IconName, InteractiveElementExt, Sizable,
     input::{Input, InputState},
+    spinner::Spinner,
     resizable::{resizable_panel, v_resizable},
     table::{Table, TableDelegate, TableState},
 };
@@ -243,6 +244,15 @@ fn render_results(
             .child(line)
             .into_any_element()
     };
+    // The default `Loader` icon names a file Slate's asset source does not
+    // serve, so the spinner has to be pointed at the one it does.
+    let spinner = || {
+        Spinner::new()
+            .icon(IconName::LoaderCircle)
+            .color(t.text_muted.into())
+            .small()
+            .into_any_element()
+    };
 
     let content = match query {
         QueryState::Idle if is_query => centered(
@@ -256,14 +266,14 @@ fn render_results(
         // A preview runs the moment its tab is shown, so an idle one is a
         // tab that is about to run rather than one waiting to be asked. It has
         // nothing to cancel yet, though, which is the whole difference here.
-        QueryState::Idle => centered(quiet_line("Running query…".into())),
+        QueryState::Idle => centered(spinner()),
         QueryState::Running => centered(
             div()
                 .flex()
                 .flex_col()
                 .items_center()
                 .gap(px(layout::SPACE_MD))
-                .child(quiet_line("Running query…".into()))
+                .child(spinner())
                 // A word rather than an icon: a square or a cross beside a
                 // status line reads as "close this", and the quiet tone is what
                 // keeps it from competing with rows that are still coming.
