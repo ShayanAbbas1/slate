@@ -53,14 +53,25 @@ use crate::{
 /// kept. What a session holds is bounded by what it actually wrote about.
 #[derive(Clone, Debug)]
 pub enum ColumnState {
-    /// Asked for, not back yet. Held so a relation is asked about once rather
-    /// than on every keystroke until it lands.
-    Loading,
+    /// Asked for, not back yet, and how many attempts have already failed.
+    /// Held so a relation is asked about once rather than on every keystroke
+    /// until it lands.
+    Loading(u8),
     Loaded(Vec<String>),
-    /// The fetch failed. Held for the same reason `Loading` is: a relation the
-    /// server will not describe must not be re-asked forever.
-    Failed,
+    /// That many attempts have failed. Retried while it is under
+    /// [`FETCH_ATTEMPTS`], and then not again for this connection.
+    ///
+    /// Neither extreme is right here. Never retrying means one blip -- or one
+    /// statement timeout, which bounds Slate's own catalog queries too -- kills
+    /// completion for that relation silently, for the rest of the session.
+    /// Always retrying means a describe per keystroke, and every one of them
+    /// queues on the connection mutex behind the last, so a slow failure would
+    /// freeze the profile rather than degrade it.
+    Failed(u8),
 }
+
+/// How many times a relation's columns are asked for before Slate stops.
+const FETCH_ATTEMPTS: u8 = 3;
 
 /// Columns by schema and relation, shared between the provider that reads them
 /// and the workspace that fills them. `Rc` rather than `Arc` because both live
@@ -227,9 +238,12 @@ impl SchemaCompletions {
                             )
                         }));
                     }
-                    // In flight, or known not to answer. Neither is a reason to
-                    // ask again.
-                    Some(ColumnState::Loading | ColumnState::Failed) => {}
+                    // Failed, but not yet often enough to give up on.
+                    Some(ColumnState::Failed(attempts)) if *attempts < FETCH_ATTEMPTS => {
+                        wanted.push(key)
+                    }
+                    // In flight, or asked for as often as it is going to be.
+                    Some(ColumnState::Loading(_) | ColumnState::Failed(_)) => {}
                     None => wanted.push(key),
                 }
             }
@@ -436,9 +450,13 @@ impl CompletionProvider for SchemaCompletions {
         // Marked before the request so a second keystroke arriving while the
         // first fetch is in flight does not ask again.
         for key in wanted {
+            let attempts = match self.columns.borrow().get(&key) {
+                Some(ColumnState::Failed(attempts)) => *attempts,
+                _ => 0,
+            };
             self.columns
                 .borrow_mut()
-                .insert(key.clone(), ColumnState::Loading);
+                .insert(key.clone(), ColumnState::Loading(attempts));
             if let Some(workspace) = &self.workspace {
                 workspace
                     .update(cx, |workspace, cx| {
@@ -963,7 +981,7 @@ mod tests {
         // nothing while the first fetch is still out.
         completions.columns.borrow_mut().insert(
             ("public".to_string(), "accounts".to_string()),
-            ColumnState::Loading,
+            ColumnState::Loading(0),
         );
         assert!(completions.items(sql, sql.len()).1.is_empty());
     }
@@ -982,10 +1000,32 @@ mod tests {
         let completions = detached(schemas(), &[]);
         completions.columns.borrow_mut().insert(
             ("public".to_string(), "accounts".to_string()),
-            ColumnState::Failed,
+            ColumnState::Failed(FETCH_ATTEMPTS),
         );
         let sql = "SELECT accounts.";
         assert!(completions.items(sql, sql.len()).1.is_empty());
+    }
+
+    #[test]
+    fn a_failure_is_retried_until_the_budget_runs_out() {
+        // One blip -- or one statement timeout, which bounds Slate's own
+        // catalog queries too -- must not silently kill completion for a
+        // relation for the rest of the connection.
+        let completions = detached(schemas(), &[]);
+        let key = ("public".to_string(), "accounts".to_string());
+        let sql = "SELECT accounts.";
+
+        for attempts in 0..FETCH_ATTEMPTS {
+            completions
+                .columns
+                .borrow_mut()
+                .insert(key.clone(), ColumnState::Failed(attempts));
+            assert_eq!(
+                completions.items(sql, sql.len()).1,
+                vec![key.clone()],
+                "a relation that has failed {attempts} times is still worth asking about"
+            );
+        }
     }
 
     #[test]

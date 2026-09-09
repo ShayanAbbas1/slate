@@ -317,6 +317,17 @@ relation is asked about once rather than once per keystroke. A name the catalog
 does not list is never fetched at all — otherwise a typo puts a describe on the
 wire for as long as it is on screen.
 
+Two things about that cache are load-bearing and easy to undo by accident.
+**`load_structure` fills it too**, because opening a relation's Structure tab
+makes exactly the call completion would make; dropping that line costs a
+duplicate round trip per relation the user both opened and wrote about. And **a
+failed fetch is retried, but only `FETCH_ATTEMPTS` times.** Neither extreme
+works: never retrying lets one blip — or one statement timeout, which bounds
+Slate's own catalog queries too — kill completion for a relation silently for
+the rest of the connection, and always retrying puts a describe on the wire per
+keystroke, each queued behind the last on the connection mutex, which freezes
+the profile rather than degrading it.
+
 Two rules it exists under. **It is a lexer, not a parser** — half-typed SQL is a
 parse error by definition, and `SELECT * FROM ` is both the text a user most
 wants completed and the text the grammar returns an `ERROR` node for, so

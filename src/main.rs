@@ -1704,6 +1704,7 @@ impl Workspace {
                     if workspace.issued_to(&id, generation).is_none() {
                         return;
                     }
+                    let key = (schema, relation);
                     let state = match result {
                         Ok(structure) => completion::ColumnState::Loaded(
                             structure
@@ -1712,9 +1713,17 @@ impl Workspace {
                                 .map(|column| column.name)
                                 .collect(),
                         ),
-                        Err(_) => completion::ColumnState::Failed,
+                        // The attempt count rides on the `Loading` the request
+                        // wrote, so a relation that keeps failing runs out.
+                        Err(_) => {
+                            let attempts = match columns.borrow().get(&key) {
+                                Some(completion::ColumnState::Loading(attempts)) => *attempts,
+                                _ => 0,
+                            };
+                            completion::ColumnState::Failed(attempts.saturating_add(1))
+                        }
                     };
-                    columns.borrow_mut().insert((schema, relation), state);
+                    columns.borrow_mut().insert(key, state);
                     cx.notify();
                 })
                 .ok();
@@ -2065,6 +2074,7 @@ impl Workspace {
         };
         let profile_id = profile.id.clone();
         let generation = profile.generation;
+        let key = (schema.clone(), relation.clone());
         let structure_task = cx
             .background_executor()
             .spawn(async move { connection.structure(&schema, &relation) });
@@ -2076,6 +2086,20 @@ impl Workspace {
                     let Some(profile) = workspace.issued_to(&profile_id, generation) else {
                         return;
                     };
+                    // The same call completion makes, so completion should not
+                    // make it again for this relation.
+                    if let Ok(structure) = &result {
+                        profile.session.completion_columns.borrow_mut().insert(
+                            key,
+                            completion::ColumnState::Loaded(
+                                structure
+                                    .columns
+                                    .iter()
+                                    .map(|column| column.name.clone())
+                                    .collect(),
+                            ),
+                        );
+                    }
                     // Addressed by tab, so a second object opened while this was
                     // in flight cannot end up wearing this one's columns.
                     let Some(tab) = profile.session.objects.iter_mut().find(|tab| tab.id == id)
