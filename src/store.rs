@@ -57,8 +57,10 @@ pub struct StoredProfile {
     /// The database file, for SQLite. Absent for a server engine.
     #[serde(default)]
     pub path: Option<String>,
-    /// The editor's zoom. Absent is a profile written before zoom was kept, and
-    /// reads back as the default -- which is what it was showing.
+    /// The editor's zoom, back when it was a per-profile setting. Read only:
+    /// the live value is [`StoredSettings::editor_font_size`] now, and this is
+    /// what the migration seeds it from for anyone upgrading -- dropping the
+    /// field would take their zoom with it on the next save.
     #[serde(default)]
     pub editor_font_size: Option<f32>,
     /// Seconds a statement may run before the engine stops it, or 0 / absent
@@ -169,14 +171,35 @@ pub struct StoredFonts {
     pub grid: Option<String>,
 }
 
+/// What the app is set to, as opposed to what a connection is. App-level for
+/// the same reason the fonts are: the theme, the zoom and how many rows a
+/// preview asks for belong to the person reading, not to the database they
+/// happen to be connected to. Every field is optional, so a file written
+/// before settings existed reads back as the defaults -- which is what it was
+/// running with.
+#[derive(Clone, Default, Debug, PartialEq, Serialize, Deserialize)]
+pub struct StoredSettings {
+    #[serde(default)]
+    pub theme: Option<String>,
+    #[serde(default)]
+    pub editor_font_size: Option<f32>,
+    #[serde(default)]
+    pub preview_rows: Option<usize>,
+}
+
 /// A decoded profile file: the profiles, the id of the one that was in front,
-/// and the fonts. Named because it is three things and a bare triple in the
-/// signature reads as none of them.
-type Restored = (Vec<StoredProfile>, Option<String>, Option<StoredFonts>);
+/// the fonts and the settings. Named because it is four things and a bare
+/// tuple in the signature reads as none of them.
+type Restored = (
+    Vec<StoredProfile>,
+    Option<String>,
+    Option<StoredFonts>,
+    Option<StoredSettings>,
+);
 
 /// Field order is load-bearing here too: `active` is a scalar, so it has to
-/// precede both tables, and `fonts` is a table, so it has to precede the
-/// profile table array.
+/// precede every table, and `fonts` and `settings` are tables, so both have to
+/// precede the profile table array.
 #[derive(Default, Debug, PartialEq, Serialize, Deserialize)]
 struct ProfileFile {
     /// The profile that was in front. An id rather than a flag on the profile,
@@ -186,6 +209,8 @@ struct ProfileFile {
     active: Option<String>,
     #[serde(default)]
     fonts: Option<StoredFonts>,
+    #[serde(default)]
+    settings: Option<StoredSettings>,
     #[serde(default)]
     profiles: Vec<StoredProfile>,
 }
@@ -200,7 +225,7 @@ pub fn load_profiles() -> Result<Restored, String> {
     // it, so the overwrite hazard below technically remains. A directory we
     // cannot read is one we almost certainly cannot write either.
     let Some(text) = read_file(&path)? else {
-        return Ok((Vec::new(), None, None));
+        return Ok((Vec::new(), None, None, None));
     };
     decode_profiles(&text).map_err(|error| {
         // The next save rewrites this path, so moving the unparsable file aside
@@ -222,7 +247,7 @@ pub fn load_profiles() -> Result<Restored, String> {
 
 fn decode_profiles(text: &str) -> Result<Restored, String> {
     toml::from_str::<ProfileFile>(text)
-        .map(|file| (file.profiles, file.active, file.fonts))
+        .map(|file| (file.profiles, file.active, file.fonts, file.settings))
         .map_err(|error| error.to_string())
 }
 
@@ -230,10 +255,12 @@ pub fn save_profiles(
     profiles: &[StoredProfile],
     active: Option<&str>,
     fonts: &StoredFonts,
+    settings: &StoredSettings,
 ) -> Result<(), String> {
     let text = toml::to_string_pretty(&ProfileFile {
         active: active.map(str::to_string),
         fonts: Some(fonts.clone()),
+        settings: Some(settings.clone()),
         profiles: profiles.to_vec(),
     })
     .map_err(|error| format!("Could not encode the profile list: {error}"))?;
@@ -741,6 +768,7 @@ mod tests {
         let file = ProfileFile {
             fonts: None,
             active: Some("dev".into()),
+            settings: None,
             profiles: vec![profile.clone()],
         };
 
@@ -815,6 +843,7 @@ open_objects = []
         let file = ProfileFile {
             active: None,
             fonts: None,
+            settings: None,
             profiles: vec![profile.clone()],
         };
 
@@ -914,6 +943,7 @@ open_objects = []
         let text = toml::to_string_pretty(&ProfileFile {
             active: None,
             fonts: None,
+            settings: None,
             profiles: vec![profile],
         })
         .expect("profile must encode");
@@ -942,11 +972,83 @@ open_objects = []
     }
 
     #[test]
+    fn the_profile_file_round_trips_and_a_file_without_settings_reads_as_none() {
+        // An empty `profiles` list is not a real test of table order: toml 0.9
+        // hoists it to a scalar `profiles = []` above `[settings]` regardless
+        // of field order, so a decode-only check against it proves nothing.
+        // This encodes two real profiles alongside `fonts` and `settings` and
+        // asserts the round trip, which is what would actually fail if a field
+        // were moved to where TOML cannot place it.
+        let file = ProfileFile {
+            active: Some("dev".into()),
+            fonts: Some(StoredFonts {
+                chrome: Some("Inter".into()),
+                editor: Some("Berkeley Mono".into()),
+                grid: Some("Inter".into()),
+            }),
+            settings: Some(StoredSettings {
+                theme: Some("Dark".into()),
+                editor_font_size: Some(18.0),
+                preview_rows: Some(500),
+            }),
+            profiles: vec![
+                StoredProfile {
+                    id: "dev".into(),
+                    name: "Dev".into(),
+                    host: "localhost".into(),
+                    port: Some(5432),
+                    database: "dev".into(),
+                    user: "slate".into(),
+                    sslmode: Some("prefer".into()),
+                    root_certificate: None,
+                    engine: Some("postgres".into()),
+                    path: None,
+                    editor_font_size: None,
+                    statement_timeout: Some(30),
+                    next_query_id: Some(2),
+                    open_query: None,
+                    open_queries: Vec::new(),
+                    open_objects: Vec::new(),
+                },
+                StoredProfile {
+                    id: "local".into(),
+                    name: "Local".into(),
+                    host: String::new(),
+                    port: None,
+                    database: String::new(),
+                    user: String::new(),
+                    sslmode: None,
+                    root_certificate: None,
+                    engine: Some("sqlite".into()),
+                    path: Some("/tmp/dev.sqlite".into()),
+                    editor_font_size: None,
+                    statement_timeout: None,
+                    next_query_id: None,
+                    open_query: None,
+                    open_queries: Vec::new(),
+                    open_objects: Vec::new(),
+                },
+            ],
+        };
+
+        let text = toml::to_string_pretty(&file).expect("profile file must encode");
+        let decoded: ProfileFile = toml::from_str(&text).expect("profile file must decode");
+        assert_eq!(decoded, file, "round trip did not preserve the file:\n{text}");
+
+        // A file written before `settings` existed has no `[settings]` table
+        // at all, and that is what is on disk for everyone running Slate
+        // today -- it has to keep reading as `None`, not as the defaults.
+        let (.., missing) =
+            decode_profiles("active = \"dev\"\n").expect("a file predating settings must load");
+        assert_eq!(missing, None);
+    }
+
+    #[test]
     fn an_unparsable_profile_file_is_an_error_rather_than_an_empty_list() {
         // The empty list is what the next save writes back, so a parse error
         // that reads as "no profiles" is a parse error that deletes them.
         assert!(decode_profiles("host = ").is_err());
-        assert_eq!(decode_profiles(""), Ok((Vec::new(), None, None)));
+        assert_eq!(decode_profiles(""), Ok((Vec::new(), None, None, None)));
     }
 
     #[test]
@@ -1164,6 +1266,7 @@ open_objects = []
         let text = toml::to_string_pretty(&ProfileFile {
             active: Some("dev".into()),
             fonts: None,
+            settings: None,
             profiles: vec![profile.clone()],
         })
         .expect("profiles must encode");

@@ -80,6 +80,7 @@ pub enum Command {
     SetFont(FontSlot, String),
     ToggleSidebar,
     ResetEditorZoom,
+    OpenSettings,
 }
 
 struct Item {
@@ -504,6 +505,12 @@ fn command_items(workspace: &Workspace, profile: &Profile, cx: &App) -> Vec<Item
             Command::PickFont(slot),
         ));
     }
+    items.push(Item::command(
+        "Settings",
+        "⌘,",
+        icon::SWITCHER,
+        Command::OpenSettings,
+    ));
     // One row rather than a Show/Hide pair: the palette is built from the
     // session, which does not know whether the column is folded.
     items.push(Item::command(

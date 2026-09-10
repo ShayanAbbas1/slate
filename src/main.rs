@@ -92,6 +92,7 @@ actions!(
         CloseTab,
         ToggleSidebar,
         AcceptCompletion,
+        OpenSettings,
         Quit,
     ]
 );
@@ -167,7 +168,10 @@ impl Profile {
                 ConnectionConfig::Sqlite { path, .. } => Some(path.clone()),
                 _ => None,
             },
-            editor_font_size: Some(self.session.editor_font_size),
+            // App-wide now, in `[settings]`. Kept on the stored shape and left
+            // unwritten so the value an older build put here is still there for
+            // the migration to read on the next upgrade.
+            editor_font_size: None,
             statement_timeout: Some(self.config.statement_timeout()),
             next_query_id: Some(self.session.next_query_id),
             // Nothing writes the legacy scalar any more; a buffer's name is a
@@ -245,7 +249,6 @@ struct Session {
     /// including a saved query's own second question.
     pending_discard: Option<CloseTarget>,
     notice: Option<String>,
-    editor_font_size: f32,
     /// The generated batch a relation tab is showing before it runs. That tab
     /// has no buffer to put SQL in, so the modal is where the statement is on
     /// screen — and nothing runs until Run.
@@ -265,7 +268,6 @@ impl Session {
         id: String,
         stored_queries: Vec<store::StoredQueryTab>,
         stored_next_query_id: u64,
-        editor_font_size: f32,
         pending_objects: Vec<store::StoredObject>,
         window: &mut Window,
         cx: &mut Context<Workspace>,
@@ -352,7 +354,6 @@ impl Session {
             pending_close: None,
             pending_discard: None,
             notice,
-            editor_font_size,
             apply_review: None,
         }
     }
@@ -1110,15 +1111,41 @@ enum QueryState {
     Failed(DbError),
 }
 
+/// What the app is set to, as opposed to what a connection is. The theme and
+/// the fonts stay in their globals -- every view reads those at render time,
+/// without a workspace to ask.
+struct Settings {
+    editor_font_size: f32,
+    preview_rows: usize,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            editor_font_size: EDITOR_FONT_SIZE_DEFAULT,
+            preview_rows: PREVIEW_ROW_LIMIT,
+        }
+    }
+}
+
 struct Workspace {
     profiles: Vec<Profile>,
+    settings: Settings,
     active: usize,
     form: Option<ConnectionForm>,
     switcher_open: bool,
+    /// Whether the settings modal is up. On the workspace rather than a
+    /// session, because nothing it changes belongs to one connection.
+    settings_open: bool,
     /// Whether the explorer column is folded away. Not persisted: a hidden
     /// sidebar is a thing done for the next minute, not a preference.
     sidebar_hidden: bool,
     pending_removal: Option<String>,
+    /// Whether `store::load_profiles` failed outright rather than finding no
+    /// file. Set once at startup and never cleared, because the file it could
+    /// not read is still sitting there -- and a session that never saw it must
+    /// not be the one that overwrites it with an empty list.
+    store_unreadable: bool,
     next_generation: u64,
     /// The palette, built from scratch every time it opens. Its rows are a
     /// snapshot of what the catalog held and which tab was in front, and both
@@ -1134,11 +1161,14 @@ impl Workspace {
     fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let mut workspace = Self {
             profiles: Vec::new(),
+            settings: Settings::default(),
             active: 0,
             form: None,
             switcher_open: false,
+            settings_open: false,
             sidebar_hidden: false,
             pending_removal: None,
+            store_unreadable: false,
             next_generation: 0,
             palette: None,
             focus: cx.focus_handle(),
@@ -1146,11 +1176,33 @@ impl Workspace {
 
         let mut load_failure = None;
         match store::load_profiles() {
-            Ok((profiles, active, stored_fonts)) => {
+            Ok((profiles, active, stored_fonts, stored_settings)) => {
                 // Before the first frame, so the window is drawn in the faces
                 // the user picked rather than repainted into them.
                 let available = cx.text_system().all_font_names();
                 install_fonts(restored_fonts(stored_fonts, &available), cx);
+                let stored_settings = stored_settings.unwrap_or_default();
+                install_theme(restored_theme(stored_settings.theme.as_deref()), window, cx);
+                // The zoom was per-profile until settings existed, so a file
+                // with no app-wide value has one under whichever profile was in
+                // front -- and reading it there is what keeps a person's zoom
+                // across the upgrade instead of resetting it.
+                workspace.settings.editor_font_size =
+                    restored_editor_font_size(stored_settings.editor_font_size.or_else(|| {
+                        profiles
+                            .iter()
+                            .find(|stored| Some(stored.id.as_str()) == active.as_deref())
+                            .or_else(|| profiles.first())
+                            .and_then(|stored| stored.editor_font_size)
+                    }));
+                // A hand-edited value outside the choices the controls offer
+                // is unreachable by the controls that set it, and leaves no
+                // chip highlighted either -- so it is rejected rather than
+                // clamped.
+                workspace.settings.preview_rows = stored_settings
+                    .preview_rows
+                    .filter(|rows| explorer::ROW_LIMITS.contains(rows))
+                    .unwrap_or(PREVIEW_ROW_LIMIT);
                 for stored in profiles {
                     workspace.restore_profile(stored, window, cx);
                 }
@@ -1166,7 +1218,10 @@ impl Workspace {
                     workspace.active = index;
                 }
             }
-            Err(message) => load_failure = Some(message),
+            Err(message) => {
+                workspace.store_unreadable = true;
+                load_failure = Some(message);
+            }
         }
 
         match connection_config_from_environment() {
@@ -1283,25 +1338,30 @@ impl Workspace {
     }
 
     fn adjust_editor_zoom(&mut self, delta: f32, cx: &mut Context<Self>) {
-        let Some(current) = self
-            .profile()
-            .map(|profile| profile.session.editor_font_size)
-        else {
-            return;
-        };
-        self.set_editor_zoom(adjusted_editor_font_size(current, delta), cx);
+        let adjusted = adjusted_editor_font_size(self.settings.editor_font_size, delta);
+        self.set_editor_zoom(adjusted, cx);
     }
 
-    /// Written through to the profile, because a zoom that resets on relaunch is
-    /// a setting the user has to make again every morning.
+    /// Written through to disk, because a zoom that resets on relaunch is a
+    /// setting the user has to make again every morning.
     fn set_editor_zoom(&mut self, font_size: f32, cx: &mut Context<Self>) {
-        let Some(profile) = self.profile_mut() else {
-            return;
-        };
-        if profile.session.editor_font_size == font_size {
+        if self.settings.editor_font_size == font_size {
             return;
         }
-        profile.session.editor_font_size = font_size;
+        self.settings.editor_font_size = font_size;
+        self.remember_profiles(cx);
+        cx.notify();
+    }
+
+    /// The default a relation tab opens with. Written through for the same
+    /// reason the zoom is, and deliberately not applied to the tabs already
+    /// open: their row count is a property of those rows, and changing a
+    /// default must never re-run a query nobody asked to re-run.
+    fn set_preview_rows(&mut self, rows: usize, cx: &mut Context<Self>) {
+        if self.settings.preview_rows == rows {
+            return;
+        }
+        self.settings.preview_rows = rows;
         self.remember_profiles(cx);
         cx.notify();
     }
@@ -1317,6 +1377,14 @@ impl Workspace {
     }
 
     fn remember_profiles(&mut self, cx: &mut Context<Self>) {
+        // The file we could not read at startup is still the user's, and an
+        // empty list is not what they have -- so a session that never managed
+        // to read it must not flatten it the moment nothing has been loaded
+        // into `profiles` yet. Once a profile exists (including the last one
+        // being deliberately removed) this no longer applies.
+        if self.store_unreadable && self.profiles.is_empty() {
+            return;
+        }
         let profiles = self
             .profiles
             .iter()
@@ -1329,7 +1397,13 @@ impl Workspace {
             editor: Some(picked.editor.to_string()),
             grid: Some(picked.grid.to_string()),
         };
-        if let Err(message) = store::save_profiles(&profiles, active.as_deref(), &fonts) {
+        let settings = store::StoredSettings {
+            theme: Some(theme(cx).name.to_string()),
+            editor_font_size: Some(self.settings.editor_font_size),
+            preview_rows: Some(self.settings.preview_rows),
+        };
+        if let Err(message) = store::save_profiles(&profiles, active.as_deref(), &fonts, &settings)
+        {
             self.note(message, cx);
         }
     }
@@ -1414,7 +1488,6 @@ impl Workspace {
             stored.id.clone(),
             stored_queries,
             stored.next_query_id.unwrap_or(0),
-            restored_editor_font_size(stored.editor_font_size),
             stored.open_objects,
             window,
             cx,
@@ -1455,15 +1528,7 @@ impl Workspace {
             .map(|profile| profile.id.clone())
             .collect::<Vec<_>>();
         let id = store::profile_id(&name, &existing);
-        let session = Session::new(
-            id.clone(),
-            Vec::new(),
-            0,
-            EDITOR_FONT_SIZE_DEFAULT,
-            Vec::new(),
-            window,
-            cx,
-        );
+        let session = Session::new(id.clone(), Vec::new(), 0, Vec::new(), window, cx);
         let password = password_to_persist(&config, origin).map(str::to_string);
         self.profiles.push(Profile {
             id: id.clone(),
@@ -1659,6 +1724,9 @@ impl Workspace {
     ) {
         self.form = Some(ConnectionForm::new(None, window, cx));
         self.switcher_open = false;
+        // The form branch of `Render` returns before painting the modal, so a
+        // flag left set would reappear the moment the form closes.
+        self.settings_open = false;
         cx.notify();
     }
 
@@ -2025,6 +2093,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> Option<u64> {
         let (schema, name, kind) = (opened.schema().to_string(), opened.name(), opened.kind());
+        let preview_rows = self.settings.preview_rows;
         let profile = self.profile_mut()?;
         let existing = profile
             .session
@@ -2047,7 +2116,7 @@ impl Workspace {
                 results: result_grid(window, cx),
                 query: QueryState::Idle,
                 sort: Vec::new(),
-                limit: PREVIEW_ROW_LIMIT,
+                limit: preview_rows,
                 stale: false,
                 hydrated: false,
             },
@@ -2299,6 +2368,7 @@ impl Workspace {
             return;
         };
         show_snapshot(&results, &snapshot, cx);
+        let preview_rows = self.settings.preview_rows;
         let Some(profile) = self.profile_mut() else {
             return;
         };
@@ -2333,7 +2403,7 @@ impl Workspace {
                         .iter()
                         .map(|(expression, ascending)| SortKey::new(expression.clone(), *ascending))
                         .collect();
-                    *limit = snapshot.limit.unwrap_or(PREVIEW_ROW_LIMIT);
+                    *limit = snapshot.limit.unwrap_or(preview_rows);
                     *stale = true;
                 }
             }
@@ -2469,20 +2539,26 @@ impl Workspace {
     /// from the global at render time, so repainting is the whole change — and
     /// side-by-side comparison is the only honest way to pick between palettes.
     fn cycle_theme(&mut self, _: &CycleTheme, window: &mut Window, cx: &mut Context<Self>) {
-        let next = theme(cx).next();
-        next.apply_to_components(cx);
-        cx.set_global(next);
-        // Only a glass theme wants the desktop behind it, and the platform
-        // tears the vibrant view out of the window the moment this says
-        // otherwise -- so it has to be said again on every switch, not once at
-        // startup.
-        window.set_background_appearance(next.window_background());
+        self.set_theme(theme(cx).next(), window, cx);
+    }
+
+    /// Written through to disk, so the palette a person picked is the one the
+    /// next launch paints.
+    fn set_theme(&mut self, theme: Theme, window: &mut Window, cx: &mut Context<Self>) {
+        // `set_editor_zoom` and `set_preview_rows` both skip the write-through
+        // when nothing changed; picking the theme already installed should not
+        // rewrite `profiles.toml` or re-post the notice either.
+        if theme.name == theme::theme(cx).name {
+            return;
+        }
+        install_theme(theme, window, cx);
         // The titlebar deliberately no longer names the theme -- permanent
         // chrome should not narrate a setting -- so the switch itself says
         // where it landed.
         if self.profile().is_some() {
-            self.note(format!("Theme: {}", next.name), cx);
+            self.note(format!("Theme: {}", theme.name), cx);
         }
+        self.remember_profiles(cx);
         cx.refresh_windows();
     }
 
@@ -2493,10 +2569,17 @@ impl Workspace {
             cx.notify();
             return;
         }
-        // Whatever is in front, in the order it is stacked: the palette is over
-        // the batch panel, which is over the surface, so `escape` backs out of
-        // them one at a time.
+        // Whatever is in front, in the order it is stacked: the palette paints
+        // over the settings modal, which paints over the discard-close
+        // confirmation, which paints over the close confirmation, which paints
+        // over the apply review, which paints over the surface -- so `escape`
+        // backs out of them in that order, one at a time. The palette stays
+        // first so that picking a font from inside settings closes the font
+        // list and leaves the modal it was opened from standing.
         if self.close_palette(cx) {
+            return;
+        }
+        if self.close_settings(cx) {
             return;
         }
         if self.cancel_discard_close(cx) {
@@ -2729,6 +2812,20 @@ impl Workspace {
         true
     }
 
+    fn open_settings(&mut self, _: &OpenSettings, _: &mut Window, cx: &mut Context<Self>) {
+        self.settings_open = true;
+        cx.notify();
+    }
+
+    fn close_settings(&mut self, cx: &mut Context<Self>) -> bool {
+        if !self.settings_open {
+            return false;
+        }
+        self.settings_open = false;
+        cx.notify();
+        true
+    }
+
     /// Every row runs through the method its button or keystroke already calls.
     /// The palette is another way in, never a second implementation.
     fn run_command(&mut self, command: Command, window: &mut Window, cx: &mut Context<Self>) {
@@ -2755,6 +2852,7 @@ impl Workspace {
             Command::SetFont(slot, family) => self.set_font(slot, family, cx),
             Command::ToggleSidebar => self.toggle_sidebar(&ToggleSidebar, window, cx),
             Command::ResetEditorZoom => self.reset_editor_zoom(&ResetEditorZoom, window, cx),
+            Command::OpenSettings => self.open_settings(&OpenSettings, window, cx),
         }
     }
 
@@ -4923,7 +5021,11 @@ impl Render for Workspace {
             // one seam, and the planes inside separate by tone.
             .size_full()
             .min_w_0()
-            .child(views::render_main_content(profile, cx));
+            .child(views::render_main_content(
+                profile,
+                self.settings.editor_font_size,
+                cx,
+            ));
         // With the sidebar folded there is nothing to split, and a split with
         // one panel still paints the handle it no longer divides anything with.
         let main_pane = if self.sidebar_hidden {
@@ -4971,6 +5073,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::palette_previous))
             .on_action(cx.listener(Self::toggle_sidebar))
             .on_action(cx.listener(Self::accept_completion))
+            .on_action(cx.listener(Self::open_settings))
             .size_full()
             // The shell is the frost: titlebar, sidebar and status bar paint
             // nothing of their own, they are the glass the window root already
@@ -5092,6 +5195,10 @@ impl Render for Workspace {
             .children(self.render_apply_review(cx))
             .children(self.render_close_confirmation(cx))
             .children(self.render_discard_confirmation(cx))
+            .children(
+                self.settings_open
+                    .then(|| views::render_settings(&self.settings, cx)),
+            )
             .children(self.render_palette(cx))
     }
 }
@@ -5679,6 +5786,24 @@ fn restored_editor_font_size(stored: Option<f32>) -> f32 {
         .unwrap_or(EDITOR_FONT_SIZE_DEFAULT)
 }
 
+/// A theme read back from disk, by name. An absent or unknown name is the
+/// default: a palette dropped from `all` between launches must not strand the
+/// app on a name nothing answers to.
+fn restored_theme(name: Option<&str>) -> Theme {
+    name.and_then(|name| Theme::all().into_iter().find(|theme| theme.name == name))
+        .unwrap_or_default()
+}
+
+/// Push a theme everywhere it is read from. Only a glass theme wants the
+/// desktop behind it, and the platform tears the vibrant view out of the window
+/// the moment this says otherwise -- so it has to be said again on every
+/// switch, not once at startup.
+fn install_theme(theme: Theme, window: &mut Window, cx: &mut App) {
+    theme.apply_to_components(cx);
+    cx.set_global(theme);
+    window.set_background_appearance(theme.window_background());
+}
+
 /// Push a font choice everywhere it is read from: the global the views render
 /// against, and gpui-component's own theme, which carries the chrome family.
 fn install_fonts(picked: Fonts, cx: &mut App) {
@@ -5870,6 +5995,7 @@ fn main() {
             KeyBinding::new("ctrl-shift-tab", PreviousProfile, None),
             KeyBinding::new("escape", ShowEditor, None),
             KeyBinding::new("cmd-shift-t", CycleTheme, None),
+            KeyBinding::new("cmd-,", OpenSettings, None),
             KeyBinding::new("cmd-p", FuzzyOpen, None),
             KeyBinding::new("cmd-shift-p", CommandPalette, None),
             // A binding wins the keystroke at the deepest context it matches,
@@ -5908,11 +6034,53 @@ fn main() {
         // focus, including a native text field that swallows the rest. Set
         // after the bindings, because the shortcut the item displays is read
         // back out of the keymap.
+        //
+        // The rest of the bar is there for the same reason in reverse: every
+        // item names an action Slate already dispatches, so the menu is a way
+        // to discover the keystroke rather than a second path to the work. No
+        // Edit menu -- Slate does not own cut, copy and paste, the focused
+        // field does, and a menu claiming them would take them from it.
         cx.on_action(|_: &Quit, cx: &mut App| cx.quit());
-        cx.set_menus(vec![Menu {
-            name: "Slate".into(),
-            items: vec![MenuItem::action("Quit Slate", Quit)],
-        }]);
+        cx.set_menus(vec![
+            Menu {
+                name: "Slate".into(),
+                items: vec![
+                    MenuItem::action("Settings…", OpenSettings),
+                    MenuItem::separator(),
+                    MenuItem::action("Quit Slate", Quit),
+                ],
+            },
+            Menu {
+                name: "File".into(),
+                items: vec![
+                    MenuItem::action("New Query", NewQuery),
+                    MenuItem::action("New Connection", NewConnection),
+                    MenuItem::separator(),
+                    MenuItem::action("Save Query", SaveQuery),
+                    MenuItem::separator(),
+                    MenuItem::action("Close Tab", CloseTab),
+                ],
+            },
+            Menu {
+                name: "Query".into(),
+                items: vec![
+                    MenuItem::action("Run", RunQuery),
+                    MenuItem::action("Cancel", CancelQuery),
+                ],
+            },
+            Menu {
+                name: "View".into(),
+                items: vec![
+                    MenuItem::action("Toggle Sidebar", ToggleSidebar),
+                    MenuItem::separator(),
+                    MenuItem::action("Zoom In", ZoomEditorIn),
+                    MenuItem::action("Zoom Out", ZoomEditorOut),
+                    MenuItem::action("Reset Zoom", ResetEditorZoom),
+                    MenuItem::separator(),
+                    MenuItem::action("Cycle Theme", CycleTheme),
+                ],
+            },
+        ]);
 
         // The platform titlebar is kept only for its window buttons: a system
         // bar in its own grey above Slate's chrome is the seam every native app

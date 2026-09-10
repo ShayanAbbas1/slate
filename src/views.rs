@@ -9,10 +9,10 @@
 
 use gpui::{
     AnyElement, ClickEvent, Context, Entity, FontWeight, InteractiveElement, IntoElement,
-    ParentElement, StatefulInteractiveElement, Styled, div, prelude::FluentBuilder, px,
+    ParentElement, StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder, px,
 };
 use gpui_component::{
-    IconName, Sizable,
+    Disableable, IconName, Sizable,
     input::{Input, InputState},
     resizable::{resizable_panel, v_resizable},
     spinner::Spinner,
@@ -20,24 +20,31 @@ use gpui_component::{
 };
 
 use crate::{
-    CancelQuery, CloseTarget, Control, NewQuery, ObjectBody, ObjectTab, Profile, QueryState,
-    RunQuery, SaveQuery, SetRowLimit, StructureState, Tab, Tone, Workspace, button, button_label,
-    compact_count, db,
+    CancelQuery, CloseTarget, Control, EDITOR_FONT_SIZE_MAX, EDITOR_FONT_SIZE_MIN, NewQuery,
+    ObjectBody, ObjectTab, Profile, QueryState, ResetEditorZoom, RunQuery, SaveQuery, SetRowLimit,
+    Settings, StructureState, Tab, Tone, Workspace, ZoomEditorIn, ZoomEditorOut, button,
+    button_label, compact_count, db,
     db::RoutineKind,
-    editor_zoom_percent,
+    dialog, editor_zoom_percent,
     explorer::ROW_LIMITS,
     group_thousands, icon_button,
     icons::icon,
-    key_hint, object_icon, result_grid,
+    key_hint, object_icon,
+    palette::Mode as PaletteMode,
+    result_grid,
     result_grid::ResultGrid,
     result_pane_is_expanded, row_icon, section_label,
-    theme::{fonts, layout, theme},
+    theme::{FontSlot, Theme, fonts, layout, theme},
 };
 
-pub fn render_main_content(profile: &Profile, cx: &mut Context<Workspace>) -> AnyElement {
+pub fn render_main_content(
+    profile: &Profile,
+    editor_font_size: f32,
+    cx: &mut Context<Workspace>,
+) -> AnyElement {
     let body = match profile.session.active_object() {
         Some(tab) => render_object(tab, cx),
-        None => render_query_surface(profile, cx),
+        None => render_query_surface(profile, editor_font_size, cx),
     };
 
     div()
@@ -46,7 +53,7 @@ pub fn render_main_content(profile: &Profile, cx: &mut Context<Workspace>) -> An
         .flex_col()
         // Chrome, so the strip reads as the frame the surfaces sit in --
         // and chrome is the frost, which is already painted beneath it.
-        .child(render_tab_strip(profile, cx))
+        .child(render_tab_strip(profile, editor_font_size, cx))
         .child(div().flex_1().min_h_0().child(body))
         .into_any_element()
 }
@@ -109,7 +116,11 @@ fn render_editor_surface(
         .into_any_element()
 }
 
-fn render_query_surface(profile: &Profile, cx: &mut Context<Workspace>) -> AnyElement {
+fn render_query_surface(
+    profile: &Profile,
+    editor_font_size: f32,
+    cx: &mut Context<Workspace>,
+) -> AnyElement {
     let Some(tab) = profile.session.active_query_tab() else {
         return div().into_any_element();
     };
@@ -123,7 +134,7 @@ fn render_query_surface(profile: &Profile, cx: &mut Context<Workspace>) -> AnyEl
             gpui::SharedString::from(format!("{}-{}", profile.id, tab.id)),
         )),
         &tab.editor,
-        profile.session.editor_font_size,
+        editor_font_size,
         &tab.query,
         bottom,
         cx,
@@ -695,7 +706,11 @@ fn render_structure(state: &StructureState, cx: &mut Context<Workspace>) -> AnyE
 /// window: the active one is lifted to the editor's tone, the rest are names
 /// that reveal a wash on hover. No boxes, no hairlines — tone carries the
 /// state.
-fn render_tab_strip(profile: &Profile, cx: &mut Context<Workspace>) -> AnyElement {
+fn render_tab_strip(
+    profile: &Profile,
+    editor_font_size: f32,
+    cx: &mut Context<Workspace>,
+) -> AnyElement {
     let t = *theme(cx);
     let workspace = cx.entity().downgrade();
     let session = &profile.session;
@@ -1004,7 +1019,7 @@ fn render_tab_strip(profile: &Profile, cx: &mut Context<Workspace>) -> AnyElemen
             .children(chips)
     });
 
-    let zoom = editor_zoom_percent(session.editor_font_size);
+    let zoom = editor_zoom_percent(editor_font_size);
     let named = on_query_tab && session.open_query().is_some();
     let new_workspace = workspace.clone();
     let save_workspace = workspace.clone();
@@ -1100,6 +1115,204 @@ fn render_tab_strip(profile: &Profile, cx: &mut Context<Workspace>) -> AnyElemen
                         workspace.run_query(&RunQuery, window, cx);
                     });
                 })
+        }))
+        .into_any_element()
+}
+
+/// The app-wide settings, on the card every other modal is drawn on.
+///
+/// There is no Cancel and no OK. Every control here calls the same method the
+/// keystroke or the palette row calls, and each of those has already written
+/// the change to `profiles.toml` by the time this repaints — so Cancel would
+/// have to undo a file, and Done only takes the card away.
+pub fn render_settings(settings: &Settings, cx: &mut Context<Workspace>) -> AnyElement {
+    let t = *theme(cx);
+    let families = fonts(cx).clone();
+    let font_size = settings.editor_font_size;
+    let preview_rows = settings.preview_rows;
+
+    let themes: Vec<AnyElement> = Theme::all()
+        .into_iter()
+        .enumerate()
+        .map(|(index, candidate)| {
+            settings_chip(
+                ("theme", index),
+                candidate.name,
+                candidate.name == t.name,
+                cx,
+                move |workspace, window, cx| workspace.set_theme(candidate, window, cx),
+            )
+        })
+        .collect();
+
+    // Disabled at the ends rather than clamped again here: `adjust_editor_zoom`
+    // already refuses to go past them, and a button that looks live and does
+    // nothing is worse than one that says it cannot.
+    let zoom = div()
+        .flex()
+        .items_center()
+        .gap(px(layout::SPACE_SM))
+        .child(
+            button("zoom-out", "−", Tone::Quiet, Control::Compact, t)
+                .disabled(font_size <= EDITOR_FONT_SIZE_MIN)
+                .on_click(cx.listener(|workspace, _: &ClickEvent, window, cx| {
+                    workspace.zoom_editor_out(&ZoomEditorOut, window, cx);
+                })),
+        )
+        .child(
+            div()
+                .min_w(px(40.))
+                .text_size(px(layout::TEXT_SM))
+                .child(format!("{}%", editor_zoom_percent(font_size))),
+        )
+        .child(
+            button("zoom-in", "+", Tone::Quiet, Control::Compact, t)
+                .disabled(font_size >= EDITOR_FONT_SIZE_MAX)
+                .on_click(cx.listener(|workspace, _: &ClickEvent, window, cx| {
+                    workspace.zoom_editor_in(&ZoomEditorIn, window, cx);
+                })),
+        )
+        .child(
+            button("zoom-reset", "Reset", Tone::Quiet, Control::Compact, t).on_click(cx.listener(
+                |workspace, _: &ClickEvent, window, cx| {
+                    workspace.reset_editor_zoom(&ResetEditorZoom, window, cx);
+                },
+            )),
+        );
+
+    // The palette rather than a dropdown of our own: it already lists every
+    // family the text system resolved and marks the one in use. It opens over
+    // this card and leaves it standing, so a pick lands back here.
+    let font_rows: Vec<AnyElement> = [
+        ("Chrome", FontSlot::Chrome),
+        ("Editor", FontSlot::Editor),
+        ("Grid", FontSlot::Grid),
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(index, (label, slot))| {
+        let family = families.family(slot).clone();
+        div()
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap(px(layout::SPACE_MD))
+            .child(
+                div()
+                    .text_size(px(layout::TEXT_SM))
+                    .text_color(t.text_muted)
+                    .child(label),
+            )
+            .child(settings_chip(
+                ("font", index),
+                family,
+                true,
+                cx,
+                move |workspace, window, cx| {
+                    workspace.open_palette(PaletteMode::Font(slot), window, cx);
+                },
+            ))
+            .into_any_element()
+    })
+    .collect();
+
+    let limits: Vec<AnyElement> = ROW_LIMITS
+        .into_iter()
+        .map(|rows| {
+            settings_chip(
+                ("preview-rows", rows),
+                compact_count(rows),
+                rows == preview_rows,
+                cx,
+                move |workspace, _, cx| workspace.set_preview_rows(rows, cx),
+            )
+        })
+        .collect();
+
+    div()
+        .absolute()
+        .inset_0()
+        .flex()
+        .items_center()
+        .justify_center()
+        .child(
+            dialog(t)
+                .child(section_label(t, "Settings"))
+                .child(settings_section(
+                    t,
+                    "Theme",
+                    div()
+                        .flex()
+                        .gap(px(layout::SPACE_XS))
+                        .children(themes),
+                ))
+                .child(settings_section(t, "Editor zoom", zoom))
+                .child(settings_section(
+                    t,
+                    "Fonts",
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(layout::SPACE_XS))
+                        .children(font_rows),
+                ))
+                .child(settings_section(
+                    t,
+                    "Default limit",
+                    div().flex().gap(px(layout::SPACE_XS)).children(limits),
+                ))
+                .child(
+                    div().flex().justify_end().child(
+                        button("settings-done", "Done", Tone::Primary, Control::Standard, t)
+                            .on_click(cx.listener(|workspace, _: &ClickEvent, _, cx| {
+                                workspace.close_settings(cx);
+                            })),
+                    ),
+                ),
+        )
+        .into_any_element()
+}
+
+/// One setting: its label over whatever sets it.
+fn settings_section(t: Theme, label: &str, controls: impl IntoElement) -> impl IntoElement {
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(layout::SPACE_XS))
+        .child(section_label(t, label))
+        .child(controls)
+}
+
+/// One choice in the settings modal, in the row-limit chips' clothes: a handful
+/// of values, all of them on screen, the one in force filled in.
+fn settings_chip(
+    id: impl Into<gpui::ElementId>,
+    label: impl Into<gpui::SharedString>,
+    selected: bool,
+    cx: &mut Context<Workspace>,
+    apply: impl Fn(&mut Workspace, &mut Window, &mut Context<Workspace>) + 'static,
+) -> AnyElement {
+    let t = *theme(cx);
+    div()
+        .id(id)
+        .flex()
+        .items_center()
+        .h(px(24.))
+        .px(px(layout::SPACE_SM))
+        .rounded(px(layout::RADIUS_CONTROL))
+        .text_size(px(layout::TEXT_SM))
+        .whitespace_nowrap()
+        .map(|chip| {
+            if selected {
+                chip.bg(t.element_active).text_color(t.text)
+            } else {
+                chip.text_color(t.text_muted)
+                    .hover(|style| style.bg(t.element_hover))
+            }
+        })
+        .child(label.into())
+        .on_click(cx.listener(move |workspace, _: &ClickEvent, window, cx| {
+            apply(workspace, window, cx);
         }))
         .into_any_element()
 }
