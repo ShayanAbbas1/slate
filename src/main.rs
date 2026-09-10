@@ -131,24 +131,20 @@ impl Profile {
         // Tabs read back from disk that the catalog has not named yet are still
         // the truth about this profile: writing the live list instead would
         // drop every restored object the first time anything else is saved.
-        //
-        // A transient tab is deliberately not written: it was opened for a look,
-        // and coming back to a window full of things nobody chose to keep is
-        // the whole reason preview tabs exist.
-        let open_objects = if self.session.pending_objects.is_empty() {
-            let active = self.session.active;
-            self.session
-                .objects
-                .iter()
-                .filter(|tab| !tab.transient)
-                .map(|tab| store::StoredObject {
-                    active: active == Tab::Object(tab.id),
-                    ..tab.stored()
-                })
-                .collect()
-        } else {
-            self.session.pending_objects.clone()
-        };
+        let active = self.session.active;
+        let mut open_objects = self
+            .session
+            .objects
+            .iter()
+            .map(|tab| store::StoredObject {
+                active: active == Tab::Object(tab.id),
+                ..tab.stored()
+            })
+            .collect::<Vec<_>>();
+        // Both lists, because a restore now opens the relations first and
+        // leaves the routines pending: writing either one alone would drop the
+        // other half of the session.
+        open_objects.extend(self.session.pending_objects.iter().cloned());
 
         // A file engine writes no server fields and a server engine writes no
         // path, rather than either writing a blank the loader would have to
@@ -172,6 +168,7 @@ impl Profile {
             },
             editor_font_size: Some(self.session.editor_font_size),
             statement_timeout: Some(self.config.statement_timeout()),
+            next_query_id: Some(self.session.next_query_id),
             // Nothing writes the legacy scalar any more; a buffer's name is a
             // property of its tab now. Kept on the stored shape only so a
             // profile written by an older build still loads with its buffer.
@@ -241,6 +238,11 @@ struct Session {
     /// and it is the one tab that says so before it goes. Separate from
     /// `pending_delete`, which is the chip's own quieter two-click arming.
     pending_close: Option<String>,
+    /// The close `cmd+w` is asking about, because the tab it names holds cell
+    /// edits nobody has applied. Held as the target rather than the tab, so
+    /// confirming runs exactly the close the keystroke had decided on --
+    /// including a saved query's own second question.
+    pending_discard: Option<CloseTarget>,
     notice: Option<String>,
     editor_font_size: f32,
     /// The generated batch a relation tab is showing before it runs. That tab
@@ -261,6 +263,7 @@ impl Session {
     fn new(
         id: String,
         stored_queries: Vec<store::StoredQueryTab>,
+        stored_next_query_id: u64,
         editor_font_size: f32,
         pending_objects: Vec<store::StoredObject>,
         window: &mut Window,
@@ -315,11 +318,7 @@ impl Session {
             .find(|stored| stored.active)
             .unwrap_or(&stored_queries[0])
             .id;
-        let next_query_id = stored_queries
-            .iter()
-            .map(|stored| stored.id + 1)
-            .max()
-            .unwrap_or(0);
+        let next_query_id = next_query_id(stored_next_query_id, &stored_queries);
 
         let mut notice = None;
         let queries = stored_queries
@@ -350,6 +349,7 @@ impl Session {
             naming: false,
             pending_delete: None,
             pending_close: None,
+            pending_discard: None,
             notice,
             editor_font_size,
             apply_review: None,
@@ -426,6 +426,18 @@ impl Session {
         }
     }
 
+    /// The grid one named tab is showing. `slot` answers the same question but
+    /// needs a `&mut`, and asking what a tab holds changes nothing.
+    fn results(&self, tab: Tab) -> Option<&Entity<TableState<ResultGrid>>> {
+        match tab {
+            Tab::Query(id) => self.query_tab(id).map(|tab| &tab.results),
+            Tab::Object(id) => match &self.objects.iter().find(|tab| tab.id == id)?.body {
+                ObjectBody::Relation { results, .. } => Some(results),
+                ObjectBody::Routine(_) => None,
+            },
+        }
+    }
+
     /// Where a run's state and rows belong. Returning both together is what
     /// keeps a result from landing in one tab's grid with another tab's status.
     fn slot(&mut self, tab: Tab) -> Option<(&mut QueryState, Entity<TableState<ResultGrid>>)> {
@@ -455,18 +467,9 @@ impl Session {
     fn clear_prompts(&mut self) {
         self.pending_delete = None;
         self.pending_close = None;
+        self.pending_discard = None;
         self.naming = false;
         self.save_name_needs_focus = false;
-    }
-
-    fn promote(&mut self, id: u64) -> bool {
-        match self.objects.iter_mut().find(|tab| tab.id == id) {
-            Some(tab) if tab.transient => {
-                tab.transient = false;
-                true
-            }
-            _ => false,
-        }
     }
 }
 
@@ -512,6 +515,19 @@ enum CloseTarget {
     Buffer(u64),
 }
 
+impl CloseTarget {
+    /// The tab this close takes out of the strip. A saved query names its file
+    /// rather than its tab, so the strip is what says which tab that is -- and
+    /// `None` is a saved query with no tab open, which no close comes from.
+    fn tab(&self, session: &Session) -> Option<Tab> {
+        match self {
+            Self::Object(id) => Some(Tab::Object(*id)),
+            Self::Buffer(id) => Some(Tab::Query(*id)),
+            Self::SavedQuery(name) => session.tab_holding(name).map(Tab::Query),
+        }
+    }
+}
+
 /// `None` for the last unsaved buffer, which is always in the strip: a profile
 /// always has somewhere to write, so there is no closed state for it to go to
 /// and `cmd+w` on it does nothing rather than inventing one.
@@ -548,6 +564,10 @@ struct QueryTab {
     /// edits appends the `UPDATE` to the buffer, so the cursor no longer sits on
     /// the `SELECT` and the text can no longer say where these rows came from.
     last_query: Option<String>,
+    /// Whether this tab's snapshot has been looked for yet. Set on the first
+    /// attempt whether or not one was found, so a tab reached a second time
+    /// cannot read the disk again and put stale rows over live ones.
+    hydrated: bool,
 }
 
 impl QueryTab {
@@ -586,6 +606,7 @@ impl QueryTab {
             query: QueryState::Idle,
             open_query: stored.name.clone(),
             last_query: None,
+            hydrated: false,
         };
         (tab, notice)
     }
@@ -608,10 +629,6 @@ struct ObjectTab {
     /// is the only thing that tells two overloads of one function apart.
     name: String,
     kind: ObjectKind,
-    /// Opened for a look rather than to be kept. One click gets a transient
-    /// tab, the next one replaces it, and only a deliberate gesture — a double
-    /// click, or typing in its buffer — makes it stay.
-    transient: bool,
     body: ObjectBody,
 }
 
@@ -621,6 +638,10 @@ impl ObjectTab {
             schema: self.schema.clone(),
             name: self.name.clone(),
             routine: matches!(self.kind, ObjectKind::Routine(_)),
+            kind: match self.kind {
+                ObjectKind::Relation(kind) => kind,
+                ObjectKind::Routine(_) => RelationKind::default(),
+            },
             active: false,
         }
     }
@@ -689,6 +710,19 @@ impl OpenedObject {
     }
 }
 
+/// What the catalog says a relation is. The only authority on it: a stored
+/// tab's kind is a cache of this, and can be a default rather than a kind.
+fn relation_kind(catalog: &Catalog, schema: &str, name: &str) -> Option<RelationKind> {
+    catalog
+        .schemas
+        .iter()
+        .find(|candidate| candidate.name == schema)?
+        .relations
+        .iter()
+        .find(|relation| relation.name == name)
+        .map(|relation| relation.kind)
+}
+
 /// A routine's name carries its argument types, because a schema can hold
 /// several routines with the same name and nothing else to tell them apart.
 fn routine_name(routine: &Routine) -> String {
@@ -715,6 +749,14 @@ enum ObjectBody {
         /// (spec §4.3); this is the tab's own copy of the cap, so raising it
         /// for one wide table does not raise it everywhere.
         limit: usize,
+        /// Whether the rows on screen came off disk rather than from the
+        /// server. Refreshed on the tab's first activation and cleared there,
+        /// not at startup: a session of restored tabs would otherwise open by
+        /// firing one query per tab at a database nobody has looked at yet.
+        stale: bool,
+        /// Whether this tab's snapshot has been looked for yet. See
+        /// [`QueryTab::hydrated`].
+        hydrated: bool,
     },
     Routine(Routine),
 }
@@ -723,6 +765,39 @@ enum StructureState {
     Loading,
     Loaded(Structure),
     Failed(String),
+}
+
+/// Put a snapshot's rows on screen.
+fn show_snapshot(
+    results: &Entity<TableState<ResultGrid>>,
+    grid: &store::StoredGrid,
+    cx: &mut Context<Workspace>,
+) {
+    results.update(cx, |table, cx| {
+        *table.delegate_mut() = ResultGrid::restored(grid);
+        table.refresh(cx);
+    });
+}
+
+/// The state a tab restored from a snapshot is in.
+///
+/// `Complete` rather than `Idle`, for two reasons: the rows are a result and
+/// the status bar has to be able to count them, and it is what makes
+/// `load_relation` leave a restored tab's rows alone instead of re-querying
+/// them the moment the tab is reached. The cost fields are zero because a
+/// snapshot knows none of them -- it is not the run, it is what the run left --
+/// and the status readout says "snapshot" rather than reporting the zeroes.
+///
+/// `rows` is the result's own size, which can be larger than the rows the grid
+/// holds: a snapshot is capped. `row_readout` is what says so, and
+/// `export_results` refuses rather than writing a short file.
+fn restored_state(grid: &store::StoredGrid) -> QueryState {
+    QueryState::Complete {
+        rows: grid.total_rows,
+        bytes: 0,
+        elapsed: std::time::Duration::ZERO,
+        rows_affected: None,
+    }
 }
 
 fn result_grid(window: &mut Window, cx: &mut Context<Workspace>) -> Entity<TableState<ResultGrid>> {
@@ -760,6 +835,13 @@ fn result_grid(window: &mut Window, cx: &mut Context<Workspace>) -> Entity<Table
                 table.delegate_mut().select_col(col);
                 cx.notify();
             });
+        }
+        // The library resizes its own copy of the columns, so a drag is only
+        // in the delegate -- the thing a snapshot is taken from -- if it is
+        // written back here.
+        TableEvent::ColumnWidthsChanged(widths) => {
+            let widths = widths.clone();
+            table.update(cx, |table, _| table.delegate_mut().set_widths(&widths));
         }
         _ => {}
     })
@@ -1314,9 +1396,23 @@ impl Workspace {
         } else {
             stored.open_queries
         };
+        // Snapshots whose tab is gone -- a renamed table strands its file
+        // under the old name, and nothing else will ever remove it.
+        let live_grids = stored_queries
+            .iter()
+            .map(|tab| store::query_grid_key(tab.id))
+            .chain(
+                stored
+                    .open_objects
+                    .iter()
+                    .map(|object| store::object_grid_key(&object.schema, &object.name)),
+            )
+            .collect();
+        store::prune_grids(&stored.id, &live_grids);
         let mut session = Session::new(
             stored.id.clone(),
             stored_queries,
+            stored.next_query_id.unwrap_or(0),
             restored_editor_font_size(stored.editor_font_size),
             stored.open_objects,
             window,
@@ -1361,6 +1457,7 @@ impl Workspace {
         let session = Session::new(
             id.clone(),
             Vec::new(),
+            0,
             EDITOR_FONT_SIZE_DEFAULT,
             Vec::new(),
             window,
@@ -1649,6 +1746,19 @@ impl Workspace {
                         Ok(catalog) => CatalogState::Loaded(catalog),
                         Err(error) => CatalogState::Failed(error.message),
                     };
+                    // Relations restore before the catalog arrives, wearing
+                    // whatever kind was on disk -- a default, for a profile an
+                    // older build wrote. This is the first moment there is
+                    // anything to correct it from.
+                    if let CatalogState::Loaded(catalog) = &profile.catalog {
+                        for tab in &mut profile.session.objects {
+                            if let ObjectKind::Relation(kind) = &mut tab.kind
+                                && let Some(actual) = relation_kind(catalog, &tab.schema, &tab.name)
+                            {
+                                *kind = actual;
+                            }
+                        }
+                    }
                     workspace.install_completions(&id, cx);
                     workspace.refresh_explorer(&id, cx);
                     cx.notify();
@@ -1849,6 +1959,7 @@ impl Workspace {
         self.profiles.remove(index);
         store::delete_password(&id);
         let removed_queries = store::delete_queries(&id);
+        let _ = store::delete_grids(&id);
         self.pending_removal = None;
         self.active = active_after_removal(self.active, index, self.profiles.len());
         self.remember_profiles(cx);
@@ -1864,7 +1975,6 @@ impl Workspace {
     fn open_explorer_target(
         &mut self,
         target: ExplorerTarget,
-        transient: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -1897,7 +2007,7 @@ impl Workspace {
         };
 
         if let Some(opened) = opened
-            && let Some(id) = self.open_object(opened, transient, window, cx)
+            && let Some(id) = self.open_object(opened, window, cx)
         {
             self.activate_tab(Tab::Object(id), cx);
             self.remember_profiles(cx);
@@ -1907,14 +2017,9 @@ impl Workspace {
     /// Give an object a tab, reusing the one it already has. Opening does not
     /// show it — the caller decides that, so restoring a session can rebuild
     /// six tabs without running six queries.
-    ///
-    /// A transient tab takes the place of the last transient one, the way a
-    /// preview tab works in an editor: browsing the tree leaves one tab behind,
-    /// not thirty.
     fn open_object(
         &mut self,
         opened: OpenedObject,
-        transient: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<u64> {
@@ -1928,24 +2033,7 @@ impl Workspace {
             .map(|tab| tab.id);
 
         if let Some(id) = existing {
-            if !transient {
-                profile.session.promote(id);
-            }
             return Some(id);
-        }
-
-        if transient {
-            let replaced = profile
-                .session
-                .objects
-                .iter()
-                .filter(|tab| tab.transient)
-                .map(|tab| tab.id)
-                .collect::<Vec<_>>();
-            profile
-                .session
-                .objects
-                .retain(|tab| !replaced.contains(&tab.id));
         }
 
         let id = profile.session.next_object_id;
@@ -1959,6 +2047,8 @@ impl Workspace {
                 query: QueryState::Idle,
                 sort: Vec::new(),
                 limit: PREVIEW_ROW_LIMIT,
+                stale: false,
+                hydrated: false,
             },
         };
         self.profile_mut()?.session.objects.push(ObjectTab {
@@ -1966,7 +2056,6 @@ impl Workspace {
             schema,
             name,
             kind,
-            transient,
             body,
         });
         Some(id)
@@ -1983,10 +2072,13 @@ impl Workspace {
         else {
             return;
         };
-        let ObjectBody::Relation { query, .. } = &tab.body else {
+        let ObjectBody::Relation { query, stale, .. } = &tab.body else {
             return;
         };
-        if !matches!(query, QueryState::Idle | QueryState::Failed(_)) {
+        // A tab restored from a snapshot is `Complete` over rows nothing has
+        // checked against the server, so it gets exactly one run -- and its
+        // structure, which no snapshot keeps.
+        if !*stale && !matches!(query, QueryState::Idle | QueryState::Failed(_)) {
             return;
         }
 
@@ -2019,7 +2111,11 @@ impl Workspace {
         };
         let (schema, relation) = (tab.schema.clone(), tab.name.clone());
         let ObjectBody::Relation {
-            sort, query, limit, ..
+            sort,
+            query,
+            limit,
+            stale,
+            ..
         } = &mut tab.body
         else {
             return;
@@ -2028,10 +2124,16 @@ impl Workspace {
             return;
         }
 
+        // The one run that must not blank the grid first: a restored tab's rows
+        // are the rows it was showing, and clearing them to fetch the same
+        // thing again is a flash of nothing. Taken here rather than tested,
+        // because every later run is replacing rows the server sent and has to
+        // clear them.
+        let keep_rows = std::mem::take(stale);
         let sql = relation_sql(engine, &schema, &relation, sort, *limit);
         // A preview only re-queries when it is asked to, and this is the ask.
         *query = QueryState::Idle;
-        self.execute_sql(sql, Tab::Object(id), cx);
+        self.execute_and_then(sql, Tab::Object(id), None, keep_rows, cx);
     }
 
     /// A header click on a relation tab: move that column through the sort and
@@ -2137,12 +2239,116 @@ impl Workspace {
         }
     }
 
+    /// Put a tab's snapshot on screen, the first time the tab is looked at.
+    ///
+    /// Startup used to parse every stored tab's snapshot, which is a megabyte
+    /// of JSON per handful of tabs decoded inside `Render` for grids nobody has
+    /// asked to see. A tab that is never reached now touches the disk not at
+    /// all.
+    ///
+    /// Nothing here can land on a live result. `hydrated` is set on the first
+    /// attempt whether or not a snapshot was found, so the read happens at most
+    /// once per tab; and a tab whose state is anything but `Idle` has a run of
+    /// its own -- in flight, finished or failed -- so it is left alone even on
+    /// that one attempt.
+    fn hydrate_tab(&mut self, tab: Tab, cx: &mut Context<Self>) {
+        let Some(profile) = self.profile_mut() else {
+            return;
+        };
+        let profile_id = profile.id.clone();
+        let key = match tab {
+            Tab::Query(id) => {
+                let Some(query_tab) = profile.session.query_tab_mut(id) else {
+                    return;
+                };
+                if std::mem::replace(&mut query_tab.hydrated, true)
+                    || !matches!(query_tab.query, QueryState::Idle)
+                {
+                    return;
+                }
+                store::query_grid_key(id)
+            }
+            Tab::Object(id) => {
+                let Some(object) = profile.session.objects.iter_mut().find(|tab| tab.id == id)
+                else {
+                    return;
+                };
+                let key = store::object_grid_key(&object.schema, &object.name);
+                let ObjectBody::Relation {
+                    query, hydrated, ..
+                } = &mut object.body
+                else {
+                    return;
+                };
+                if std::mem::replace(hydrated, true) || !matches!(query, QueryState::Idle) {
+                    return;
+                }
+                key
+            }
+        };
+
+        let Some(snapshot) = store::read_grid(&profile_id, &key) else {
+            return;
+        };
+        let Some(results) = self
+            .profile()
+            .and_then(|profile| profile.session.results(tab))
+            .cloned()
+        else {
+            return;
+        };
+        show_snapshot(&results, &snapshot, cx);
+        let Some(profile) = self.profile_mut() else {
+            return;
+        };
+        match tab {
+            // A query tab's rows are all a snapshot restores: the statement
+            // behind them is arbitrary SQL the user wrote, so nothing re-runs
+            // it until they ask. It could be an `UPDATE ... RETURNING`.
+            Tab::Query(id) => {
+                if let Some(query_tab) = profile.session.query_tab_mut(id) {
+                    query_tab.query = restored_state(&snapshot);
+                    query_tab.last_query = snapshot.last_query;
+                }
+            }
+            Tab::Object(id) => {
+                if let Some(object) = profile.session.objects.iter_mut().find(|tab| tab.id == id)
+                    && let ObjectBody::Relation {
+                        showing_structure,
+                        query,
+                        sort,
+                        limit,
+                        stale,
+                        ..
+                    } = &mut object.body
+                {
+                    *showing_structure = snapshot.showing_structure;
+                    *query = restored_state(&snapshot);
+                    // The sort the snapshot's rows are actually in, so the
+                    // refresh asks for the same order rather than whatever the
+                    // server hands back unordered.
+                    *sort = snapshot
+                        .order_by
+                        .iter()
+                        .map(|(expression, ascending)| SortKey::new(expression.clone(), *ascending))
+                        .collect();
+                    *limit = snapshot.limit.unwrap_or(PREVIEW_ROW_LIMIT);
+                    *stale = true;
+                }
+            }
+        }
+    }
+
     fn activate_tab(&mut self, tab: Tab, cx: &mut Context<Self>) {
         if let Some(profile) = self.profile_mut() {
             profile.session.active = tab;
             profile.session.clear_prompts();
             profile.session.editor_needs_focus = true;
         }
+        // Before `load_relation`, which decides whether to re-query from the
+        // state the snapshot leaves the tab in: hydrating afterwards would
+        // arrive over a run already in flight and be refused.
+        self.hydrate_tab(tab, cx);
         if let Tab::Object(id) = tab {
             self.load_relation(id, cx);
         }
@@ -2150,20 +2356,21 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Keep a tab that was opened for a look.
-    fn keep_object(&mut self, id: u64, cx: &mut Context<Self>) {
-        if self
-            .profile_mut()
-            .is_some_and(|profile| profile.session.promote(id))
-        {
-            self.remember_profiles(cx);
-            cx.notify();
-        }
-    }
-
     fn close_object(&mut self, id: u64, cx: &mut Context<Self>) {
         if let Some(profile) = self.profile_mut() {
+            // Read before the tab goes, because the key is made of its schema
+            // and name and there is nothing left to make it from afterwards.
+            let snapshot = profile
+                .session
+                .objects
+                .iter()
+                .find(|tab| tab.id == id)
+                .map(|tab| store::object_grid_key(&tab.schema, &tab.name));
+            let profile_id = profile.id.clone();
             profile.session.objects.retain(|tab| tab.id != id);
+            if let Some(key) = snapshot {
+                let _ = store::remove_grid(&profile_id, &key);
+            }
             if profile.session.active == Tab::Object(id)
                 && let Some(first) = profile.session.queries.first().map(|tab| tab.id)
             {
@@ -2175,33 +2382,69 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Turn the object tabs read back from disk into live ones, now that the
-    /// catalog can say what they hold. Anything the database no longer has
-    /// simply does not come back.
+    /// Turn the object tabs read back from disk into live ones. A relation is
+    /// opened as soon as there is a connection to query, because everything its
+    /// tab needs is on disk; only a routine, whose body the tab renders, waits
+    /// for the catalog. Anything the database no longer has simply does not
+    /// come back -- a relation it has dropped comes back as a tab whose query
+    /// fails, which says so where silence did not.
     fn restore_objects(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(profile) = self.profile() else {
             return;
         };
-        if profile.session.pending_objects.is_empty() {
+        let pending = profile.session.pending_objects.len();
+        if pending == 0 {
             return;
         }
-        let CatalogState::Loaded(catalog) = &profile.catalog else {
-            return;
+        let connected = profile.connection().is_some();
+        let catalog = match &profile.catalog {
+            CatalogState::Loaded(catalog) => Some(catalog),
+            _ => None,
         };
 
-        let opened = profile
-            .session
-            .pending_objects
-            .iter()
-            .filter_map(|stored| Some((OpenedObject::resolve(catalog, stored)?, stored.active)))
-            .collect::<Vec<_>>();
+        let mut opened = Vec::new();
+        let mut still_pending = Vec::new();
+        for stored in &profile.session.pending_objects {
+            if stored.routine {
+                match catalog {
+                    Some(catalog) => opened.extend(
+                        OpenedObject::resolve(catalog, stored)
+                            .map(|object| (object, stored.active)),
+                    ),
+                    None => still_pending.push(stored.clone()),
+                }
+            } else if connected {
+                opened.push((
+                    OpenedObject::Relation {
+                        schema: stored.schema.clone(),
+                        name: stored.name.clone(),
+                        // The catalog when it is here, because `stored.kind` can
+                        // be the default a build that did not keep one wrote --
+                        // which draws every view with a table's icon.
+                        kind: catalog
+                            .and_then(|catalog| {
+                                relation_kind(catalog, &stored.schema, &stored.name)
+                            })
+                            .unwrap_or(stored.kind),
+                    },
+                    stored.active,
+                ));
+            } else {
+                still_pending.push(stored.clone());
+            }
+        }
+        // Called on every frame, so a pass that could do nothing has to change
+        // nothing: rewriting the profile here would write to disk per frame.
+        if opened.is_empty() && still_pending.len() == pending {
+            return;
+        }
 
         if let Some(profile) = self.profile_mut() {
-            profile.session.pending_objects.clear();
+            profile.session.pending_objects = still_pending;
         }
         let mut restored_active = None;
         for (opened, active) in opened {
-            let id = self.open_object(opened, false, window, cx);
+            let id = self.open_object(opened, window, cx);
             if active {
                 restored_active = id;
             }
@@ -2253,6 +2496,9 @@ impl Workspace {
         // the batch panel, which is over the surface, so `escape` backs out of
         // them one at a time.
         if self.close_palette(cx) {
+            return;
+        }
+        if self.cancel_discard_close(cx) {
             return;
         }
         if self.cancel_close_tab(cx) {
@@ -2309,17 +2555,70 @@ impl Workspace {
             .iter()
             .filter(|tab| tab.open_query.is_none())
             .count();
-        match close_target(session.active, session.open_query(), unsaved) {
-            Some(CloseTarget::Object(id)) => self.close_object(id, cx),
-            Some(CloseTarget::Buffer(id)) => self.close_buffer(id, cx),
-            Some(CloseTarget::SavedQuery(name)) => {
+        let Some(target) = close_target(session.active, session.open_query(), unsaved) else {
+            return;
+        };
+        self.ask_before_close(target, cx);
+    }
+
+    /// Close a tab, asking first if it holds cell edits nobody has applied.
+    ///
+    /// Every gesture that takes a tab away comes through here -- `cmd+w`, the
+    /// chip's own close button, the palette -- because the edits are lost the
+    /// same way whichever one it was, and a guard on one path is a guard on
+    /// none.
+    fn ask_before_close(&mut self, target: CloseTarget, cx: &mut Context<Self>) {
+        let unapplied = self.profile().is_some_and(|profile| {
+            target
+                .tab(&profile.session)
+                .and_then(|tab| profile.session.results(tab))
+                .is_some_and(|results| results.read(cx).delegate().has_pending())
+        });
+        if !unapplied {
+            self.close_now(target, cx);
+            return;
+        }
+        if let Some(profile) = self.profile_mut() {
+            profile.session.pending_discard = Some(target);
+        }
+        cx.notify();
+    }
+
+    /// Carry out a close that has been decided on. A saved query asks its own
+    /// question from here: closing its tab deletes its file.
+    fn close_now(&mut self, target: CloseTarget, cx: &mut Context<Self>) {
+        match target {
+            CloseTarget::Object(id) => self.close_object(id, cx),
+            CloseTarget::Buffer(id) => self.close_buffer(id, cx),
+            CloseTarget::SavedQuery(name) => {
                 if let Some(profile) = self.profile_mut() {
                     profile.session.pending_close = Some(name);
                 }
                 cx.notify();
             }
-            None => {}
         }
+    }
+
+    /// Close the tab the discard prompt was raised over, edits and all.
+    fn confirm_discard_close(&mut self, cx: &mut Context<Self>) {
+        let Some(target) = self
+            .profile_mut()
+            .and_then(|profile| profile.session.pending_discard.take())
+        else {
+            return;
+        };
+        self.close_now(target, cx);
+    }
+
+    fn cancel_discard_close(&mut self, cx: &mut Context<Self>) -> bool {
+        let cancelled = self
+            .profile_mut()
+            .and_then(|profile| profile.session.pending_discard.take())
+            .is_some();
+        if cancelled {
+            cx.notify();
+        }
+        cancelled
     }
 
     fn cancel_close_tab(&mut self, cx: &mut Context<Self>) -> bool {
@@ -2411,7 +2710,7 @@ impl Workspace {
     /// The palette is another way in, never a second implementation.
     fn run_command(&mut self, command: Command, window: &mut Window, cx: &mut Context<Self>) {
         match command {
-            Command::OpenObject(target) => self.open_explorer_target(target, false, window, cx),
+            Command::OpenObject(target) => self.open_explorer_target(target, window, cx),
             Command::OpenQuery(name) => self.open_saved_query(name, window, cx),
             Command::OpenScratch => self.open_scratch_query(window, cx),
             Command::NewQuery => self.new_query(&NewQuery, window, cx),
@@ -2422,7 +2721,7 @@ impl Workspace {
             Command::RecallStatement(sql) => self.recall_statement(sql, window, cx),
             Command::ShowStructure(showing) => self.show_structure(showing, cx),
             Command::RefreshRelation(id) => self.refresh_relation(id, cx),
-            Command::CloseObject(id) => self.close_object(id, cx),
+            Command::CloseObject(id) => self.ask_before_close(CloseTarget::Object(id), cx),
             Command::ApplyEdits => self.apply_edits(&ApplyEdits, window, cx),
             Command::DiscardEdits => self.discard_edits(&DiscardEdits, window, cx),
             Command::ExportResults(format) => self.export_results(format, cx),
@@ -2739,6 +3038,26 @@ impl Workspace {
     /// read it off. Pending edits are not written either: this is the result set
     /// the server returned, and applying them is a separate, visible act.
     fn export_results(&mut self, format: Format, cx: &mut Context<Self>) {
+        // A restored snapshot holds at most `GRID_ROW_CAP` rows of a larger
+        // result. Exporting those is a file that is quietly short of what the
+        // status bar says the tab is showing, so it refuses and says how to get
+        // the rest -- rather than writing a wrong file successfully.
+        let capped = self.profile().and_then(|profile| {
+            let grid = profile.session.active_results()?.read(cx).delegate();
+            let showing = grid.result().rows.len();
+            (showing < grid.total_rows()).then(|| (showing, grid.total_rows()))
+        });
+        if let Some((showing, total)) = capped {
+            self.note(
+                format!(
+                    "This tab is showing {} of {} rows from a snapshot. Refresh it before exporting.",
+                    group_thousands(showing as u64),
+                    group_thousands(total as u64)
+                ),
+                cx,
+            );
+            return;
+        }
         let Some(profile) = self.profile() else {
             return;
         };
@@ -2896,7 +3215,13 @@ impl Workspace {
         let text = editor.read(cx).value().to_string();
         let appended = appended_statement(&text, &batch);
         editor.update(cx, |editor, cx| editor.set_value(appended, window, cx));
-        self.execute_and_then(batch, Tab::Query(id), Some(Refresh::Statement(select)), cx);
+        self.execute_and_then(
+            batch,
+            Tab::Query(id),
+            Some(Refresh::Statement(select)),
+            false,
+            cx,
+        );
     }
 
     /// Run the batch a relation tab is showing. The modal stays up until it
@@ -2914,7 +3239,7 @@ impl Workspace {
         };
         // Without the refresh the grid would show the UPDATE's empty result set
         // and the user would watch their table vanish.
-        self.execute_and_then(sql, tab, Some(Refresh::Relation(id)), cx);
+        self.execute_and_then(sql, tab, Some(Refresh::Relation(id)), false, cx);
     }
 
     /// Put the batch away, leaving the edits pending: reading a statement and
@@ -2951,7 +3276,10 @@ impl Workspace {
 
     fn persist_buffer(&self, cx: &App) -> Result<(), String> {
         match self.profile() {
-            Some(profile) => write_buffer(profile, cx),
+            Some(profile) => {
+                write_grids(profile, cx);
+                write_buffer(profile, cx)
+            }
             None => Ok(()),
         }
     }
@@ -2960,6 +3288,7 @@ impl Workspace {
     /// failure to: the application is closing.
     fn persist_buffers(&self, cx: &App) {
         for profile in &self.profiles {
+            write_grids(profile, cx);
             let _ = write_buffer(profile, cx);
         }
     }
@@ -3156,6 +3485,10 @@ impl Workspace {
         if let Err(message) = store::delete_scratch(&profile_id, id) {
             self.note(message, cx);
         }
+        // The tab is gone, so its snapshot has nothing left to come back to --
+        // and the ids are reused, so a leftover file would open as another
+        // buffer's rows.
+        let _ = store::remove_grid(&profile_id, &store::query_grid_key(id));
         self.remember_profiles(cx);
         cx.notify();
     }
@@ -3301,6 +3634,10 @@ impl Workspace {
             if let Some(open) = was_open {
                 if profile.session.queries.len() > 1 {
                     profile.session.queries.retain(|tab| tab.id != open);
+                    // With the tab, as in `close_buffer`: a snapshot with no
+                    // tab left to come back to is rows the next buffer to be
+                    // handed this id would show as its own.
+                    let _ = store::remove_grid(&id, &store::query_grid_key(open));
                     if profile.session.active == Tab::Query(open)
                         && let Some(next) = profile.session.queries.first().map(|tab| tab.id)
                     {
@@ -3325,11 +3662,16 @@ impl Workspace {
     /// through a profile's own editor or explorer, so the absence of one is not
     /// a state the user can be shown an error about.
     fn execute_sql(&mut self, sql: String, tab: Tab, cx: &mut Context<Self>) {
-        self.execute_and_then(sql, tab, None, cx);
+        self.execute_and_then(sql, tab, None, false, cx);
     }
 
     /// As `execute_sql`, with something to run once this statement has
     /// succeeded.
+    ///
+    /// `keep_rows` leaves whatever the grid is showing in place until the new
+    /// result lands, for the refresh of a tab whose rows came off disk. Every
+    /// other run clears them first, because rows from the previous statement
+    /// sitting under the one now running cannot be told from fresh ones.
     ///
     /// Chained inside the completion rather than called after it: `execute_sql`
     /// refuses to start while a query is running, so a second call made here
@@ -3340,6 +3682,7 @@ impl Workspace {
         sql: String,
         tab: Tab,
         refresh: Option<Refresh>,
+        keep_rows: bool,
         cx: &mut Context<Self>,
     ) {
         // Read before the task, which outlives the borrow of `self`.
@@ -3372,13 +3715,15 @@ impl Workspace {
 
         // Rows from the previous statement must not sit under the one now on
         // screen -- a reader cannot tell stale rows from fresh ones.
-        results.update(cx, |table, cx| {
-            *table.delegate_mut() = ResultGrid::empty();
-            // The inspector reads whatever row is selected, and a row index
-            // means nothing once the rows behind it are gone.
-            table.clear_selection(cx);
-            table.refresh(cx);
-        });
+        if !keep_rows {
+            results.update(cx, |table, cx| {
+                *table.delegate_mut() = ResultGrid::empty();
+                // The inspector reads whatever row is selected, and a row index
+                // means nothing once the rows behind it are gone.
+                table.clear_selection(cx);
+                table.refresh(cx);
+            });
+        }
         cx.notify();
 
         // Read from the statement that is about to run, so the headers say what
@@ -3412,6 +3757,7 @@ impl Workspace {
                 .update(cx, |workspace, cx| {
                     let (succeeded, produced_grid) = {
                         let Some(profile) = workspace.issued_to(&id, generation) else {
+                            workspace.drop_stale_run(&id, tab, cx);
                             return;
                         };
                         let Some((state, results)) = profile.session.slot(tab) else {
@@ -3472,6 +3818,27 @@ impl Workspace {
                 .ok();
         })
         .detach();
+    }
+
+    /// A result dropped because its generation was retired -- a reconnect or a
+    /// profile switch bumped it while the statement was in flight.
+    ///
+    /// The tab it was for is still `Running`, showing a spinner over rows
+    /// nothing is going to replace, and `load_relation` will not re-query a tab
+    /// that is not `Idle` or `Failed`. `Idle` rather than `Failed`, because
+    /// nothing failed: the run was abandoned, and `Idle` is what makes the next
+    /// visit to the tab run it again.
+    fn drop_stale_run(&mut self, id: &str, tab: Tab, cx: &mut Context<Self>) {
+        let Some(profile) = self.profiles.iter_mut().find(|profile| profile.id == id) else {
+            return;
+        };
+        let Some((state, _)) = profile.session.slot(tab) else {
+            return;
+        };
+        if matches!(state, QueryState::Running) {
+            *state = QueryState::Idle;
+            cx.notify();
+        }
     }
 
     fn sql_to_run(
@@ -3796,6 +4163,78 @@ impl Workspace {
                                 workspace.close_palette(cx);
                             });
                         }),
+                )
+                .into_any_element(),
+        )
+    }
+
+    /// What `cmd+w` asks before it takes unapplied cell edits with the tab.
+    fn render_discard_confirmation(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let t = *theme(cx);
+        self.profile()?.session.pending_discard.as_ref()?;
+        let cancel_workspace = cx.entity().downgrade();
+        let discard_workspace = cancel_workspace.clone();
+
+        Some(
+            div()
+                .absolute()
+                .inset_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(
+                    dialog(t)
+                        .child(section_label(t, "Close tab"))
+                        .child(
+                            div()
+                                .text_size(px(layout::TEXT_SM))
+                                .text_color(t.text_muted)
+                                // The edits are held against the fetched rows
+                                // and never written to them, so closing the
+                                // tab is the moment they stop existing.
+                                .child(
+                                    "This tab has cell edits that have not been applied. \
+                                     Closing it discards them.",
+                                ),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .justify_end()
+                                .gap(px(layout::SPACE_SM))
+                                .child(
+                                    button(
+                                        "cancel-discard-close",
+                                        "Cancel",
+                                        Tone::Quiet,
+                                        Control::Standard,
+                                        t,
+                                    )
+                                    .on_click(
+                                        move |_, _, cx| {
+                                            _ = cancel_workspace.update(cx, |workspace, cx| {
+                                                workspace.cancel_discard_close(cx);
+                                            });
+                                        },
+                                    ),
+                                )
+                                .child(
+                                    button(
+                                        "confirm-discard-close",
+                                        "Discard",
+                                        Tone::Danger,
+                                        Control::Standard,
+                                        t,
+                                    )
+                                    .on_click(
+                                        move |_, _, cx| {
+                                            _ = discard_workspace.update(cx, |workspace, cx| {
+                                                workspace.confirm_discard_close(cx);
+                                            });
+                                        },
+                                    ),
+                                ),
+                        ),
                 )
                 .into_any_element(),
         )
@@ -4239,13 +4678,12 @@ impl Workspace {
                             return row;
                         };
                         let workspace = workspace.clone();
-                        // One click opens a tab to look at; the second keeps
-                        // it. Both events arrive, so the double click promotes
-                        // the tab its own first click opened.
-                        row.on_click(move |event: &ClickEvent, window, cx| {
-                            let transient = event.click_count() < 2;
+                        // Every opened object gets a tab that stays until it is
+                        // closed, so a second click on the same row is the same
+                        // gesture as the first.
+                        row.on_click(move |_, window, cx| {
                             _ = workspace.update(cx, |workspace, cx| {
-                                workspace.open_explorer_target(leaf.target, transient, window, cx);
+                                workspace.open_explorer_target(leaf.target, window, cx);
                             });
                         })
                     },
@@ -4300,6 +4738,25 @@ impl Render for Workspace {
         // have: the catalog that names these tabs resolves off-thread, and a
         // grid cannot be built without a window.
         self.restore_objects(window, cx);
+        // Where a query tab that reached the front without `activate_tab` gets
+        // its snapshot read. `session.active` is written in six places --
+        // `Session::new`, `activate_tab`, `close_object`, `escape`,
+        // `close_buffer` and `delete_saved_query` -- and all but the first two
+        // set a `Tab::Query` without hydrating it, so this cannot be narrowed
+        // to the opening tab.
+        //
+        // What keeps it off a live result is `hydrate_tab`'s own `Idle` guard,
+        // which holds only because no reachable state leaves a query tab
+        // `Idle` while its grid holds rows: a run blanks the grid before it
+        // starts, and nothing sets `Idle` back afterwards. A "clear results"
+        // or a cancel that resets state would break that, and this line would
+        // then read a snapshot over rows the user is looking at.
+        //
+        // Gated on a flag rather than on the disk, so every later frame is a
+        // bool test.
+        if let Some(active @ Tab::Query(_)) = self.profile().map(|profile| profile.session.active) {
+            self.hydrate_tab(active, cx);
+        }
 
         // Deferred for the same reason plus one: an element has to be mounted
         // before it can take focus.
@@ -4401,18 +4858,33 @@ impl Render for Workspace {
             ProfileState::Failed(message) => (message.clone(), t.danger),
         };
 
+        // The rows the grid actually holds, which is fewer than the result had
+        // whenever a restored snapshot was capped.
+        let showing = profile
+            .session
+            .active_results()
+            .map(|results| results.read(cx).delegate().result().rows.len());
+        let snapshot_age = profile
+            .session
+            .active_results()
+            .and_then(|results| results.read(cx).delegate().captured())
+            .map(|captured| relative_age(store::captured_at().saturating_sub(captured)));
         let query_status = match profile.session.active_query() {
             Some(QueryState::Complete {
                 rows,
                 bytes,
                 elapsed,
                 ..
-            }) => Some(format!(
-                "{} {} · {} · {elapsed:.1?}",
-                group_thousands(*rows as u64),
-                if *rows == 1 { "row" } else { "rows" },
-                human_bytes(*bytes as u64),
-            )),
+            }) => {
+                let count = row_readout(showing.unwrap_or(*rows), *rows);
+                // A snapshot knows neither how many bytes crossed the wire nor
+                // how long it took, so reporting `0 B · 0.0ns` invents two
+                // numbers. What it does know is when it was taken.
+                Some(match snapshot_age {
+                    Some(age) => format!("{count} · snapshot from {age} ago"),
+                    None => format!("{count} · {} · {elapsed:.1?}", human_bytes(*bytes as u64)),
+                })
+            }
             _ => None,
         };
         let notice = profile.session.notice.clone();
@@ -4595,6 +5067,7 @@ impl Render for Workspace {
             )
             .children(self.render_apply_review(cx))
             .children(self.render_close_confirmation(cx))
+            .children(self.render_discard_confirmation(cx))
             .children(self.render_palette(cx))
     }
 }
@@ -4777,6 +5250,69 @@ fn write_buffer(profile: &Profile, cx: &App) -> Result<(), String> {
     match failure {
         Some(message) => Err(message),
         None => Ok(()),
+    }
+}
+
+/// Snapshot every tab's grid, so reopening a profile shows the rows it was
+/// showing rather than an empty grid waiting on a re-run.
+///
+/// Only a `Complete` tab is written: an empty or failed grid is not a result,
+/// and writing one would replace a good snapshot with nothing. Failures are
+/// dropped rather than reported, unlike the buffers this runs beside -- a cache
+/// that did not land costs a re-run, not somebody's unsaved work.
+fn write_grids(profile: &Profile, cx: &App) {
+    for tab in &profile.session.queries {
+        if !matches!(tab.query, QueryState::Complete { .. }) {
+            continue;
+        }
+        let grid = tab.results.read(cx).delegate().stored();
+        // A statement that returned no columns produced no grid to keep --
+        // which is every `UPDATE` and `DELETE` the buffer has run.
+        if grid.columns.is_empty() {
+            continue;
+        }
+        let _ = store::write_grid(
+            &profile.id,
+            &store::query_grid_key(tab.id),
+            &store::StoredGrid {
+                last_query: tab.last_query.clone(),
+                ..grid
+            },
+        );
+    }
+
+    for tab in &profile.session.objects {
+        let ObjectBody::Relation {
+            results,
+            query,
+            sort,
+            limit,
+            showing_structure,
+            ..
+        } = &tab.body
+        else {
+            continue;
+        };
+        if !matches!(query, QueryState::Complete { .. }) {
+            continue;
+        }
+        let grid = results.read(cx).delegate().stored();
+        if grid.columns.is_empty() {
+            continue;
+        }
+        let _ = store::write_grid(
+            &profile.id,
+            &store::object_grid_key(&tab.schema, &tab.name),
+            &store::StoredGrid {
+                limit: Some(*limit),
+                showing_structure: *showing_structure,
+                order_by: sort
+                    .iter()
+                    .map(|key| (key.expression.clone(), key.ascending))
+                    .collect(),
+                ..grid
+            },
+        );
     }
 }
 
@@ -5021,6 +5557,47 @@ fn group_thousands(value: u64) -> String {
         grouped.push(digit);
     }
     grouped
+}
+
+/// The id the next new buffer gets.
+///
+/// `stored` is what the profile last wrote, and the maximum over the open tabs
+/// is the floor: a profile written before the field was kept has none, and one
+/// written by a build that derived it could hand out an id a tab already holds.
+/// Never the derived value alone -- that decreases when the highest tab closes,
+/// and the reused id would hydrate the closed tab's snapshot.
+fn next_query_id(stored: u64, tabs: &[store::StoredQueryTab]) -> u64 {
+    stored.max(tabs.iter().map(|tab| tab.id + 1).max().unwrap_or(0))
+}
+
+/// The row count for the status bar.
+///
+/// A restored snapshot keeps at most [`store::GRID_ROW_CAP`] rows of what the
+/// result had, so the grid can hold fewer rows than the count it reports --
+/// and "20,000 rows" over 5,000 of them is a number nobody can act on. Every
+/// other result reads as the plain count it always did.
+fn row_readout(showing: usize, total: usize) -> String {
+    let unit = if total == 1 { "row" } else { "rows" };
+    if showing < total {
+        return format!(
+            "{} of {} {unit}",
+            group_thousands(showing as u64),
+            group_thousands(total as u64)
+        );
+    }
+    format!("{} {unit}", group_thousands(total as u64))
+}
+
+/// How long ago, at the one unit worth reading in a status bar. A cache's age
+/// is read to decide whether to trust it, and no such decision turns on the
+/// difference between 121 and 122 minutes.
+fn relative_age(seconds: u64) -> String {
+    match seconds {
+        ..60 => "moments".to_string(),
+        60..3_600 => format!("{}m", seconds / 60),
+        3_600..86_400 => format!("{}h", seconds / 3_600),
+        _ => format!("{}d", seconds / 86_400),
+    }
 }
 
 /// Bytes at the precision a person reads them, not the count the server sent.
@@ -5577,6 +6154,19 @@ mod tests {
     }
 
     #[test]
+    fn a_snapshots_age_reads_in_one_unit() {
+        assert_eq!(relative_age(0), "moments");
+        assert_eq!(relative_age(59), "moments");
+        assert_eq!(relative_age(60), "1m");
+        assert_eq!(relative_age(3_599), "59m");
+        assert_eq!(relative_age(7_200), "2h");
+        assert_eq!(relative_age(86_399), "23h");
+        // A cache left over a long weekend, which is exactly when its age is
+        // the thing worth reading.
+        assert_eq!(relative_age(3 * 86_400 + 4_000), "3d");
+    }
+
+    #[test]
     fn a_relations_statement_carries_its_sort_before_the_limit() {
         let sorted = relation_sql(
             Engine::Postgres,
@@ -5648,6 +6238,44 @@ mod tests {
     fn result_pane_expands_as_soon_as_a_query_starts() {
         assert!(!result_pane_is_expanded(&QueryState::Idle));
         assert!(result_pane_is_expanded(&QueryState::Running));
+    }
+
+    #[test]
+    fn a_capped_snapshots_readout_says_how_much_of_the_result_it_holds() {
+        // The status bar over a restored, capped grid. Without the "of" it
+        // reads as 20,000 rows on screen, and the export below it as complete.
+        assert_eq!(row_readout(5_000, 20_000), "5,000 of 20,000 rows");
+        // Nothing was trimmed: the count it always was.
+        assert_eq!(row_readout(842, 842), "842 rows");
+        assert_eq!(row_readout(1, 1), "1 row");
+        assert_eq!(row_readout(0, 0), "0 rows");
+        // A snapshot written before `total_rows` was kept reports zero over
+        // rows it can still show, and must not read as "5,000 of 0".
+        assert_eq!(row_readout(5_000, 0), "0 rows");
+    }
+
+    #[test]
+    fn the_next_buffer_id_never_goes_backwards_over_a_closed_tab() {
+        let tabs = |ids: &[u64]| {
+            ids.iter()
+                .map(|id| store::StoredQueryTab {
+                    id: *id,
+                    name: None,
+                    active: false,
+                })
+                .collect::<Vec<_>>()
+        };
+
+        // Tab 1 closed, so the highest surviving id is 0 -- and deriving the
+        // next id from it would hand out 1 again, over tab 1's snapshot.
+        assert_eq!(next_query_id(2, &tabs(&[0])), 2);
+        // A profile written before the id was persisted has no stored value,
+        // and the derived one is all there is.
+        assert_eq!(next_query_id(0, &tabs(&[0, 1])), 2);
+        // A stored value behind the open tabs -- an older build's file beside
+        // a newer build's tabs -- must not hand out a live id.
+        assert_eq!(next_query_id(1, &tabs(&[0, 4])), 5);
+        assert_eq!(next_query_id(0, &tabs(&[])), 0);
     }
 
     #[test]

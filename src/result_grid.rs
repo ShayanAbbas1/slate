@@ -11,6 +11,7 @@ use gpui_component::{
 use crate::{
     db::{self, EditTarget, QueryResult},
     icons::icon,
+    store::{GRID_ROW_CAP, StoredGrid, captured_at},
     theme::{layout, theme},
 };
 
@@ -80,6 +81,16 @@ pub struct ResultGrid {
     /// The one cell showing an input, if any. At most one: every other cell
     /// stays on the fast path that `display`'s no-allocation rule is about.
     editing: Option<Editing>,
+    /// When these rows were snapshotted, for a grid that came off disk.
+    ///
+    /// Held here rather than on the tab because a completed run replaces the
+    /// whole delegate: there is no field anyone has to remember to clear, and
+    /// so no way for a live result to keep claiming it is a snapshot.
+    captured: Option<u64>,
+    /// How many rows the result had, for a snapshot that was capped before it
+    /// was written. Held beside `captured` and for the same reason: a run
+    /// replaces the whole delegate, so a live result cannot keep a stale count.
+    restored_total: Option<usize>,
 }
 
 /// One changed cell, held beside the fetched value rather than over it.
@@ -152,6 +163,8 @@ impl ResultGrid {
             active: None,
             pending: Vec::new(),
             editing: None,
+            captured: None,
+            restored_total: None,
         }
     }
 
@@ -162,6 +175,113 @@ impl ResultGrid {
         self.sort = sort;
         self.sortable = sortable;
         self
+    }
+
+    /// A grid read back from a snapshot.
+    ///
+    /// There is no `QueryResult` behind it: the snapshot keeps column names and
+    /// values, not the type information or the edit target those come with. So
+    /// a restored grid shows rows, and the inspector and in-grid editing come
+    /// back with the run that replaces it.
+    pub fn restored(stored: &StoredGrid) -> Self {
+        let mut grid = Self::new(QueryResult {
+            columns: stored
+                .columns
+                .iter()
+                .map(|name| db::Column {
+                    name: name.clone(),
+                    data_type: None,
+                })
+                .collect(),
+            rows: stored.rows.clone(),
+            ..QueryResult::default()
+        });
+
+        // Over the widths `new` just fitted, which measured the capped rows
+        // rather than the layout the user was actually looking at.
+        for (column, width) in grid.columns.iter_mut().zip(&stored.widths) {
+            column.width = px(*width);
+        }
+        // The headers say what the rows are ordered by. `sortable` stays false:
+        // whether a header click can do anything is a fact about the statement,
+        // and a snapshot is not a statement -- the next run settles it.
+        grid.sort = stored.sort.clone();
+        let (rows, columns) = (grid.result.rows.len(), grid.columns.len());
+        // A snapshot is capped, so the cell that was active may be past the
+        // rows that came back with it -- and that is not a cell.
+        grid.active = stored
+            .active
+            .filter(|(row, col)| *row < rows && *col < columns);
+        grid.captured = Some(stored.captured);
+        grid.restored_total = Some(stored.total_rows);
+        grid
+    }
+
+    /// When a restored grid's rows were snapshotted, or `None` for rows a run
+    /// put here.
+    pub fn captured(&self) -> Option<u64> {
+        self.captured
+    }
+
+    /// How many rows the result behind this grid had. More than the grid holds
+    /// only for a restored snapshot the cap trimmed -- which is the one case
+    /// where the rows on screen are not the whole result set.
+    pub fn total_rows(&self) -> usize {
+        self.restored_total.unwrap_or(self.result.rows.len())
+    }
+
+    /// What a snapshot of this grid keeps. The tab's own fields -- the
+    /// statement, the row limit -- are the caller's to fill in: the grid does
+    /// not know which kind of tab it is in.
+    ///
+    /// `pending` and `editing` are deliberately absent. An unapplied edit is
+    /// against rows this session fetched, and a restored grid is not those rows.
+    pub fn stored(&self) -> StoredGrid {
+        StoredGrid {
+            columns: self
+                .result
+                .columns
+                .iter()
+                .map(|column| column.name.clone())
+                .collect(),
+            // Capped here rather than in `write_grid`, which would have to
+            // clone the whole vector to keep the front of it.
+            rows: self
+                .result
+                .rows
+                .iter()
+                .take(GRID_ROW_CAP)
+                .cloned()
+                .collect(),
+            // The result's own size, which a restored grid knows and does not
+            // hold: recomputing it from the capped rows is what collapsed a
+            // 20,000-row snapshot to 5,000 on the next save.
+            total_rows: self.total_rows(),
+            sort: self.sort.clone(),
+            order_by: Vec::new(),
+            widths: self
+                .columns
+                .iter()
+                .map(|column| f32::from(column.width))
+                .collect(),
+            active: self.active,
+            last_query: None,
+            limit: None,
+            showing_structure: false,
+            // A snapshot that is written back unchanged keeps its own age: it
+            // is still the rows it was, and restamping it would make every
+            // restart claim the cache was just taken.
+            captured: self.captured.unwrap_or_else(captured_at),
+        }
+    }
+
+    /// The widths the table is drawing, which is where a drag lands: the
+    /// library resizes its own copy of the columns, so without this a snapshot
+    /// would keep the width every column was first fitted to.
+    pub fn set_widths(&mut self, widths: &[gpui::Pixels]) {
+        for (column, width) in self.columns.iter_mut().zip(widths) {
+            column.width = *width;
+        }
     }
 
     pub fn columns(&self) -> &[crate::db::Column] {
@@ -816,6 +936,103 @@ mod tests {
         // In the order they were edited, so the batch reads the way it was made.
         assert_eq!(updates[0].keys, vec![("id".to_string(), "8".to_string())]);
         assert_eq!(updates[1].keys, vec![("id".to_string(), "7".to_string())]);
+    }
+
+    #[test]
+    fn a_grid_survives_the_round_trip_through_a_snapshot() {
+        // What reopening a profile shows. Every field here is one a person can
+        // see is missing: a column that came back narrow, the sort arrows gone,
+        // the ring on another cell.
+        let mut grid = editable_grid();
+        grid.sort = vec![(2, false), (0, true)];
+        grid.set_widths(&[px(120.), px(64.), px(200.)]);
+        grid.set_active(1, 2);
+        // An edit nobody applied stays with the session that typed it.
+        assert!(grid.set_pending(0, 1, "changed".into()));
+
+        let restored = ResultGrid::restored(&grid.stored());
+
+        assert_eq!(
+            restored
+                .columns()
+                .iter()
+                .map(|column| column.name.as_str())
+                .collect::<Vec<_>>(),
+            ["id", "note", "total"]
+        );
+        assert_eq!(
+            restored
+                .columns
+                .iter()
+                .map(|column| column.width)
+                .collect::<Vec<_>>(),
+            [px(120.), px(64.), px(200.)]
+        );
+        assert_eq!(restored.result.rows, grid.result.rows);
+        assert_eq!(restored.sort, vec![(2, false), (0, true)]);
+        assert_eq!(restored.active, Some((1, 2)));
+        assert!(!restored.has_pending());
+        // The rows the cache holds are the rows the status bar counts.
+        assert_eq!(grid.stored().total_rows, 2);
+    }
+
+    #[test]
+    fn a_capped_snapshot_keeps_the_result_size_across_a_re_save() {
+        // Restore, then quit without re-running: the snapshot is written back
+        // from a grid holding `GRID_ROW_CAP` rows, and recomputing the count
+        // from those would collapse the real size to the cap for good.
+        let restored = ResultGrid::restored(&StoredGrid {
+            columns: vec!["n".into()],
+            rows: (0..GRID_ROW_CAP)
+                .map(|n| vec![Some(n.to_string())])
+                .collect(),
+            total_rows: 20_000,
+            sort: Vec::new(),
+            order_by: Vec::new(),
+            widths: Vec::new(),
+            active: None,
+            last_query: None,
+            limit: None,
+            showing_structure: false,
+            captured: 1_700_000_000,
+        });
+
+        assert_eq!(restored.total_rows(), 20_000);
+        let written = restored.stored();
+        assert_eq!(written.total_rows, 20_000);
+        assert_eq!(written.rows.len(), GRID_ROW_CAP);
+        // And again, however many times the profile is reopened.
+        assert_eq!(ResultGrid::restored(&written).stored().total_rows, 20_000);
+    }
+
+    #[test]
+    fn a_result_larger_than_the_cap_is_capped_once_by_the_grid() {
+        // `write_grid` caps too, but only as a backstop: cloning the whole row
+        // vector to keep the front of it is what this avoids.
+        let grid = ResultGrid::new(QueryResult {
+            columns: vec![column("n")],
+            rows: (0..GRID_ROW_CAP + 10)
+                .map(|n| vec![Some(n.to_string())])
+                .collect(),
+            ..QueryResult::default()
+        });
+
+        let written = grid.stored();
+        assert_eq!(written.rows.len(), GRID_ROW_CAP);
+        assert_eq!(written.total_rows, GRID_ROW_CAP + 10);
+    }
+
+    #[test]
+    fn a_snapshots_active_cell_is_dropped_when_its_row_did_not_fit() {
+        // `write_grid` caps the rows, so the cell that was active can be past
+        // the end of what comes back -- and a ring around nothing is worse
+        // than none.
+        let grid = ResultGrid::restored(&StoredGrid {
+            active: Some((9_000, 0)),
+            ..editable_grid().stored()
+        });
+
+        assert_eq!(grid.active, None);
     }
 
     #[test]

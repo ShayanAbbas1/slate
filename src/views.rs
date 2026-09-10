@@ -12,7 +12,7 @@ use gpui::{
     ParentElement, StatefulInteractiveElement, Styled, div, prelude::FluentBuilder, px,
 };
 use gpui_component::{
-    IconName, InteractiveElementExt, Sizable,
+    IconName, Sizable,
     input::{Input, InputState},
     resizable::{resizable_panel, v_resizable},
     spinner::Spinner,
@@ -20,8 +20,8 @@ use gpui_component::{
 };
 
 use crate::{
-    CancelQuery, Control, NewQuery, ObjectBody, ObjectTab, Profile, QueryState, RunQuery,
-    SaveQuery, SetRowLimit, StructureState, Tab, Tone, Workspace, button, button_label,
+    CancelQuery, CloseTarget, Control, NewQuery, ObjectBody, ObjectTab, Profile, QueryState,
+    RunQuery, SaveQuery, SetRowLimit, StructureState, Tab, Tone, Workspace, button, button_label,
     compact_count, db,
     db::RoutineKind,
     editor_zoom_percent,
@@ -261,84 +261,122 @@ fn render_results(
             .into_any_element()
     };
 
-    let content = match query {
-        QueryState::Idle if is_query => centered(
+    let cancel = |cx: &mut Context<Workspace>| {
+        // A word rather than an icon: a square or a cross beside a status line
+        // reads as "close this", and the quiet tone is what keeps it from
+        // competing with rows that are still coming.
+        button("cancel-query", "Cancel", Tone::Quiet, Control::Compact, t).on_click(cx.listener(
+            |workspace, _, window, cx| {
+                workspace.cancel_query(&CancelQuery, window, cx);
+            },
+        ))
+    };
+    // A refresh keeps the rows it is replacing (`execute_and_then`'s
+    // `keep_rows`), and a centred spinner over rows the user is still reading
+    // hides the data this pane is for. So every state that has rows behind it
+    // falls through to the grid, and the run says so in a strip above it
+    // instead of in place of it.
+    let has_rows = results.read(cx).delegate().rows_count(cx) > 0;
+
+    let message = match query {
+        QueryState::Idle if is_query => Some(centered(
             key_hint(
                 t,
                 "cmd-enter",
                 "runs the selection or statement under the cursor",
             )
             .into_any_element(),
-        ),
+        )),
         // A preview runs the moment its tab is shown, so an idle one is a
         // tab that is about to run rather than one waiting to be asked. It has
         // nothing to cancel yet, though, which is the whole difference here.
-        QueryState::Idle => centered(spinner()),
-        QueryState::Running => centered(
+        QueryState::Idle if !has_rows => Some(centered(spinner())),
+        QueryState::Running if !has_rows => Some(centered(
             div()
                 .flex()
                 .flex_col()
                 .items_center()
                 .gap(px(layout::SPACE_MD))
                 .child(spinner())
-                // A word rather than an icon: a square or a cross beside a
-                // status line reads as "close this", and the quiet tone is what
-                // keeps it from competing with rows that are still coming.
-                .child(
-                    button("cancel-query", "Cancel", Tone::Quiet, Control::Compact, t).on_click(
-                        cx.listener(|workspace, _, window, cx| {
-                            workspace.cancel_query(&CancelQuery, window, cx);
-                        }),
-                    ),
-                )
+                .child(cancel(cx))
                 .into_any_element(),
-        ),
+        )),
         QueryState::Failed(error) => {
             let position = error
                 .position
                 .map(|position| format!(" (at byte {position})"))
                 .unwrap_or_default();
-            div()
-                .size_full()
-                .p(px(layout::SPACE_LG))
-                .font_family(code)
-                .text_color(t.danger)
-                .child(format!("{}{position}", error.message))
-                .into_any_element()
+            Some(
+                div()
+                    .size_full()
+                    .p(px(layout::SPACE_LG))
+                    .font_family(code)
+                    .text_color(t.danger)
+                    .child(format!("{}{position}", error.message))
+                    .into_any_element(),
+            )
         }
+        // A restored snapshot written before it kept a row count is `Complete`
+        // over zero rows it can nonetheless show, so the count alone cannot
+        // decide this.
         QueryState::Complete {
             rows,
             rows_affected,
             ..
-        } if *rows == 0 => centered(quiet_line(match rows_affected {
+        } if *rows == 0 && !has_rows => Some(centered(quiet_line(match rows_affected {
             Some(rows) => format!("Query completed. Server row count: {rows}."),
             None => "Query completed.".into(),
-        })),
-        // Values are read by comparing them down a column, which only lines
-        // up in a monospaced face -- and the header inherits it, so the
-        // heading of a column sits in the same rhythm as its values. The
-        // library's table sets no family of its own, so this is where the
-        // cells and their headings get theirs.
-        _ => div()
+        }))),
+        _ => None,
+    };
+
+    // Values are read by comparing them down a column, which only lines up in
+    // a monospaced face -- and the header inherits it, so the heading of a
+    // column sits in the same rhythm as its values. The library's table sets
+    // no family of its own, so this is where the cells and their headings get
+    // theirs.
+    let content = message.unwrap_or_else(|| {
+        div()
             .size_full()
             .flex()
+            .flex_col()
             .min_h_0()
+            .children(matches!(query, QueryState::Running).then(|| {
+                div()
+                    .h(px(layout::TAB_HEIGHT))
+                    .flex_shrink_0()
+                    .px(px(layout::SPACE_SM))
+                    .flex()
+                    .items_center()
+                    .gap(px(layout::SPACE_SM))
+                    .border_b_1()
+                    .border_color(t.border)
+                    .child(spinner())
+                    .child(quiet_line("Refreshing…".into()))
+                    .child(div().ml_auto().child(cancel(cx)))
+            }))
             .child(
                 div()
                     .flex_1()
-                    .min_w_0()
-                    .h_full()
-                    .font_family(grid)
-                    // The grid's own delegate has no key hook and the focused
-                    // element is the table root, so `enter` is caught here on
-                    // its way out of the Table context.
-                    .on_action(cx.listener(Workspace::edit_cell))
-                    .on_action(cx.listener(Workspace::copy_cell))
-                    .child(Table::new(results).bordered(false).stripe(false)),
+                    .flex()
+                    .min_h_0()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .h_full()
+                            .font_family(grid)
+                            // The grid's own delegate has no key hook and the
+                            // focused element is the table root, so `enter` is
+                            // caught here on its way out of the Table context.
+                            .on_action(cx.listener(Workspace::edit_cell))
+                            .on_action(cx.listener(Workspace::copy_cell))
+                            .child(Table::new(results).bordered(false).stripe(false)),
+                    )
+                    .children(render_row_inspector(results, cx)),
             )
-            .children(render_row_inspector(results, cx))
-            .into_any_element(),
-    };
+            .into_any_element()
+    });
 
     div()
         .size_full()
@@ -680,15 +718,12 @@ fn render_tab_strip(profile: &Profile, cx: &mut Context<Workspace>) -> AnyElemen
                 }
             })
     };
-    let name_label = |name: String, transient: bool| {
+    let name_label = |name: String| {
         div()
             .max_w(px(180.))
             .overflow_hidden()
             .text_ellipsis()
             .whitespace_nowrap()
-            // Italic for a tab nobody has asked to keep, the way every
-            // editor marks one.
-            .when(transient, |label| label.italic())
             .child(name)
     };
 
@@ -747,7 +782,7 @@ fn render_tab_strip(profile: &Profile, cx: &mut Context<Workspace>) -> AnyElemen
                                     // this just closed, in the same click.
                                     cx.stop_propagation();
                                     _ = close_workspace.update(cx, |workspace, cx| {
-                                        workspace.close_buffer(id, cx);
+                                        workspace.ask_before_close(CloseTarget::Buffer(id), cx);
                                     });
                                 }),
                             ),
@@ -782,7 +817,7 @@ fn render_tab_strip(profile: &Profile, cx: &mut Context<Workspace>) -> AnyElemen
                     .pl(px(layout::SPACE_SM))
                     .pr(px(layout::SPACE_XS))
                     .child(row_icon(t, icon::SAVED_QUERY))
-                    .child(name_label(name.clone(), false))
+                    .child(name_label(name.clone()))
                     .child(
                         // Revealed by its own tab, so the strip reads as names
                         // rather than a row of delete buttons.
@@ -840,7 +875,6 @@ fn render_tab_strip(profile: &Profile, cx: &mut Context<Workspace>) -> AnyElemen
         let id = object.id;
         let group = format!("object-tab-{id}");
         let open_workspace = workspace.clone();
-        let keep_workspace = workspace.clone();
         let close_workspace = workspace.clone();
         chip(session.active == Tab::Object(id))
             .id(("object-tab", id as usize))
@@ -848,7 +882,7 @@ fn render_tab_strip(profile: &Profile, cx: &mut Context<Workspace>) -> AnyElemen
             .pl(px(layout::SPACE_SM))
             .pr(px(layout::SPACE_XS))
             .child(row_icon(t, object_icon(object.kind)))
-            .child(name_label(object.name.clone(), object.transient))
+            .child(name_label(object.name.clone()))
             .child(
                 div()
                     .opacity(0.)
@@ -867,7 +901,7 @@ fn render_tab_strip(profile: &Profile, cx: &mut Context<Workspace>) -> AnyElemen
                             // this just closed, in the same click.
                             cx.stop_propagation();
                             _ = close_workspace.update(cx, |workspace, cx| {
-                                workspace.close_object(id, cx);
+                                workspace.ask_before_close(CloseTarget::Object(id), cx);
                             });
                         }),
                     ),
@@ -875,13 +909,6 @@ fn render_tab_strip(profile: &Profile, cx: &mut Context<Workspace>) -> AnyElemen
             .on_click(move |_, _, cx| {
                 _ = open_workspace.update(cx, |workspace, cx| {
                     workspace.activate_tab(Tab::Object(id), cx);
-                });
-            })
-            // The other half of the preview gesture: a double click on the
-            // tab keeps it, exactly as it does in the tree.
-            .on_double_click(move |_, _, cx| {
-                _ = keep_workspace.update(cx, |workspace, cx| {
-                    workspace.keep_object(id, cx);
                 });
             })
             .into_any_element()

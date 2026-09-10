@@ -7,6 +7,8 @@ use std::path::{Path, PathBuf};
 use security_framework::passwords::{self, PasswordOptions};
 use serde::{Deserialize, Serialize};
 
+use crate::db::{Cell, RelationKind};
+
 const PROFILES_FILE: &str = "profiles.toml";
 const KEYCHAIN_SERVICE: &str = "Slate";
 /// The buffer file a build before per-tab buffers wrote. Read-only now, and
@@ -24,6 +26,10 @@ pub const HISTORY_DEPTH: usize = 200;
 /// here -- adding it with the exact pin this project uses everywhere would
 /// fight `security-framework`'s own transitive bump of it.
 const ITEM_NOT_FOUND: i32 = -25300;
+/// A grid past this many rows still runs and displays in full -- this is only
+/// how much of it a snapshot keeps on disk, so reopening a tab is instant
+/// without the cache growing as large as the result it is caching.
+pub const GRID_ROW_CAP: usize = 5_000;
 
 /// Field order is load-bearing: TOML cannot emit a scalar after a table, so
 /// every scalar has to precede the `open_queries` and `open_objects` arrays.
@@ -60,6 +66,13 @@ pub struct StoredProfile {
     /// no limit is exactly what it was running with.
     #[serde(default)]
     pub statement_timeout: Option<u32>,
+    /// The id the next query buffer will be given. Persisted rather than
+    /// derived from the open buffers, because deriving it hands a closed tab's
+    /// id back out -- and a new buffer with a dead tab's id reads that tab's
+    /// snapshot as its own. Absent is a profile written before it was kept, and
+    /// the loader falls back to the derived value for one.
+    #[serde(default)]
+    pub next_query_id: Option<u64>,
     /// The name of the one query buffer a profile had, before a profile could
     /// have several. Read only: nothing writes it any more, and it is kept
     /// because every profile on disk today carries its open query here and
@@ -95,11 +108,50 @@ pub struct StoredObject {
     pub name: String,
     #[serde(default)]
     pub routine: bool,
+    /// A relation's kind, which the catalog would otherwise be the only source
+    /// of -- and waiting for it is what kept a restored relation out of the tab
+    /// strip. Meaningless for a routine.
+    #[serde(default)]
+    pub kind: RelationKind,
     /// Which tab was in front. A flag on the object rather than a pointer to
     /// it: a name can contain anything, including whatever would separate a
     /// schema from a relation in a key.
     #[serde(default)]
     pub active: bool,
+}
+
+/// A tab's last-seen grid, kept so reopening a profile shows a query's or a
+/// table's data immediately rather than an empty grid until it reruns. A
+/// cache, not a source of truth -- [`read_grid`] hands back `None` rather than
+/// an error for anything it cannot make sense of, and nothing here is ever
+/// written back to the database it came from.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct StoredGrid {
+    pub columns: Vec<String>,
+    pub rows: Vec<Vec<Cell>>,
+    /// The row count before [`GRID_ROW_CAP`] trimmed it, so the UI can say
+    /// "5000 of N" for a result that did not fit whole.
+    pub total_rows: usize,
+    #[serde(default)]
+    pub sort: Vec<(usize, bool)>,
+    /// A relation tab's `ORDER BY`, as expression and direction. [`Self::sort`]
+    /// is what the headers draw; this is what rebuilds the statement, and
+    /// without it a refresh asks for no order at all and returns rows in a
+    /// different order than the snapshot it replaces.
+    #[serde(default)]
+    pub order_by: Vec<(String, bool)>,
+    #[serde(default)]
+    pub widths: Vec<f32>,
+    #[serde(default)]
+    pub active: Option<(usize, usize)>,
+    #[serde(default)]
+    pub last_query: Option<String>,
+    #[serde(default)]
+    pub limit: Option<usize>,
+    #[serde(default)]
+    pub showing_structure: bool,
+    #[serde(default)]
+    pub captured: u64,
 }
 
 /// The three font families in use. App-level rather than per-profile: the face
@@ -386,6 +438,140 @@ fn decode_history(text: &str) -> Vec<String> {
         .collect()
 }
 
+/// A missing or unreadable file reads as no cached grid: a stale or corrupt
+/// snapshot is worth exactly as much as none, and must never be the reason
+/// the app fails to start.
+/// When a snapshot was taken, and the clock a snapshot's age is measured
+/// against. A clock set before the epoch reads as 0 rather than refusing to
+/// write a grid over it.
+pub fn captured_at() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs())
+}
+
+pub fn read_grid(profile_id: &str, key: &str) -> Option<StoredGrid> {
+    let path = grid_path(profile_id, key).ok()?;
+    let text = fs::read_to_string(path).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+/// Writes the first [`GRID_ROW_CAP`] rows atomically; `total_rows` is kept as
+/// given, so a capped snapshot still reports the query's real size.
+pub fn write_grid(profile_id: &str, key: &str, grid: &StoredGrid) -> Result<(), String> {
+    let path = grid_path(profile_id, key)?;
+    let capped;
+    let grid = if grid.rows.len() > GRID_ROW_CAP {
+        // Field by field rather than `..grid.clone()`: that clones the whole
+        // row vector -- tens of megabytes, on the frame thread -- to keep the
+        // first few thousand of it and drop the rest.
+        capped = StoredGrid {
+            columns: grid.columns.clone(),
+            rows: grid.rows[..GRID_ROW_CAP].to_vec(),
+            total_rows: grid.total_rows,
+            sort: grid.sort.clone(),
+            order_by: grid.order_by.clone(),
+            widths: grid.widths.clone(),
+            active: grid.active,
+            last_query: grid.last_query.clone(),
+            limit: grid.limit,
+            showing_structure: grid.showing_structure,
+            captured: grid.captured,
+        };
+        &capped
+    } else {
+        grid
+    };
+    let text = serde_json::to_string(grid)
+        .map_err(|error| format!("Could not encode the grid: {error}"))?;
+    write_file(&path, &text)
+}
+
+/// Every grid snapshot a profile cached, on its way out with the profile.
+///
+/// `profile_id` derives from the name, so a profile recreated under the name
+/// of a removed one is handed the same id -- and would read a dead profile's
+/// cached rows as its own. Leaving the directory behind is what makes that
+/// happen.
+pub fn delete_grids(profile_id: &str) -> Result<(), String> {
+    let directory = grids_directory(profile_id)?;
+    match fs::remove_dir_all(&directory) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("Could not delete {}: {error}", directory.display())),
+    }
+}
+
+/// Snapshots that belong to no tab any more.
+///
+/// A tab's key is made of what identifies it -- a query buffer's id, a
+/// relation's schema and name -- so renaming a table strands its snapshot under
+/// the old name with nothing left to remove it by. `live` is every key the
+/// profile on disk still has a tab for, so a file that is in use is never the
+/// one deleted. Failures are dropped: this is cache housekeeping, and a file
+/// that could not be read or removed costs disk, not work.
+pub fn prune_grids(profile_id: &str, live: &HashSet<String>) {
+    let Ok(directory) = grids_directory(profile_id) else {
+        return;
+    };
+    let Ok(entries) = fs::read_dir(&directory) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        // Only the snapshots themselves: a `.tmp` beside one is `write_file`
+        // mid-write, and removing that is a different bug.
+        if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
+            continue;
+        }
+        let Some(key) = path.file_stem().and_then(|stem| stem.to_str()) else {
+            continue;
+        };
+        if !live.contains(key) {
+            let _ = fs::remove_file(&path);
+        }
+    }
+}
+
+/// A snapshot nothing ever wrote has no file to remove.
+pub fn remove_grid(profile_id: &str, key: &str) -> Result<(), String> {
+    let path = grid_path(profile_id, key)?;
+    match fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("Could not delete {}: {error}", path.display())),
+    }
+}
+
+/// A query tab's grid key. The id alone is enough -- it is already a bare
+/// integer, so nothing in it can collide with the escaping [`object_grid_key`]
+/// does for schema and relation names.
+pub fn query_grid_key(id: u64) -> String {
+    format!("q-{id}")
+}
+
+/// An object tab's grid key. A schema or relation name can hold anything --
+/// `/`, `.`, spaces, non-ASCII -- so every byte outside `[A-Za-z0-9_-]` is
+/// percent-encoded, `.` included: it is this function's own separator, and a
+/// name that happened to contain one would otherwise let two different tables
+/// collide on one key (`"a.b"` + `"c"` and `"a"` + `"b.c"` would both read
+/// `"a.b.c"` if `.` were left unescaped).
+pub fn object_grid_key(schema: &str, name: &str) -> String {
+    format!("o-{}.{}", escape_grid_key(schema), escape_grid_key(name))
+}
+
+fn escape_grid_key(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-' {
+            escaped.push(byte as char);
+        } else {
+            escaped.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    escaped
+}
+
 fn unsafe_component(value: &str) -> Option<&'static str> {
     if value.trim().is_empty() {
         Some("is empty")
@@ -423,6 +609,20 @@ fn query_path(profile_id: &str, name: &str) -> Result<PathBuf, String> {
     Ok(query_directory(profile_id)?.join(format!("{name}.sql")))
 }
 
+fn grids_directory(profile_id: &str) -> Result<PathBuf, String> {
+    if let Some(reason) = unsafe_component(profile_id) {
+        return Err(format!("Profile id {reason}."));
+    }
+    Ok(slate_directory()?.join("grids").join(profile_id))
+}
+
+fn grid_path(profile_id: &str, key: &str) -> Result<PathBuf, String> {
+    if let Some(reason) = unsafe_component(key) {
+        return Err(format!("Grid key {reason}."));
+    }
+    Ok(grids_directory(profile_id)?.join(format!("{key}.json")))
+}
+
 /// `Ok(None)` for a file that is not there, which every caller has a sensible
 /// answer for. A file that exists and could not be read does not get the same
 /// answer -- that is the one that sends a person looking for lost work.
@@ -445,9 +645,16 @@ fn write_file(path: &Path, contents: &str) -> Result<(), String> {
     // Set before the rename, not after: the rename is what makes this the file
     // at `path`, so a mode applied afterward would leave it world-readable for
     // however long the two steps are apart.
-    secure(&temporary)?;
-    fs::rename(&temporary, path)
-        .map_err(|error| format!("Could not replace {}: {error}", path.display()))
+    let written = secure(&temporary).and_then(|()| {
+        fs::rename(&temporary, path)
+            .map_err(|error| format!("Could not replace {}: {error}", path.display()))
+    });
+    if written.is_err() {
+        // Nothing reads a leftover temporary, and every failed write would
+        // otherwise leave one behind for good.
+        let _ = fs::remove_file(&temporary);
+    }
+    written
 }
 
 /// Connection settings live in these files -- host, port, user, database --
@@ -511,6 +718,7 @@ mod tests {
             path: None,
             editor_font_size: Some(16.0),
             statement_timeout: Some(30),
+            next_query_id: Some(7),
             open_query: Some("daily".into()),
             open_queries: Vec::new(),
             open_objects: vec![
@@ -518,12 +726,14 @@ mod tests {
                     schema: "public".into(),
                     name: "accounts".into(),
                     routine: false,
+                    kind: RelationKind::MaterializedView,
                     active: true,
                 },
                 StoredObject {
                     schema: "public".into(),
                     name: "total(integer)".into(),
                     routine: true,
+                    kind: RelationKind::default(),
                     active: false,
                 },
             ],
@@ -591,12 +801,14 @@ open_objects = []
             path: Some("/Users/dev/slate_dev.db".into()),
             editor_font_size: Some(14.0),
             statement_timeout: None,
+            next_query_id: Some(7),
             open_query: None,
             open_queries: Vec::new(),
             open_objects: vec![StoredObject {
                 schema: "main".into(),
                 name: "accounts".into(),
                 routine: false,
+                kind: RelationKind::Table,
                 active: true,
             }],
         };
@@ -610,6 +822,37 @@ open_objects = []
         let decoded: ProfileFile = toml::from_str(&text).expect("profiles must decode");
 
         assert_eq!(decoded.profiles, vec![profile]);
+    }
+
+    #[test]
+    fn an_object_written_before_the_kind_existed_loads_as_a_table() {
+        // A relation's tab is opened from what is on disk now, so a profile
+        // written before the kind was stored has to name a kind anyway.
+        let (profiles, ..) = decode_profiles(
+            "\
+[[profiles]]
+id = \"slate-dev\"
+name = \"slate_dev\"
+host = \"127.0.0.1\"
+database = \"slate_dev\"
+user = \"slate\"
+
+[[profiles.open_objects]]
+schema = \"public\"
+name = \"accounts\"
+active = true
+",
+        )
+        .expect("a profile predating the object kind must load");
+
+        let [profile] = &profiles[..] else {
+            panic!("expected exactly one profile, got {}", profiles.len());
+        };
+        let [object] = &profile.open_objects[..] else {
+            panic!("expected exactly one open object");
+        };
+        assert_eq!(object.kind, RelationKind::Table);
+        assert!(!object.routine);
     }
 
     #[test]
@@ -657,12 +900,14 @@ open_objects = []
             path: Some("/tmp/dev.sqlite".into()),
             editor_font_size: None,
             statement_timeout: Some(30),
+            next_query_id: Some(7),
             open_query: None,
             open_queries: Vec::new(),
             open_objects: vec![StoredObject {
                 schema: "main".into(),
                 name: "accounts".into(),
                 routine: false,
+                kind: RelationKind::Table,
                 active: true,
             }],
         };
@@ -894,6 +1139,7 @@ open_objects = []
             path: None,
             editor_font_size: Some(15.0),
             statement_timeout: Some(30),
+            next_query_id: Some(7),
             open_query: Some("daily".into()),
             open_queries: vec![
                 StoredQueryTab {
@@ -911,6 +1157,7 @@ open_objects = []
                 schema: "public".into(),
                 name: "accounts".into(),
                 routine: false,
+                kind: RelationKind::Table,
                 active: true,
             }],
         };
@@ -937,9 +1184,110 @@ open_objects = []
     }
 
     #[test]
+    fn pruning_takes_the_snapshots_no_tab_claims_and_leaves_the_rest() {
+        with_home(|| {
+            let grid = StoredGrid {
+                columns: vec!["n".into()],
+                rows: vec![vec![Some("1".into())]],
+                total_rows: 1,
+                sort: Vec::new(),
+                order_by: Vec::new(),
+                widths: Vec::new(),
+                active: None,
+                last_query: None,
+                limit: None,
+                showing_structure: false,
+                captured: 0,
+            };
+            let live_query = query_grid_key(0);
+            let live_object = object_grid_key("public", "accounts");
+            // The one a rename stranded: nothing names it any more, and its
+            // key cannot be rebuilt from anything that does.
+            let orphan = object_grid_key("public", "accounts_old");
+            for key in [&live_query, &live_object, &orphan] {
+                write_grid("dev", key, &grid).expect("a grid must write");
+            }
+
+            let live = HashSet::from([live_query.clone(), live_object.clone()]);
+            prune_grids("dev", &live);
+
+            assert!(read_grid("dev", &live_query).is_some());
+            assert!(read_grid("dev", &live_object).is_some());
+            assert_eq!(read_grid("dev", &orphan), None);
+
+            delete_grids("dev").expect("the profile's grids must be removable");
+        });
+    }
+
+    #[test]
     fn ordinary_query_names_are_accepted() {
         for name in ["daily report", "v1.2 counts", "accounts", "-x-"] {
             assert!(validate_query_name(name).is_ok(), "{name:?}");
         }
+    }
+
+    #[test]
+    fn a_grid_round_trips_caps_its_rows_and_keys_do_not_collide() {
+        with_home(|| {
+            let small = StoredGrid {
+                columns: vec!["id".into(), "name".into()],
+                rows: vec![vec![Some("1".into()), None]],
+                total_rows: 1,
+                sort: vec![(0, true)],
+                order_by: vec![("created_at".into(), false)],
+                widths: vec![80.0, 160.0],
+                active: Some((0, 1)),
+                last_query: Some("select * from accounts".into()),
+                limit: Some(1_000),
+                showing_structure: false,
+                captured: 1_700_000_000,
+            };
+            let key = query_grid_key(9);
+            write_grid("dev", &key, &small).expect("a small grid must write");
+            // Whole-struct equality, so a field added without a `serde(default)`
+            // -- or dropped from the encode -- fails here rather than silently
+            // reading back as nothing.
+            assert_eq!(read_grid("dev", &key), Some(small));
+
+            // A result over the cap still writes and reads back, but only the
+            // first `GRID_ROW_CAP` rows are on disk -- `total_rows` is what
+            // says the rest existed.
+            let oversized = StoredGrid {
+                columns: vec!["n".into()],
+                rows: (0..GRID_ROW_CAP + 10)
+                    .map(|n| vec![Some(n.to_string())])
+                    .collect(),
+                total_rows: GRID_ROW_CAP + 10,
+                sort: Vec::new(),
+                order_by: Vec::new(),
+                widths: Vec::new(),
+                active: None,
+                last_query: None,
+                limit: None,
+                showing_structure: false,
+                captured: 0,
+            };
+            let big_key = query_grid_key(10);
+            write_grid("dev", &big_key, &oversized).expect("an oversized grid must write");
+            let read_back = read_grid("dev", &big_key).expect("the capped grid must read back");
+            assert_eq!(read_back.rows.len(), GRID_ROW_CAP);
+            assert_eq!(read_back.total_rows, GRID_ROW_CAP + 10);
+            assert_eq!(
+                oversized.rows.len(),
+                GRID_ROW_CAP + 10,
+                "the caller's rows must be untouched"
+            );
+
+            // A dot inside a schema or table name must not read as the
+            // separator between them.
+            assert_ne!(object_grid_key("a.b", "c"), object_grid_key("a", "b.c"));
+
+            // A profile id derives from its name, so a recreated profile can
+            // be handed a dead one's id -- and a leftover snapshot would read
+            // as somebody else's rows.
+            delete_grids("dev").expect("the profile's grids must be removable");
+            assert_eq!(read_grid("dev", &key), None);
+            assert_eq!(read_grid("dev", &big_key), None);
+        });
     }
 }

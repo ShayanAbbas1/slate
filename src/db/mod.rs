@@ -14,6 +14,8 @@
 
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
+
 pub use crate::tls::SslMode;
 
 mod mysql;
@@ -431,8 +433,13 @@ pub fn is_binary_type(data_type: &str) -> bool {
 /// distinct from an empty string and must stay distinguishable in the grid.
 pub type Cell = Option<String>;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Serialized because a restored tab has to know which kind it is before the
+/// catalog that would say so has loaded -- and a table is what a profile
+/// written before the kind was stored gets read back as.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum RelationKind {
+    #[default]
     Table,
     PartitionedTable,
     View,
