@@ -68,6 +68,7 @@ fn render_editor_surface(
     // The editor is the prompt, one tone behind its results -- and one step
     // more transparent, since it is also one step further from the data.
     let top = div()
+        .key_context("Editor")
         .size_full()
         .bg(t.panel_glass())
         .p(px(layout::SPACE_LG))

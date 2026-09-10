@@ -24,7 +24,7 @@ use gpui::{
 use gpui_component::{
     Disableable, IndexPath, InteractiveElementExt, Root,
     button::{Button, ButtonVariants},
-    input::{CompletionProvider, Input, InputEvent, InputState, Position},
+    input::{CompletionProvider, Enter, IndentInline, Input, InputEvent, InputState, Position},
     kbd::Kbd,
     list::{List, ListEvent, ListItem, ListState},
     resizable::{h_resizable, resizable_panel},
@@ -91,6 +91,7 @@ actions!(
         PalettePrevious,
         CloseTab,
         ToggleSidebar,
+        AcceptCompletion,
         Quit,
     ]
 );
@@ -2533,6 +2534,28 @@ impl Workspace {
         cx.notify();
     }
 
+    /// `tab` takes the highlighted suggestion, and indents when there is none
+    /// to take.
+    fn accept_completion(
+        &mut self,
+        _: &AcceptCompletion,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(editor) = self
+            .profile()
+            .and_then(|profile| profile.session.editor(profile.session.active))
+        else {
+            return;
+        };
+        let accepted = editor.update(cx, |editor, cx| {
+            editor.handle_action_for_context_menu(Box::new(Enter { secondary: false }), window, cx)
+        });
+        if !accepted {
+            window.dispatch_action(Box::new(IndentInline), cx);
+        }
+    }
+
     /// `cmd+w` on whatever surface is in front.
     ///
     /// An object tab closes: it is a view onto something the database still
@@ -4947,6 +4970,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::palette_next))
             .on_action(cx.listener(Self::palette_previous))
             .on_action(cx.listener(Self::toggle_sidebar))
+            .on_action(cx.listener(Self::accept_completion))
             .size_full()
             // The shell is the frost: titlebar, sidebar and status bar paint
             // nothing of their own, they are the glass the window root already
@@ -5869,6 +5893,12 @@ fn main() {
             // `cmd+c` wins there and the grid's copy never steals a text
             // selection.
             KeyBinding::new("cmd-c", CopyCell, Some("Table")),
+            // The input binds `tab` to indent and never asks its own
+            // completion popup first, so the popup would never see the
+            // keystroke. Scoped to the buffer, and registered after
+            // `gpui_component::init`, which is what makes it win there and
+            // nowhere else.
+            KeyBinding::new("tab", AcceptCompletion, Some("Editor > Input")),
             KeyBinding::new("cmd-shift-s", ToggleSidebar, None),
             KeyBinding::new("cmd-q", Quit, None),
         ]);
