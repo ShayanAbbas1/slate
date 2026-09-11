@@ -47,7 +47,7 @@ use icons::{Icons, icon};
 use palette::{Command, Mode as PaletteMode, Palette};
 use result_grid::{PendingRow, ResultGrid};
 use sql::{Buffer, SortKey};
-use theme::{FontSlot, Fonts, Theme, fonts, layout, theme};
+use theme::{ConnectionColor, FontSlot, Fonts, Theme, fonts, layout, theme};
 
 /// A header click. The column is the one in the grid; which statement it
 /// belongs to is whatever surface is in front, because that is the grid the
@@ -115,6 +115,7 @@ struct Profile {
     id: String,
     name: String,
     config: ConnectionConfig,
+    color: Option<ConnectionColor>,
     generation: u64,
     state: ProfileState,
     catalog: CatalogState,
@@ -174,6 +175,7 @@ impl Profile {
             editor_font_size: None,
             statement_timeout: Some(self.config.statement_timeout()),
             next_query_id: Some(self.session.next_query_id),
+            color: self.color.map(|color| color.slug().to_string()),
             // Nothing writes the legacy scalar any more; a buffer's name is a
             // property of its tab now. Kept on the stored shape only so a
             // profile written by an older build still loads with its buffer.
@@ -859,6 +861,7 @@ struct ConnectionForm {
     /// switching engine and switching back does not lose what was typed.
     engine: Engine,
     name: Entity<InputState>,
+    color: Option<ConnectionColor>,
     /// SQLite's entire connection. No host, no credentials, no transport.
     path: Entity<InputState>,
     host: Entity<InputState>,
@@ -882,6 +885,8 @@ struct ConnectionForm {
     /// on the next frame, once it exists to receive it.
     needs_focus: Option<Entity<InputState>>,
     error: Option<String>,
+    /// The id of the profile being edited, or `None` for a new connection.
+    editing: Option<String>,
 }
 
 impl ConnectionForm {
@@ -973,6 +978,7 @@ impl ConnectionForm {
             url,
             engine: config.map(ConnectionConfig::engine).unwrap_or_default(),
             name,
+            color: None,
             path,
             host,
             port,
@@ -983,7 +989,25 @@ impl ConnectionForm {
             root_certificate,
             statement_timeout,
             error: None,
+            editing: None,
         }
+    }
+
+    /// The same form, pointed at a profile that already exists.
+    ///
+    /// Its name is the profile's own rather than the database name a fresh form
+    /// falls back to, and the password starts blank: what the Keychain holds is
+    /// never read back onto the screen, so leaving it alone keeps it.
+    fn editing(profile: &Profile, window: &mut Window, cx: &mut Context<Workspace>) -> Self {
+        let mut form = Self::new(Some(&profile.config), window, cx);
+        form.editing = Some(profile.id.clone());
+        form.color = profile.color;
+        form.name.update(cx, |name, cx| {
+            name.set_value(profile.name.clone(), window, cx);
+        });
+        form.password
+            .update(cx, |password, cx| password.set_value("", window, cx));
+        form
     }
 
     fn config(&self, cx: &App) -> Result<(String, ConnectionConfig), String> {
@@ -1236,7 +1260,14 @@ impl Workspace {
                     Some(index) => index,
                     None => {
                         let name = default_profile_name(&config);
-                        workspace.create_profile(name, config, Origin::Environment, window, cx)
+                        workspace.create_profile(
+                            name,
+                            config,
+                            None,
+                            Origin::Environment,
+                            window,
+                            cx,
+                        )
                     }
                 };
                 // The environment picked the profile, so it is the one to come
@@ -1507,6 +1538,9 @@ impl Workspace {
             id: stored.id,
             name: stored.name,
             config,
+            // A slug this build cannot read is decoration, so it drops to no
+            // colour rather than refusing the profile it was written on.
+            color: stored.color.as_deref().and_then(ConnectionColor::from_slug),
             generation: 0,
             state: ProfileState::Idle,
             catalog: CatalogState::Loading,
@@ -1518,6 +1552,7 @@ impl Workspace {
         &mut self,
         name: String,
         config: ConnectionConfig,
+        color: Option<ConnectionColor>,
         origin: Origin,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -1534,6 +1569,7 @@ impl Workspace {
             id: id.clone(),
             name,
             config,
+            color,
             generation: 0,
             state: ProfileState::Idle,
             catalog: CatalogState::Loading,
@@ -1696,10 +1732,52 @@ impl Workspace {
             .into_any_element()
     }
 
+    /// One chip per swatch, plus the no-colour option the row opens on. The
+    /// colour only ever labels a connection, so nothing here can make the form
+    /// invalid and nothing has to move focus.
+    fn color_chip(&self, color: Option<ConnectionColor>, cx: &mut Context<Self>) -> AnyElement {
+        let t = *theme(cx);
+        let selected = self.form.as_ref().is_some_and(|form| form.color == color);
+        div()
+            .id(color.map_or("none", ConnectionColor::slug))
+            .flex()
+            .items_center()
+            .gap(px(layout::SPACE_XS))
+            .h(px(24.))
+            .px(px(layout::SPACE_SM))
+            .rounded(px(layout::RADIUS_CONTROL))
+            .text_size(px(layout::TEXT_SM))
+            .whitespace_nowrap()
+            .map(|chip| {
+                if selected {
+                    chip.bg(t.element_active).text_color(t.text)
+                } else {
+                    chip.text_color(t.text_muted)
+                        .hover(|style| style.bg(t.element_hover))
+                }
+            })
+            .children(color.map(|color| {
+                div()
+                    .size(px(layout::SPACE_SM))
+                    .rounded_full()
+                    .bg(color.swatch())
+            }))
+            .child(color.map_or("None", ConnectionColor::label))
+            .on_click(cx.listener(move |workspace, _, _, cx| {
+                if let Some(form) = &mut workspace.form {
+                    form.color = color;
+                    cx.notify();
+                }
+            }))
+            .into_any_element()
+    }
+
     fn connect(&mut self, _: &ClickEvent, window: &mut Window, cx: &mut Context<Self>) {
         let Some(form) = &self.form else {
             return;
         };
+        let color = form.color;
+        let editing = form.editing.clone();
         let (name, config) = match form.config(cx) {
             Ok(profile) => profile,
             Err(error) => {
@@ -1712,8 +1790,59 @@ impl Workspace {
         };
 
         self.form = None;
-        let index = self.create_profile(name, config, Origin::Form, window, cx);
-        self.activate(index, cx);
+        match editing {
+            Some(id) => self.save_profile(&id, name, config, color, cx),
+            None => {
+                let index = self.create_profile(name, config, color, Origin::Form, window, cx);
+                self.activate(index, cx);
+            }
+        }
+    }
+
+    fn save_profile(
+        &mut self,
+        id: &str,
+        name: String,
+        config: ConnectionConfig,
+        color: Option<ConnectionColor>,
+        cx: &mut Context<Self>,
+    ) {
+        // Removed from the switcher while the form sat open: there is nothing
+        // left to save onto, and the id is the only handle the form kept.
+        let Some(index) = self.profiles.iter().position(|profile| profile.id == id) else {
+            cx.notify();
+            return;
+        };
+
+        let password = password_to_persist(&config, Origin::Form).map(str::to_string);
+        let profile = &mut self.profiles[index];
+        let reconnect = profile.config.needs_reconnect(&config);
+        profile.name = name;
+        profile.color = color;
+        profile.config = config;
+
+        // Only what was typed. A blank field is not an instruction to forget the
+        // stored password.
+        if let Some(password) = password
+            && let Err(message) = store::set_password(id, &password)
+        {
+            self.note(message, cx);
+        }
+        self.remember_profiles(cx);
+
+        if reconnect {
+            // The rows on an object tab are the old database's. Their statement
+            // is Slate's own, so it re-runs the moment the tab is looked at
+            // again -- a query tab holds SQL the user wrote and is theirs to
+            // re-run.
+            for tab in &mut self.profiles[index].session.objects {
+                if let ObjectBody::Relation { stale, .. } = &mut tab.body {
+                    *stale = true;
+                }
+            }
+            self.begin_connect(index, cx);
+        }
+        cx.notify();
     }
 
     fn open_connection_form(
@@ -3995,6 +4124,7 @@ impl Workspace {
             .as_ref()
             .expect("form is rendered only while open");
         let message = form.error.clone();
+        let editing = form.editing.is_some();
         let hairline = || div().h(px(1.)).flex_1().bg(t.border);
 
         div()
@@ -4042,13 +4172,21 @@ impl Workspace {
                                         div()
                                             .text_size(px(layout::TEXT_LG))
                                             .font_weight(FontWeight::SEMIBOLD)
-                                            .child("Connect to a database"),
+                                            .child(if editing {
+                                                "Edit connection"
+                                            } else {
+                                                "Connect to a database"
+                                            }),
                                     )
                                     .child(
                                         div()
                                             .text_size(px(layout::TEXT_SM))
                                             .text_color(t.text_muted)
-                                            .child("Paste a URL, or fill in the fields."),
+                                            .child(if editing {
+                                                "Change where this connection points."
+                                            } else {
+                                                "Paste a URL, or fill in the fields."
+                                            }),
                                     ),
                             ),
                     )
@@ -4120,6 +4258,30 @@ impl Workspace {
                             .child(hairline()),
                     )
                     .child(self.form_field("Display name", &form.name, cx))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(layout::SPACE_XS))
+                            .child(
+                                div()
+                                    .text_size(px(layout::TEXT_SM))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(t.text_muted)
+                                    .child("Color"),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_wrap()
+                                    .gap(px(layout::SPACE_XS))
+                                    .child(self.color_chip(None, cx))
+                                    .children(
+                                        ConnectionColor::ALL
+                                            .map(|color| self.color_chip(Some(color), cx)),
+                                    ),
+                            ),
+                    )
                     // An engine that is a file has no host, no credentials and
                     // no transport, so those fields are absent rather than
                     // present and inert. A disabled field still reads as
@@ -4201,7 +4363,7 @@ impl Workspace {
                             // `escape` is the other way out, and on the first
                             // launch there is nowhere to back out to: the form
                             // is the whole application until a profile exists.
-                            .children((!self.profiles.is_empty()).then(|| {
+                            .children((editing || !self.profiles.is_empty()).then(|| {
                                 button("cancel", "Cancel", Tone::Quiet, Control::Standard, t)
                                     .flex_1()
                                     .on_click(cx.listener(|workspace, _, window, cx| {
@@ -4209,9 +4371,15 @@ impl Workspace {
                                     }))
                             }))
                             .child(
-                                button("connect", "Connect", Tone::Primary, Control::Standard, t)
-                                    .flex_1()
-                                    .on_click(cx.listener(Self::connect)),
+                                button(
+                                    "connect",
+                                    if editing { "Save" } else { "Connect" },
+                                    Tone::Primary,
+                                    Control::Standard,
+                                    t,
+                                )
+                                .flex_1()
+                                .on_click(cx.listener(Self::connect)),
                             ),
                     ),
             )
@@ -4551,6 +4719,7 @@ impl Workspace {
                 .enumerate()
                 .map(|(index, profile)| {
                     let activate_workspace = workspace.clone();
+                    let edit_workspace = workspace.clone();
                     let remove_workspace = workspace.clone();
                     let pending = self.pending_removal.as_deref() == Some(&profile.id);
                     let active = index == self.active;
@@ -4565,7 +4734,7 @@ impl Workspace {
                         .px(px(layout::SPACE_SM))
                         .rounded(px(layout::RADIUS_CONTROL))
                         .hover(|style| style.bg(t.element_hover))
-                        .child(row_icon(t, icon::DATABASE))
+                        .child(row_icon_tinted(t, icon::DATABASE, profile.color))
                         .child(
                             div()
                                 .flex_1()
@@ -4577,13 +4746,46 @@ impl Workspace {
                         )
                         .child(
                             div()
-                                .when(!pending, |remove| {
-                                    remove
+                                .flex()
+                                .items_center()
+                                .gap(px(layout::SPACE_XS))
+                                .when(!pending, |actions| {
+                                    actions
                                         .opacity(0.)
                                         .group_hover(format!("profile-row-{index}"), |style| {
                                             style.opacity(1.)
                                         })
                                 })
+                                .child(
+                                    icon_button(
+                                        ("edit-profile", index),
+                                        icon::RENAME,
+                                        Tone::Quiet,
+                                        Control::Inline,
+                                        t,
+                                    )
+                                    .tooltip("Edit connection")
+                                    .on_click(
+                                        move |_, window, cx| {
+                                            // The row activates on click, and
+                                            // activating clears `form` — so
+                                            // without this the form opens and
+                                            // is thrown away in the same click.
+                                            cx.stop_propagation();
+                                            _ = edit_workspace.update(cx, |workspace, cx| {
+                                                let Some(profile) = workspace.profiles.get(index)
+                                                else {
+                                                    return;
+                                                };
+                                                let form =
+                                                    ConnectionForm::editing(profile, window, cx);
+                                                workspace.form = Some(form);
+                                                workspace.switcher_open = false;
+                                                cx.notify();
+                                            });
+                                        },
+                                    ),
+                                )
                                 .child(
                                     // Armed, it says the word and takes the
                                     // danger fill: the icon alone asks, the
@@ -4693,6 +4895,7 @@ impl Workspace {
             .profile()
             .map(|profile| profile.name.clone())
             .unwrap_or_else(|| "Connections".into());
+        let active_color = self.profile().and_then(|profile| profile.color);
         let toggle_workspace = workspace.clone();
 
         div()
@@ -4712,7 +4915,7 @@ impl Workspace {
                     .gap(px(layout::SPACE_SM))
                     .px(px(layout::SPACE_MD))
                     .hover(|style| style.bg(t.element_hover))
-                    .child(row_icon(t, icon::DATABASE))
+                    .child(row_icon_tinted(t, icon::DATABASE, active_color))
                     .child(
                         div()
                             .flex_1()
@@ -4982,7 +5185,7 @@ impl Render for Workspace {
                 .on_action(cx.listener(Self::previous_profile))
                 // Without a titlebar of its own the form has no drag handle at
                 // all, since the platform's is transparent.
-                .child(titlebar(t, None, None))
+                .child(titlebar(t, None, None, None))
                 .child(
                     div()
                         .flex_1()
@@ -5000,9 +5203,11 @@ impl Render for Workspace {
                 format!("Connecting to {}…", profile.config.endpoint()),
                 t.text_muted,
             ),
+            // Connected is the one state worth spending on decoration: every
+            // other one is news, and news beats which connection this is.
             ProfileState::Connected(_) => (
                 format!("{} · {}", profile.name, profile.config.endpoint()),
-                t.success,
+                profile.color.map_or(t.success, ConnectionColor::swatch),
             ),
             ProfileState::Failed(message) => (message.clone(), t.danger),
         };
@@ -5114,6 +5319,7 @@ impl Render for Workspace {
             .child(titlebar(
                 t,
                 Some(profile.name.clone()),
+                profile.color,
                 Some(
                     icon_button(
                         "toggle-sidebar",
@@ -5478,9 +5684,19 @@ fn write_grids(profile: &Profile, cx: &App) {
 /// One column of icons down the sidebar, so every label starts at the same x
 /// whether its row is a folder or an object.
 fn row_icon(t: Theme, path: &'static str) -> impl IntoElement {
+    row_icon_tinted(t, path, None)
+}
+
+/// `row_icon`, in a connection's own colour. Without one it is `row_icon`
+/// exactly, so an uncoloured connection is drawn the way it always was.
+fn row_icon_tinted(
+    t: Theme,
+    path: &'static str,
+    color: Option<ConnectionColor>,
+) -> impl IntoElement {
     icon(path)
         .size(px(layout::ICON_SIZE))
-        .text_color(t.text_faint)
+        .text_color(color.map_or(t.text_faint, ConnectionColor::swatch))
 }
 
 /// Slate's own titlebar, drawn where the platform's would be.
@@ -5491,7 +5707,12 @@ fn row_icon(t: Theme, path: &'static str) -> impl IntoElement {
 /// is why the drag region is a child covering what is left of the row rather
 /// than the row itself: a drag region swallows the clicks a button needs, so
 /// anything interactive goes in `leading`, outside it.
-fn titlebar(t: Theme, subtitle: Option<String>, leading: Option<AnyElement>) -> impl IntoElement {
+fn titlebar(
+    t: Theme,
+    subtitle: Option<String>,
+    color: Option<ConnectionColor>,
+    leading: Option<AnyElement>,
+) -> impl IntoElement {
     div()
         .h(px(layout::TITLEBAR_HEIGHT))
         .w_full()
@@ -5512,7 +5733,6 @@ fn titlebar(t: Theme, subtitle: Option<String>, leading: Option<AnyElement>) -> 
                 .flex()
                 .items_center()
                 .gap(px(layout::SPACE_SM))
-                .child(div().font_weight(FontWeight::SEMIBOLD).child("Slate"))
                 .children(subtitle.map(|subtitle| {
                     div()
                         .flex()
@@ -5520,8 +5740,22 @@ fn titlebar(t: Theme, subtitle: Option<String>, leading: Option<AnyElement>) -> 
                         .gap(px(layout::SPACE_XS))
                         .text_size(px(layout::TEXT_SM))
                         .text_color(t.text_faint)
-                        .child(row_icon(t, icon::DATABASE))
+                        .child(row_icon_tinted(t, icon::DATABASE, color))
                         .child(subtitle)
+                        // With a colour the name is the one thing in the
+                        // titlebar wearing it, so it stops being a subtitle and
+                        // becomes the label of a pill filled with its own hue.
+                        // The fill and the icon carry the colour; the text does
+                        // not, because the same hue at text size on a tint of
+                        // itself is the one arrangement nobody can read.
+                        .when_some(color, |pill, color| {
+                            pill.px(px(layout::SPACE_SM))
+                                .py(px(layout::SPACE_XS))
+                                .rounded(px(layout::RADIUS_CONTROL))
+                                .bg(color.fill())
+                                .text_color(t.text)
+                                .font_weight(FontWeight::MEDIUM)
+                        })
                 })),
         )
 }

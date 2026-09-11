@@ -308,6 +308,25 @@ impl ConnectionConfig {
         }
     }
 
+    /// Whether replacing `self` with `edited` has to be reconnected for.
+    ///
+    /// A blank password in `edited` is not a change: the edit form never shows
+    /// what the Keychain holds, so blank there means "leave it alone" -- taken
+    /// literally it would drop and reopen the connection every time a colour
+    /// was saved. A password that was typed does count, since applying it is
+    /// the only reason to type one.
+    pub fn needs_reconnect(&self, edited: &Self) -> bool {
+        let mut current = self.clone();
+        if let Some(server) = current.server_mut()
+            && edited
+                .server()
+                .is_some_and(|server| server.password.is_empty())
+        {
+            server.password.clear();
+        }
+        current != *edited
+    }
+
     /// What was being talked to, for an error or a title to name.
     pub fn endpoint(&self) -> String {
         match self {
@@ -795,6 +814,38 @@ mod tests {
             .endpoint(),
             "db.example.test"
         );
+    }
+
+    #[test]
+    fn an_edit_reconnects_for_a_new_destination_but_not_for_a_blank_password() {
+        let stored = ConnectionConfig::Postgres(ServerConfig {
+            host: "db.example.test".into(),
+            port: Some(5432),
+            database: "slate".into(),
+            user: "someone".into(),
+            password: "secret".into(),
+            ..ServerConfig::default()
+        });
+        let edited = |change: fn(&mut ServerConfig)| {
+            let mut server = stored.server().unwrap().clone();
+            // What the form hands back: it never fills the password in.
+            server.password.clear();
+            change(&mut server);
+            ConnectionConfig::Postgres(server)
+        };
+
+        assert!(!stored.needs_reconnect(&stored.clone()));
+        assert!(!stored.needs_reconnect(&edited(|_| {})));
+        assert!(stored.needs_reconnect(&edited(|server| server.host = "elsewhere".into())));
+        assert!(stored.needs_reconnect(&edited(|server| server.port = Some(6432))));
+        assert!(stored.needs_reconnect(&edited(|server| server.database = "other".into())));
+        assert!(stored.needs_reconnect(&edited(|server| server.user = "someone_else".into())));
+        assert!(stored.needs_reconnect(&edited(|server| server.password = "typed".into())));
+        assert!(stored.needs_reconnect(&ConnectionConfig::MySql(stored.server().unwrap().clone())));
+        assert!(stored.needs_reconnect(&ConnectionConfig::Sqlite {
+            path: "/tmp/slate.db".into(),
+            statement_timeout: 0
+        }));
     }
 
     #[test]

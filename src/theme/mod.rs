@@ -272,6 +272,89 @@ const TRANSPARENT: Rgba = Rgba {
     a: 0.0,
 };
 
+// ponytail: one palette for every theme. `Theme` carries semantic tokens, so
+// there are no seven hues in it to reuse, and all seven sit at the same mid
+// lightness to clear 3:1 on the lightest and the darkest plane alike. Per-theme
+// swatches if a hue turns out to read badly in one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectionColor {
+    Gray,
+    Red,
+    Orange,
+    Yellow,
+    Green,
+    Blue,
+    Purple,
+}
+
+impl ConnectionColor {
+    pub const ALL: [ConnectionColor; 7] = [
+        Self::Gray,
+        Self::Red,
+        Self::Orange,
+        Self::Yellow,
+        Self::Green,
+        Self::Blue,
+        Self::Purple,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Gray => "Gray",
+            Self::Red => "Red",
+            Self::Orange => "Orange",
+            Self::Yellow => "Yellow",
+            Self::Green => "Green",
+            Self::Blue => "Blue",
+            Self::Purple => "Purple",
+        }
+    }
+
+    pub fn slug(self) -> &'static str {
+        match self {
+            Self::Gray => "gray",
+            Self::Red => "red",
+            Self::Orange => "orange",
+            Self::Yellow => "yellow",
+            Self::Green => "green",
+            Self::Blue => "blue",
+            Self::Purple => "purple",
+        }
+    }
+
+    pub fn from_slug(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|color| color.slug() == s)
+    }
+
+    pub fn swatch(self) -> Srgb {
+        let (chroma, hue) = match self {
+            Self::Gray => (0.012, 265.0),
+            Self::Red => (0.190, 25.0),
+            Self::Orange => (0.150, 55.0),
+            Self::Yellow => (0.130, 90.0),
+            Self::Green => (0.150, 145.0),
+            Self::Blue => (0.140, 250.0),
+            Self::Purple => (0.170, 305.0),
+        };
+        Oklch::new(SWATCH_LIGHTNESS, chroma, hue).to_srgb()
+    }
+
+    /// The swatch as something to put text on: a tint of the hue, not a block
+    /// of it. The label keeps the normal text token over this rather than the
+    /// hue, so the fill has to stay weak enough to read as chrome the colour
+    /// leaked into — see `a_coloured_pill_is_visible_and_legible_in_every_theme`.
+    pub fn fill(self) -> Rgba {
+        self.swatch().alpha(PILL_ALPHA)
+    }
+}
+
+const SWATCH_LIGHTNESS: f32 = 0.65;
+
+/// Set from the light theme, where chrome is near-white and a tint over it is
+/// at its weakest: 0.22 is the lowest that still steps the pill clear of the
+/// 8-level floor a plane has to clear to be seen at all.
+const PILL_ALPHA: f32 = 0.22;
+
 /// Every colour Slate paints. Flat fields, not nested groups — a token you have
 /// to go looking for gets duplicated instead of reused.
 ///
@@ -806,6 +889,32 @@ mod tests {
                 t.edited.flatten(t.bg),
                 AAA_TEXT,
             );
+        }
+    }
+
+    #[test]
+    fn a_coloured_pill_is_visible_and_legible_in_every_theme() {
+        // The titlebar's connection name, filled with the connection's own
+        // hue. Two things have to hold at once and they pull opposite ways: the
+        // fill has to be seen against chrome, and the label on it has to stay
+        // body-legible. Levels for the fill, for the reason in
+        // `the_three_planes_are_told_apart_at_a_glance`; glass is graded
+        // against its raw tint, since the pill and the chrome under it sit on
+        // the same frost and the wallpaper cancels out.
+        let level = |c: Srgb| (c.r + c.g + c.b) / 3.0 * 255.0;
+        for t in Theme::all() {
+            for color in ConnectionColor::ALL {
+                let fill = color.fill().flatten(t.surface);
+                let step = (level(fill) - level(t.surface)).abs();
+                assert!(
+                    step >= 8.0,
+                    "{} {}: the pill steps {step:.1} levels off chrome, which \
+                     is not a fill anyone will notice",
+                    t.name,
+                    color.label()
+                );
+                check(t, "the pill's label", t.text, fill, AAA_TEXT);
+            }
         }
     }
 

@@ -75,6 +75,11 @@ pub struct StoredProfile {
     /// the loader falls back to the derived value for one.
     #[serde(default)]
     pub next_query_id: Option<u64>,
+    /// `theme::ConnectionColor::slug()`. Absent is a profile written before a
+    /// connection could carry one, and reads back as no colour -- which is
+    /// exactly how it has always been drawn.
+    #[serde(default)]
+    pub color: Option<String>,
     /// The name of the one query buffer a profile had, before a profile could
     /// have several. Read only: nothing writes it any more, and it is kept
     /// because every profile on disk today carries its open query here and
@@ -696,6 +701,7 @@ fn secure(path: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::theme::ConnectionColor;
 
     /// `HOME` is process-wide and the tests run in threads, so the ones that
     /// touch the disk take turns and each gets its own directory to be the
@@ -746,6 +752,7 @@ mod tests {
             editor_font_size: Some(16.0),
             statement_timeout: Some(30),
             next_query_id: Some(7),
+            color: None,
             open_query: Some("daily".into()),
             open_queries: Vec::new(),
             open_objects: vec![
@@ -807,8 +814,64 @@ open_objects = []
         assert_eq!(profile.editor_font_size, None);
         assert_eq!(profile.root_certificate, None);
         assert_eq!(profile.open_query, None);
+        assert_eq!(profile.color, None);
         // No limit, which is what it was running with.
         assert_eq!(profile.statement_timeout, None);
+    }
+
+    #[test]
+    fn a_colour_survives_the_round_trip_through_toml() {
+        // The colour is a scalar and the object list is a table, so a colour
+        // declared after the lists encodes fine and then fails to decode.
+        let profile = StoredProfile {
+            id: "dev".into(),
+            name: "Dev".into(),
+            host: "127.0.0.1".into(),
+            port: Some(5432),
+            database: "slate_dev".into(),
+            user: "slate".into(),
+            sslmode: None,
+            root_certificate: None,
+            engine: Some("postgres".into()),
+            path: None,
+            editor_font_size: None,
+            statement_timeout: None,
+            next_query_id: Some(0),
+            color: Some(ConnectionColor::Purple.slug().to_string()),
+            open_query: None,
+            open_queries: Vec::new(),
+            open_objects: vec![StoredObject {
+                schema: "public".into(),
+                name: "accounts".into(),
+                routine: false,
+                kind: RelationKind::Table,
+                active: true,
+            }],
+        };
+        let file = ProfileFile {
+            fonts: None,
+            active: None,
+            settings: None,
+            profiles: vec![profile.clone()],
+        };
+
+        let text = toml::to_string_pretty(&file).expect("profiles must encode");
+        let decoded: ProfileFile = toml::from_str(&text).expect("profiles must decode");
+
+        assert_eq!(decoded.profiles, vec![profile]);
+    }
+
+    #[test]
+    fn every_colour_survives_its_slug() {
+        for colour in ConnectionColor::ALL {
+            assert_eq!(ConnectionColor::from_slug(colour.slug()), Some(colour));
+        }
+    }
+
+    #[test]
+    fn a_slug_slate_cannot_read_is_no_colour() {
+        assert_eq!(ConnectionColor::from_slug("chartreuse"), None);
+        assert_eq!(ConnectionColor::from_slug(""), None);
     }
 
     #[test]
@@ -830,6 +893,7 @@ open_objects = []
             editor_font_size: Some(14.0),
             statement_timeout: None,
             next_query_id: Some(7),
+            color: None,
             open_query: None,
             open_queries: Vec::new(),
             open_objects: vec![StoredObject {
@@ -930,6 +994,7 @@ open_objects = []
             editor_font_size: None,
             statement_timeout: Some(30),
             next_query_id: Some(7),
+            color: None,
             open_query: None,
             open_queries: Vec::new(),
             open_objects: vec![StoredObject {
@@ -1006,6 +1071,7 @@ open_objects = []
                     editor_font_size: None,
                     statement_timeout: Some(30),
                     next_query_id: Some(2),
+                    color: None,
                     open_query: None,
                     open_queries: Vec::new(),
                     open_objects: Vec::new(),
@@ -1024,6 +1090,7 @@ open_objects = []
                     editor_font_size: None,
                     statement_timeout: None,
                     next_query_id: None,
+                    color: None,
                     open_query: None,
                     open_queries: Vec::new(),
                     open_objects: Vec::new(),
@@ -1242,6 +1309,7 @@ open_objects = []
             editor_font_size: Some(15.0),
             statement_timeout: Some(30),
             next_query_id: Some(7),
+            color: None,
             open_query: Some("daily".into()),
             open_queries: vec![
                 StoredQueryTab {
