@@ -72,6 +72,8 @@ pub enum Command {
     /// these two rows are one code path — see `export::Format::for_path`.
     ExportResults(Format),
     SwitchProfile(usize),
+    NextProfile,
+    PreviousProfile,
     NewConnection,
     CycleTheme,
     /// Put the palette back up over the font list for this slot, the way
@@ -475,11 +477,26 @@ fn command_items(workspace: &Workspace, profile: &Profile, cx: &App) -> Vec<Item
             .filter(|(index, _)| *index != workspace.active)
             .map(|(index, other)| Item {
                 label: format!("Switch to {}", other.name),
-                hint: "⌃⇥".into(),
+                hint: "".into(),
                 icon: icon::DATABASE,
                 command: Command::SwitchProfile(index),
             }),
     );
+
+    if workspace.profiles.len() > 1 {
+        items.push(Item::command(
+            "Next connection",
+            "⌃`",
+            icon::DATABASE,
+            Command::NextProfile,
+        ));
+        items.push(Item::command(
+            "Previous connection",
+            "⌃⇧`",
+            icon::DATABASE,
+            Command::PreviousProfile,
+        ));
+    }
 
     items.push(Item::command(
         "New connection",

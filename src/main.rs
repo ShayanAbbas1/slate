@@ -77,6 +77,8 @@ actions!(
         NewQuery,
         NextProfile,
         PreviousProfile,
+        NextTab,
+        PreviousTab,
         NewConnection,
         ZoomEditorIn,
         ZoomEditorOut,
@@ -2132,6 +2134,36 @@ impl Workspace {
         self.cycle_profile(-1, cx);
     }
 
+    fn cycle_tab(&mut self, step: isize, cx: &mut Context<Self>) {
+        let Some(session) = self.profile().map(|profile| &profile.session) else {
+            return;
+        };
+        // The chip row draws every query tab before every object tab, so
+        // cycling walks them in that order.
+        let tabs: Vec<Tab> = session
+            .queries
+            .iter()
+            .map(|tab| Tab::Query(tab.id))
+            .chain(session.objects.iter().map(|tab| Tab::Object(tab.id)))
+            .collect();
+        if tabs.len() < 2 {
+            return;
+        }
+        let Some(index) = tabs.iter().position(|tab| *tab == session.active) else {
+            return;
+        };
+        let next = tabs[(index as isize + step).rem_euclid(tabs.len() as isize) as usize];
+        self.activate_tab(next, cx);
+    }
+
+    fn next_tab(&mut self, _: &NextTab, _: &mut Window, cx: &mut Context<Self>) {
+        self.cycle_tab(1, cx);
+    }
+
+    fn previous_tab(&mut self, _: &PreviousTab, _: &mut Window, cx: &mut Context<Self>) {
+        self.cycle_tab(-1, cx);
+    }
+
     fn remove_profile(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         let Some(profile) = self.profiles.get(index) else {
             return;
@@ -2975,6 +3007,8 @@ impl Workspace {
             Command::DiscardEdits => self.discard_edits(&DiscardEdits, window, cx),
             Command::ExportResults(format) => self.export_results(format, cx),
             Command::SwitchProfile(index) => self.activate(index, cx),
+            Command::NextProfile => self.cycle_profile(1, cx),
+            Command::PreviousProfile => self.cycle_profile(-1, cx),
             Command::NewConnection => self.open_connection_form(&NewConnection, window, cx),
             Command::CycleTheme => self.cycle_theme(&CycleTheme, window, cx),
             Command::PickFont(slot) => self.open_palette(PaletteMode::Font(slot), window, cx),
@@ -5295,6 +5329,8 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::new_query))
             .on_action(cx.listener(Self::next_profile))
             .on_action(cx.listener(Self::previous_profile))
+            .on_action(cx.listener(Self::next_tab))
+            .on_action(cx.listener(Self::previous_tab))
             .on_action(cx.listener(Self::open_connection_form))
             .on_action(cx.listener(Self::zoom_editor_in))
             .on_action(cx.listener(Self::zoom_editor_out))
@@ -6253,8 +6289,10 @@ fn main() {
             KeyBinding::new("cmd-t", NewQuery, None),
             KeyBinding::new("cmd-shift-n", NewConnection, None),
             KeyBinding::new("cmd-w", CloseTab, None),
-            KeyBinding::new("ctrl-tab", NextProfile, None),
-            KeyBinding::new("ctrl-shift-tab", PreviousProfile, None),
+            KeyBinding::new("ctrl-tab", NextTab, None),
+            KeyBinding::new("ctrl-shift-tab", PreviousTab, None),
+            KeyBinding::new("ctrl-`", NextProfile, None),
+            KeyBinding::new("ctrl-shift-`", PreviousProfile, None),
             KeyBinding::new("escape", ShowEditor, None),
             KeyBinding::new("cmd-shift-t", CycleTheme, None),
             KeyBinding::new("cmd-,", OpenSettings, None),
