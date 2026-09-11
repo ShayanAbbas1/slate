@@ -18,8 +18,8 @@ use gpui::{
     Action, AnyElement, App, AppContext, Application, ClickEvent, ClipboardItem, Context, Entity,
     EntityInputHandler, FocusHandle, Focusable, FontWeight, InteractiveElement, IntoElement,
     KeyBinding, Keystroke, Menu, MenuItem, ParentElement, Render, StatefulInteractiveElement,
-    Styled, TitlebarOptions, Window, WindowOptions, actions, div, point, prelude::FluentBuilder,
-    px,
+    Styled, TitlebarOptions, Window, WindowOptions, actions, deferred, div, point,
+    prelude::FluentBuilder, px,
 };
 use gpui_component::{
     Disableable, IndexPath, InteractiveElementExt, Root,
@@ -4544,6 +4544,7 @@ impl Workspace {
         let workspace = cx.entity().downgrade();
         let panel = self.switcher_open.then(|| {
             let add_workspace = workspace.clone();
+            let dismiss_workspace = workspace.clone();
             let profile_rows = self
                 .profiles
                 .iter()
@@ -4605,6 +4606,10 @@ impl Workspace {
                                     .tooltip("Remove connection")
                                     .on_click(
                                         move |_, window, cx| {
+                                            // Likewise: activating clears
+                                            // `pending_removal`, so the first
+                                            // click would never leave it armed.
+                                            cx.stop_propagation();
                                             _ = remove_workspace.update(cx, |workspace, cx| {
                                                 workspace.remove_profile(index, window, cx);
                                             });
@@ -4630,6 +4635,18 @@ impl Workspace {
 
             div()
                 .absolute()
+                .occlude()
+                .on_mouse_down_out(move |_, _, cx| {
+                    _ = dismiss_workspace.update(cx, |workspace, cx| {
+                        workspace.switcher_open = false;
+                        cx.notify();
+                    });
+                    // `occlude` only covers what the panel is drawn over. The
+                    // press that dismisses lands everywhere else, so swallow it
+                    // rather than let it open a table in the tree on the way
+                    // out.
+                    cx.stop_propagation();
+                })
                 .bottom(px(layout::SWITCHER_HEIGHT + layout::SPACE_XS))
                 .left(px(layout::SPACE_SM))
                 .right(px(layout::SPACE_SM))
@@ -4681,7 +4698,11 @@ impl Workspace {
         div()
             .relative()
             .flex_shrink_0()
-            .children(panel)
+            // An overlay is not a layer to gpui: it hit-tests every hitbox the
+            // cursor lands in, in tree order, so the explorer under this panel
+            // answers the same click. `deferred` puts the panel in front,
+            // `occlude` stops what is behind it from answering at all.
+            .children(panel.map(deferred))
             .child(
                 div()
                     .id("profile-switcher")
@@ -4703,12 +4724,19 @@ impl Workspace {
                             .child(active_name),
                     )
                     .child(row_icon(t, icon::SWITCHER))
-                    .on_click(move |_, _, cx| {
-                        _ = toggle_workspace.update(cx, |workspace, cx| {
-                            workspace.switcher_open = !workspace.switcher_open;
-                            workspace.pending_removal = None;
-                            cx.notify();
-                        });
+                    // While the panel is open its `on_mouse_down_out` already
+                    // owns closing, and it fires on the press. Carrying a click
+                    // handler here too would reopen on the release, so the open
+                    // panel leaves the trigger without one: no handler, no
+                    // click recorded, no reopen.
+                    .when(!self.switcher_open, |trigger| {
+                        trigger.on_click(move |_, _, cx| {
+                            _ = toggle_workspace.update(cx, |workspace, cx| {
+                                workspace.switcher_open = true;
+                                workspace.pending_removal = None;
+                                cx.notify();
+                            });
+                        })
                     }),
             )
             .into_any_element()
