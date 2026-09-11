@@ -1,8 +1,18 @@
 # AGENTS.md
 
-Slate is a native macOS SQL client in Rust on GPUI, speaking Postgres, MySQL
-and SQLite. A SQL editor that shows results — not a database browser with an editor
-bolted on.
+Slate is a native macOS database client in Rust on GPUI, speaking Postgres,
+MySQL and SQLite. A data browser and a SQL editor as equals: open a table and
+browse it — page, sort, filter, edit — or write the statement yourself.
+
+This replaces the earlier "SQL editor that shows results, not a database
+browser" framing, and supersedes the spec wherever the spec leans on it:
+browsing surfaces are first-class, not an editor accessory. The split that
+survives the change is between *whose SQL it is*. An editor buffer is the
+user's and is never touched uninvited; a browsing surface (an object tab's
+preview) runs SQL Slate generates, regenerated from visible controls and
+inspectable, never spliced into anyone's buffer. Planned under the new framing:
+a filter bar over previews, row insertion, `NULL` writes, row deletion by
+primary key, foreign-key navigation.
 
 **Read this file before doing anything.** It is the source of truth for how
 Slate is built and why.
@@ -35,9 +45,13 @@ require it, stop and raise it instead.
    and the statement that runs is the statement on screen. The same will hold
    for in-place row editing.
 
-   Two limits on what Slate may write. It never writes a **destructive**
-   statement — no `DROP`, no `TRUNCATE`, no `DELETE` — whatever the user asked
-   for. And it never writes into a statement it cannot parse whole:
+   Two limits on what Slate may write. It never writes `DROP` or `TRUNCATE`,
+   whatever the user asked for; and `DELETE` only as the explicit deletion of
+   named rows — by primary key, from a direct ask on a browsing surface, with
+   the statement shown before it runs. (That deletion flow is planned, not
+   shipped: today the gate admits `UPDATE` and nothing else, and this sentence
+   is the permission to widen it — once, by that one shape.) And it never
+   writes into a statement it cannot parse whole:
    `sql::with_order_by` refuses rather than guessing at a clause boundary,
    because a corrupted statement is worse than an unsorted grid.
 
@@ -46,12 +60,12 @@ require it, stop and raise it instead.
    alters statements cannot be trusted with the statements that matter — is
    why "silently" is still the word that carries the rule.
 
-2. **No code path leads from the grid to a destructive statement.** The grid can
-   now write an `UPDATE`, and `sql::is_generated_update` is the single gate
-   every generated statement
-   passes first. It is a whitelist, so `DROP`, `TRUNCATE` and `DELETE` are
-   refused structurally rather than by name. Do not add a second path that
-   bypasses it.
+2. **One gate stands between the grid and the server.** The grid can write an
+   `UPDATE`, and `sql::is_generated_update` is the single gate every generated
+   statement passes first. It is a whitelist, so `DROP`, `TRUNCATE` and
+   `DELETE` are refused structurally rather than by name. Do not add a second
+   path that bypasses it. When row deletion ships (rule 1), it widens this
+   gate to admit a primary-key `DELETE` — it does not get a gate of its own.
 
    A cell is editable only when Slate can name its row by primary key. When it
    cannot, the grid stays read-only and says why; it never guesses at a

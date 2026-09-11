@@ -1,11 +1,11 @@
 # Slate
 
-A native macOS SQL client, speaking Postgres, MySQL and SQLite. Rust, GPUI,
-no Electron.
+A native macOS database client, speaking Postgres, MySQL and SQLite. Rust,
+GPUI, no Electron.
 
-A SQL editor that shows results — not a database browser with an editor bolted
-on. Keyboard-first, minimal, and built to stay at display refresh rate on real
-data.
+A data browser and a SQL editor as equals: open a table and page through it,
+or write the exact statement you mean. Keyboard-first, minimal, and built to
+stay at display refresh rate on real data.
 
 > **Status: early development.** Everything below under "What works" runs today.
 
@@ -78,7 +78,8 @@ rm -f dev/slate_dev.db && sqlite3 dev/slate_dev.db < dev/sqlite/001-slate-demo.s
   by itself, so a scratch buffer survives a restart without being named.
 - **Virtualized result grid** with content-fitted draggable columns and a row
   inspector showing whole values and their types. Table previews carry a
-  per-tab row limit; a query you wrote runs exactly as written, uncapped.
+  per-tab row limit and page through the relation a window at a time; a query
+  you wrote runs exactly as written, uncapped.
 - **Sorting that edits your SQL in front of you.** A header click splices an
   `ORDER BY` into the statement in the buffer — the statement that runs is the
   statement on screen, and you can edit or undo it.
@@ -135,20 +136,26 @@ around.
 
 ## Planned
 
-Notarized builds, and a Homebrew tap.
+The browsing half is still growing: a filter bar over table previews, row
+insertion from the grid, setting a cell to `NULL`, row deletion (by primary
+key, with the statement shown before it runs), and foreign-key navigation.
+Beyond that, SSH tunneling, notarized builds, and a Homebrew tap.
 
 ## Not planned
 
-Visual query builders, ER diagrams, migrations, foreign-key navigation. Slate
-assumes you write SQL.
+Visual query builders, ER diagrams, migrations. Slate assumes you can write
+SQL; it just does not make you write all of it.
 
-**Slate will never write a `DELETE`, `DROP` or `TRUNCATE`** — not on request, not
-by accident. Generated statements pass a whitelist gate that admits `UPDATE` and
-nothing else, so the guarantee is structural rather than a list of names someone
-remembered to check. On MySQL and SQLite, where each statement commits on its
-own, a multi-row edit is bracketed with `BEGIN`/`COMMIT` — written into the
-buffer where you can read it, never opened behind your back. A batch that fails
-part way is rolled back, and the error says which state the data is in.
+**Slate never writes a `DROP` or `TRUNCATE`** — not on request, not by
+accident. Generated statements pass a whitelist gate that admits `UPDATE` and
+nothing else today, so the guarantee is structural rather than a list of names
+someone remembered to check. Row deletion, when it ships, will widen that gate
+by exactly one shape — a `DELETE` of rows named by primary key, generated only
+from an explicit ask and shown before it runs, never from a predicate Slate
+guessed at. On MySQL and SQLite, where each statement commits on its own, a
+multi-row edit is bracketed with `BEGIN`/`COMMIT` — written into the buffer
+where you can read it, never opened behind your back. A batch that fails part
+way is rolled back, and the error says which state the data is in.
 
 ## License
 
