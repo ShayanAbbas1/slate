@@ -70,6 +70,9 @@ pub enum Command {
     /// the filter; it gets the user to the place they would have clicked.
     FilterRows,
     ClearFilter,
+    /// Open the "New row" form over the preview. Insertion needs no primary
+    /// key, so this is offered where the grid refuses to edit.
+    NewRow,
     CloseObject(u64),
     /// Stage a `NULL` on the active cell. The row is how the gesture stops
     /// being folklore; the editor's own affordance dispatches the same action.
@@ -474,6 +477,7 @@ fn command_items(workspace: &Workspace, profile: &Profile, cx: &App) -> Vec<Item
                         Command::ClearFilter,
                     ));
                 }
+                items.push(Item::command("New row…", "", icon::PLUS, Command::NewRow));
             }
         }
         items.push(Item::command(

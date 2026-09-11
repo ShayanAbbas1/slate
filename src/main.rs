@@ -96,6 +96,7 @@ actions!(
         NextPage,
         PreviousPage,
         ClearFilter,
+        NewRow,
         EditCell,
         CopyCell,
         SetNull,
@@ -271,14 +272,60 @@ struct Session {
     /// has no buffer to put SQL in, so the modal is where the statement is on
     /// screen — and nothing runs until Run.
     apply_review: Option<ApplyReview>,
+    /// The "New row" form a preview tab is filling in. Beside `apply_review`
+    /// because the two are halves of one flow: the form collects, the review
+    /// shows the statement it generated, and only Run sends it.
+    insert_form: Option<InsertForm>,
 }
 
-/// A generated `UPDATE` batch waiting to be read and run.
+/// A generated statement waiting to be read and run.
 struct ApplyReview {
     /// The tab the edits came from, so the modal is shown over that surface
     /// and a run cannot land in another tab's grid.
     tab: Tab,
+    /// What this panel is confirming. An `UPDATE` batch and an `INSERT` both
+    /// arrive here, and a panel calling either of them "Apply edits" would be
+    /// the confirmation lying about what it confirms.
+    title: &'static str,
     sql: String,
+}
+
+/// The row a table has not got yet, one field per column (spec §4).
+///
+/// Insertion needs a schema and a table and no primary key, so this is offered
+/// on relations the grid refuses to edit.
+struct InsertForm {
+    tab: Tab,
+    schema: String,
+    table: String,
+    fields: Vec<InsertField>,
+}
+
+struct InsertField {
+    column: String,
+    data_type: String,
+    input: Entity<InputState>,
+    /// The `NULL` chip. Wins over typed text, because the chip is the later
+    /// word.
+    nulled: bool,
+    /// Whether this field has been typed into. The reason `insert_value`
+    /// answers three ways rather than two.
+    touched: bool,
+}
+
+/// What one field contributes to the `INSERT`. The outer `None` is a column
+/// left out of the statement entirely, so the server's default applies; the
+/// inner `None` is a `NULL` the user asked for.
+///
+/// Three answers and not two: a field nobody touched and a field deliberately
+/// emptied are different intents, and collapsing them would make `''`
+/// unreachable from the form for every text column in the database.
+fn insert_value(nulled: bool, touched: bool, typed: &str) -> Option<Option<String>> {
+    match (nulled, touched) {
+        (true, _) => Some(None),
+        (false, true) => Some(Some(typed.to_string())),
+        (false, false) => None,
+    }
 }
 
 impl Session {
@@ -373,6 +420,7 @@ impl Session {
             pending_discard: None,
             notice,
             apply_review: None,
+            insert_form: None,
         }
     }
 
@@ -2809,7 +2857,8 @@ impl Workspace {
         // Whatever is in front, in the order it is stacked: the palette paints
         // over the settings modal, which paints over the discard-close
         // confirmation, which paints over the close confirmation, which paints
-        // over the apply review, which paints over the surface -- so `escape`
+        // over the new-row form, which paints over the apply review, which
+        // paints over the surface -- so `escape`
         // backs out of them in that order, one at a time. The palette stays
         // first so that picking a font from inside settings closes the font
         // list and leaves the modal it was opened from standing.
@@ -2823,6 +2872,12 @@ impl Workspace {
             return;
         }
         if self.cancel_close_tab(cx) {
+            return;
+        }
+        // Before the apply review, because the form paints over it: generating
+        // from the form is what puts a review up, so the form is the newer of
+        // the two whenever both exist.
+        if self.close_new_row(cx) {
             return;
         }
         if self.close_apply_review(cx) {
@@ -3082,6 +3137,7 @@ impl Workspace {
             Command::PreviousPage => self.turn_page(false, cx),
             Command::FilterRows => self.focus_filter(window, cx),
             Command::ClearFilter => self.clear_filter(&ClearFilter, window, cx),
+            Command::NewRow => self.new_row(&NewRow, window, cx),
             Command::CloseObject(id) => self.ask_before_close(CloseTarget::Object(id), cx),
             Command::SetNull => self.set_null(&SetNull, window, cx),
             Command::ApplyEdits => self.apply_edits(&ApplyEdits, window, cx),
@@ -3364,6 +3420,152 @@ impl Workspace {
             ObjectBody::Relation { filter_input, .. } => Some(filter_input.clone()),
             ObjectBody::Routine(_) => None,
         }
+    }
+
+    /// Open the "New row" form over the preview in front, one field per column
+    /// of the relation's loaded structure (spec §4).
+    ///
+    /// Requires a schema and a table and not a primary key, which is why this
+    /// is offered on relations the grid refuses to edit.
+    fn new_row(&mut self, _: &NewRow, window: &mut Window, cx: &mut Context<Self>) {
+        self.clear_notice();
+        let Some(profile) = self.profile() else {
+            return;
+        };
+        let Tab::Object(id) = profile.session.active else {
+            return;
+        };
+        let Some(tab) = profile.session.objects.iter().find(|tab| tab.id == id) else {
+            return;
+        };
+        let ObjectBody::Relation { structure, .. } = &tab.body else {
+            return;
+        };
+        // The columns are the form: without them there is nothing to draw, and
+        // guessing at them would be inventing a table.
+        let StructureState::Loaded(structure) = structure else {
+            self.note("Slate has not read this relation's columns yet.".into(), cx);
+            return;
+        };
+        let (schema, table) = (tab.schema.clone(), tab.name.clone());
+        let columns: Vec<(String, String)> = structure
+            .columns
+            .iter()
+            .map(|column| (column.name.clone(), column.data_type.clone()))
+            .collect();
+
+        let mut fields = Vec::with_capacity(columns.len());
+        for (index, (column, data_type)) in columns.into_iter().enumerate() {
+            let input = cx.new(|cx| InputState::new(window, cx));
+            // The first keystroke is what makes this field a value rather than
+            // an omission, so the change event is where `touched` is set.
+            cx.subscribe(&input, move |workspace, _, event: &InputEvent, _| {
+                if matches!(event, InputEvent::Change) {
+                    workspace.touch_insert_field(index);
+                }
+            })
+            .detach();
+            fields.push(InsertField {
+                column,
+                data_type,
+                input,
+                nulled: false,
+                touched: false,
+            });
+        }
+
+        if let Some(profile) = self.profile_mut() {
+            profile.session.insert_form = Some(InsertForm {
+                tab: Tab::Object(id),
+                schema,
+                table,
+                fields,
+            });
+        }
+        cx.notify();
+    }
+
+    fn touch_insert_field(&mut self, index: usize) {
+        if let Some(profile) = self.profile_mut()
+            && let Some(form) = &mut profile.session.insert_form
+            && let Some(field) = form.fields.get_mut(index)
+        {
+            field.touched = true;
+        }
+    }
+
+    fn toggle_insert_null(&mut self, index: usize, cx: &mut Context<Self>) {
+        if let Some(profile) = self.profile_mut()
+            && let Some(form) = &mut profile.session.insert_form
+            && let Some(field) = form.fields.get_mut(index)
+        {
+            field.nulled = !field.nulled;
+            cx.notify();
+        }
+    }
+
+    /// Generate the `INSERT` and show it. **Nothing runs here** — Run in the
+    /// review panel is the ask (`AGENTS.md` rule 1).
+    fn confirm_new_row(&mut self, cx: &mut Context<Self>) {
+        self.clear_notice();
+        let engine = self.engine();
+        let Some(profile) = self.profile() else {
+            return;
+        };
+        let Some(form) = &profile.session.insert_form else {
+            return;
+        };
+        let (tab, schema, table) = (form.tab, form.schema.clone(), form.table.clone());
+        let filled: Vec<(String, Option<String>)> = form
+            .fields
+            .iter()
+            .filter_map(|field| {
+                insert_value(field.nulled, field.touched, &field.input.read(cx).value())
+                    .map(|value| (field.column.clone(), value))
+            })
+            .collect();
+        let borrowed: Vec<(&str, Option<&str>)> = filled
+            .iter()
+            .map(|(column, value)| (column.as_str(), value.as_deref()))
+            .collect();
+
+        let Some(statement) = sql::insert_row(engine, &schema, &table, &borrowed) else {
+            self.note("There is nothing in this row to insert.".into(), cx);
+            return;
+        };
+        // The gate every generated statement passes before anything executes
+        // (`AGENTS.md` rule 2). Failing it is Slate disagreeing with itself --
+        // a bug in Slate rather than a user error -- so it is said and not run.
+        if !sql::is_generated_write(&statement) {
+            self.note(
+                "Slate refused to run a statement it wrote itself: it is not an INSERT.".into(),
+                cx,
+            );
+            return;
+        }
+
+        if let Some(profile) = self.profile_mut() {
+            profile.session.insert_form = None;
+            profile.session.apply_review = Some(ApplyReview {
+                tab,
+                title: "New row",
+                sql: statement,
+            });
+        }
+        cx.notify();
+    }
+
+    /// Put the form away. Nothing has been generated yet, so there is nothing
+    /// to keep.
+    fn close_new_row(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(profile) = self.profile_mut() else {
+            return false;
+        };
+        let closed = profile.session.insert_form.take().is_some();
+        if closed {
+            cx.notify();
+        }
+        closed
     }
 
     /// Move a relation's preview one page of `limit` rows through the table.
@@ -3752,7 +3954,11 @@ impl Workspace {
             Tab::Query(_) => self.apply_in_buffer(batch, window, cx),
             Tab::Object(_) => {
                 if let Some(profile) = self.profile_mut() {
-                    profile.session.apply_review = Some(ApplyReview { tab, sql: batch });
+                    profile.session.apply_review = Some(ApplyReview {
+                        tab,
+                        title: "Apply edits",
+                        sql: batch,
+                    });
                     cx.notify();
                 }
             }
@@ -4961,7 +5167,7 @@ impl Workspace {
                 .justify_center()
                 .child(
                     dialog(t)
-                        .child(section_label(t, "Apply edits"))
+                        .child(section_label(t, review.title))
                         .child(
                             div()
                                 .id("apply-review-sql")
@@ -5616,6 +5822,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::previous_page))
             .on_action(cx.listener(Self::clear_filter))
             .on_action(cx.listener(Self::filter_column))
+            .on_action(cx.listener(Self::new_row))
             .on_action(cx.listener(Self::show_editor))
             .on_action(cx.listener(Self::cycle_theme))
             .on_action(cx.listener(Self::save_query))
@@ -5755,6 +5962,7 @@ impl Render for Workspace {
                             })),
                     ),
             )
+            .children(views::render_new_row_form(self, cx))
             .children(self.render_apply_review(cx))
             .children(self.render_close_confirmation(cx))
             .children(self.render_discard_confirmation(cx))
@@ -6817,6 +7025,54 @@ mod tests {
         assert_eq!(
             filter_predicate(Engine::MySql, "path", r"a\b"),
             r"`path` = 'a\\b'"
+        );
+    }
+
+    #[test]
+    fn a_field_nobody_touched_is_left_out_so_the_servers_default_applies() {
+        // The whole design of the form in one function: absent, NULL, or a
+        // value -- and the first of those is not a value at all.
+        assert_eq!(insert_value(false, false, ""), None);
+        assert_eq!(insert_value(true, false, ""), Some(None));
+        // Typed and emptied is a value: `''` has to be reachable.
+        assert_eq!(insert_value(false, true, ""), Some(Some(String::new())));
+        assert_eq!(
+            insert_value(false, true, "42"),
+            Some(Some("42".to_string()))
+        );
+        // The chip is the later word: a field nulled after being typed into is
+        // a NULL.
+        assert_eq!(insert_value(true, true, "42"), Some(None));
+    }
+
+    #[test]
+    fn a_half_filled_form_names_only_the_columns_it_filled() {
+        // `id` untouched so the sequence fills it, `note` deliberately nulled,
+        // `bio` typed and emptied so it inserts an empty string.
+        let filled: Vec<(String, Option<String>)> = [
+            ("id", false, false, ""),
+            ("name", false, true, "Ada"),
+            ("note", true, false, ""),
+            ("bio", false, true, ""),
+        ]
+        .into_iter()
+        .filter_map(|(column, nulled, touched, typed)| {
+            insert_value(nulled, touched, typed).map(|value| (column.to_string(), value))
+        })
+        .collect();
+        let borrowed: Vec<(&str, Option<&str>)> = filled
+            .iter()
+            .map(|(column, value)| (column.as_str(), value.as_deref()))
+            .collect();
+
+        let statement = sql::insert_row(Engine::Postgres, "public", "accounts", &borrowed).unwrap();
+        assert_eq!(
+            statement,
+            r#"INSERT INTO "public"."accounts" ("name", "note", "bio") VALUES ('Ada', NULL, '')"#
+        );
+        assert!(
+            sql::is_generated_write(&statement),
+            "{statement} was refused"
         );
     }
 

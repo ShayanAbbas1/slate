@@ -21,9 +21,9 @@ use gpui_component::{
 
 use crate::{
     CancelQuery, ClearFilter, CloseTarget, Control, EDITOR_FONT_SIZE_MAX, EDITOR_FONT_SIZE_MIN,
-    NewQuery, NextPage, ObjectBody, ObjectTab, PreviousPage, Profile, QueryState, ResetEditorZoom,
-    RunQuery, SaveQuery, SetRowLimit, Settings, StructureState, Tab, Tone, Workspace, ZoomEditorIn,
-    ZoomEditorOut, button, button_label, compact_count, db,
+    NewQuery, NewRow, NextPage, ObjectBody, ObjectTab, PreviousPage, Profile, QueryState,
+    ResetEditorZoom, RunQuery, SaveQuery, SetRowLimit, Settings, StructureState, Tab, Tone,
+    Workspace, ZoomEditorIn, ZoomEditorOut, button, button_label, compact_count, db,
     db::RoutineKind,
     dialog, editor_zoom_percent,
     explorer::ROW_LIMITS,
@@ -213,6 +213,142 @@ fn render_filter_bar(filter: &str, input: &Entity<InputState>, t: Theme) -> AnyE
             })
         }))
         .into_any_element()
+}
+
+/// The "New row" form, over the preview it was opened on (spec §4).
+///
+/// The buttons are Cancel and **Review SQL**: this generates the statement and
+/// shows it, and running it is the review panel's ask, not this one's.
+pub fn render_new_row_form(
+    workspace: &Workspace,
+    cx: &mut Context<Workspace>,
+) -> Option<AnyElement> {
+    let t = *theme(cx);
+    let profile = workspace.profile()?;
+    let form = profile.session.insert_form.as_ref()?;
+    if form.tab != profile.session.active {
+        return None;
+    }
+
+    let fields: Vec<AnyElement> = form
+        .fields
+        .iter()
+        .enumerate()
+        .map(|(index, field)| {
+            let null_workspace = cx.entity().downgrade();
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(layout::SPACE_XS))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(layout::SPACE_SM))
+                        .child(div().flex_1().min_w_0().child(field.column.clone()))
+                        .child(
+                            div()
+                                .text_size(px(layout::TEXT_XS))
+                                .text_color(t.text_faint)
+                                .child(field.data_type.clone()),
+                        )
+                        .child(
+                            button(
+                                ("insert-null", index),
+                                "NULL",
+                                // Filled while it is on, because whether this
+                                // field is a NULL is the only thing the chip
+                                // has to say.
+                                if field.nulled {
+                                    Tone::Primary
+                                } else {
+                                    Tone::Quiet
+                                },
+                                Control::Inline,
+                                t,
+                            )
+                            .on_click(move |_, _, cx| {
+                                _ = null_workspace.update(cx, |workspace, cx| {
+                                    workspace.toggle_insert_null(index, cx);
+                                });
+                            }),
+                        ),
+                )
+                .child(Input::new(&field.input).small())
+                .into_any_element()
+        })
+        .collect();
+
+    let cancel_workspace = cx.entity().downgrade();
+    let review_workspace = cancel_workspace.clone();
+
+    Some(
+        div()
+            .absolute()
+            .inset_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(
+                dialog(t)
+                    .child(section_label(t, "New row"))
+                    // The one line that says what an empty field means, because
+                    // the three-way rule is invisible otherwise.
+                    .child(
+                        div()
+                            .text_size(px(layout::TEXT_SM))
+                            .text_color(t.text_faint)
+                            .child(
+                                "A field left blank is left out, so the column keeps its default.",
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id("new-row-fields")
+                            .max_h(px(320.))
+                            .overflow_y_scroll()
+                            .flex()
+                            .flex_col()
+                            .gap(px(layout::SPACE_MD))
+                            .children(fields),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .justify_end()
+                            .gap(px(layout::SPACE_SM))
+                            .child(
+                                button(
+                                    "cancel-new-row",
+                                    "Cancel",
+                                    Tone::Quiet,
+                                    Control::Standard,
+                                    t,
+                                )
+                                .on_click(move |_, _, cx| {
+                                    _ = cancel_workspace.update(cx, |workspace, cx| {
+                                        workspace.close_new_row(cx);
+                                    });
+                                }),
+                            )
+                            .child(
+                                button(
+                                    "review-new-row",
+                                    "Review SQL",
+                                    Tone::Primary,
+                                    Control::Standard,
+                                    t,
+                                )
+                                .on_click(move |_, _, cx| {
+                                    _ = review_workspace.update(cx, |workspace, cx| {
+                                        workspace.confirm_new_row(cx);
+                                    });
+                                }),
+                            ),
+                    ),
+            )
+            .into_any_element(),
+    )
 }
 
 fn render_routine(tab: &ObjectTab, cx: &mut Context<Workspace>) -> AnyElement {
@@ -1122,6 +1258,17 @@ fn render_tab_strip(
         })
     });
 
+    // Gated exactly as the pager is: a structure tab has no rows to add one to.
+    let new_row = preview.map(|_| {
+        div().flex_shrink_0().child(
+            button("new-row", "New row", Tone::Quiet, Control::Compact, t).on_click(
+                |_, window, cx| {
+                    window.dispatch_action(Box::new(NewRow), cx);
+                },
+            ),
+        )
+    });
+
     let zoom = editor_zoom_percent(editor_font_size);
     let named = on_query_tab && session.open_query().is_some();
     let new_workspace = workspace.clone();
@@ -1172,6 +1319,7 @@ fn render_tab_strip(
         .children(structure_toggle)
         .children(row_limit)
         .children(pager)
+        .children(new_row)
         // 100% is not information; the readout appears only once the zoom
         // has somewhere to return to.
         .children((runnable && zoom != 100).then(|| {

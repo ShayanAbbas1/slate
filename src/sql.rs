@@ -232,8 +232,6 @@ pub fn update_row(
 ///
 /// `None` on an empty list. The alternative is `INSERT INTO t DEFAULT VALUES`,
 /// a statement nobody has asked Slate for.
-// The "New row" form is the caller; until it lands, the tests are the only one.
-#[allow(dead_code)]
 pub fn insert_row(
     engine: Engine,
     schema: &str,
