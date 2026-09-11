@@ -753,6 +753,13 @@ enum ObjectBody {
         /// The `ORDER BY` the header clicks have built up. Slate owns this
         /// statement, so sorting regenerates it rather than editing text.
         sort: Vec<SortKey>,
+        /// The `WHERE` expression this preview narrows the relation by, without
+        /// the keyword; empty means none. The fifth control of the same kind as
+        /// the sort, the limit and the offset: a change regenerates the
+        /// statement rather than patching it. Unlike `offset`, it persists in
+        /// the tab's snapshot — a tab that forgot its filter would come back as
+        /// a different tab.
+        filter: String,
         /// How many rows this preview asks for. Every result set is capped
         /// (spec §4.3); this is the tab's own copy of the cap, so raising it
         /// for one wide table does not raise it everywhere.
@@ -2284,6 +2291,7 @@ impl Workspace {
                 results: result_grid(window, cx),
                 query: QueryState::Idle,
                 sort: Vec::new(),
+                filter: String::new(),
                 limit: preview_rows,
                 offset: 0,
                 stale: false,
@@ -2323,12 +2331,12 @@ impl Workspace {
 
         let (schema, relation) = (tab.schema.clone(), tab.name.clone());
         self.load_structure(id, schema, relation, cx);
-        self.requery_relation(id, |_, _, _| true, cx);
+        self.requery_relation(id, |_, _, _, _| true, cx);
     }
 
     /// Run a relation tab's statement again, after `change` has had its say
-    /// about the tab's sort, row limit and page offset. `false` from `change`
-    /// means nothing moved, and nothing runs.
+    /// about the tab's filter, sort, row limit and page offset. `false` from
+    /// `change` means nothing moved, and nothing runs.
     ///
     /// Every path that re-queries a relation comes through here. The statement
     /// is Slate's own, so it is regenerated from whatever the tab is now set to
@@ -2338,7 +2346,7 @@ impl Workspace {
     fn requery_relation(
         &mut self,
         id: u64,
-        change: impl FnOnce(&mut Vec<SortKey>, &mut usize, &mut usize) -> bool,
+        change: impl FnOnce(&mut String, &mut Vec<SortKey>, &mut usize, &mut usize) -> bool,
         cx: &mut Context<Self>,
     ) {
         let engine = self.engine();
@@ -2351,6 +2359,7 @@ impl Workspace {
         let (schema, relation) = (tab.schema.clone(), tab.name.clone());
         let ObjectBody::Relation {
             sort,
+            filter,
             query,
             limit,
             offset,
@@ -2360,7 +2369,7 @@ impl Workspace {
         else {
             return;
         };
-        if !change(sort, limit, offset) {
+        if !change(filter, sort, limit, offset) {
             return;
         }
 
@@ -2370,7 +2379,7 @@ impl Workspace {
         // because every later run is replacing rows the server sent and has to
         // clear them.
         let keep_rows = std::mem::take(stale);
-        let sql = relation_sql(engine, &schema, &relation, sort, *limit, *offset);
+        let sql = relation_sql(engine, &schema, &relation, filter, sort, *limit, *offset);
         // A preview only re-queries when it is asked to, and this is the ask.
         *query = QueryState::Idle;
         self.execute_and_then(sql, Tab::Object(id), None, keep_rows, cx);
@@ -2393,7 +2402,7 @@ impl Workspace {
         };
         self.requery_relation(
             id,
-            move |sort, _, offset| {
+            move |_, sort, _, offset| {
                 cycle(sort, &expression);
                 // A new ordering makes the old window meaningless: page five of
                 // one sort is not page five of another.
@@ -3156,7 +3165,7 @@ impl Workspace {
     /// the only way to ask for a newer one.
     fn refresh_relation(&mut self, id: u64, cx: &mut Context<Self>) {
         self.clear_notice();
-        self.requery_relation(id, |_, _, _| true, cx);
+        self.requery_relation(id, |_, _, _, _| true, cx);
     }
 
     /// Ask a relation's preview for a different number of rows.
@@ -3172,7 +3181,7 @@ impl Workspace {
         };
         self.requery_relation(
             id,
-            move |_, limit, offset| {
+            move |_, _, limit, offset| {
                 let moved = *limit != rows;
                 *limit = rows;
                 if moved {
@@ -3229,7 +3238,7 @@ impl Workspace {
         }
         self.requery_relation(
             id,
-            move |_, limit, offset| {
+            move |_, _, limit, offset| {
                 match forward {
                     true => *offset += *limit,
                     false => *offset = offset.saturating_sub(*limit),
@@ -5552,18 +5561,19 @@ impl Render for Workspace {
 /// into partitions, an eye for the kinds that are a saved query over a table, a
 /// disk for the one that stores its answer, and a globe for the one that lives
 /// on another server entirely.
-/// Slate's statement for a relation's tab, carrying the sort the headers asked
-/// for. Regenerated rather than edited, so the row limit and the quoting stay
-/// in one place.
+/// Slate's statement for a relation's tab, carrying the filter and the sort the
+/// controls asked for. Regenerated rather than edited, so the row limit and the
+/// quoting stay in one place.
 fn relation_sql(
     engine: Engine,
     schema: &str,
     relation: &str,
+    filter: &str,
     sort: &[SortKey],
     limit: usize,
     offset: usize,
 ) -> String {
-    let preview = preview_sql(engine, schema, relation, limit, offset);
+    let preview = preview_sql(engine, schema, relation, filter, limit, offset);
     sql::with_order_by(&preview, sort).unwrap_or(preview)
 }
 
@@ -6698,7 +6708,7 @@ mod tests {
     #[test]
     fn a_preview_asks_for_the_rows_its_tab_was_set_to() {
         assert_eq!(
-            relation_sql(Engine::Postgres, "public", "accounts", &[], 100, 0),
+            relation_sql(Engine::Postgres, "public", "accounts", "", &[], 100, 0),
             r#"SELECT * FROM "public"."accounts" LIMIT 100"#
         );
         // A raised limit still keeps the sort ahead of it, or the rows would be
@@ -6708,6 +6718,7 @@ mod tests {
                 Engine::Postgres,
                 "public",
                 "accounts",
+                "",
                 &[SortKey::new(r#""id""#, true)],
                 100_000,
                 0
@@ -6726,6 +6737,7 @@ mod tests {
             Engine::Postgres,
             "public",
             "accounts",
+            "",
             &[SortKey::new(r#""id""#, true)],
             100,
             200,
@@ -6737,6 +6749,32 @@ mod tests {
         );
         assert_eq!(
             sql::order_by(&paged),
+            Some(vec![SortKey::new(r#""id""#, true)])
+        );
+    }
+
+    #[test]
+    fn a_filtered_preview_still_sorts_and_still_pages() {
+        // All four controls at once, in the only order that parses: the filter
+        // ahead of the sort, the sort ahead of the limit, the offset inside it.
+        let filtered = relation_sql(
+            Engine::Postgres,
+            "public",
+            "accounts",
+            r#""state" = 'ok'"#,
+            &[SortKey::new(r#""id""#, true)],
+            100,
+            200,
+        );
+
+        assert_eq!(
+            filtered,
+            r#"SELECT * FROM "public"."accounts" WHERE "state" = 'ok' ORDER BY "id" ASC LIMIT 100 OFFSET 200"#
+        );
+        // And the sort is still readable back off the statement, which is what
+        // lights the headers up on a page that is not the first.
+        assert_eq!(
+            sql::order_by(&filtered),
             Some(vec![SortKey::new(r#""id""#, true)])
         );
     }
@@ -6772,6 +6810,7 @@ mod tests {
             Engine::Postgres,
             "public",
             "accounts",
+            "",
             &[SortKey::new(r#""id""#, false)],
             PREVIEW_ROW_LIMIT,
             0,

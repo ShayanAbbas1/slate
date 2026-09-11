@@ -158,13 +158,20 @@ pub fn preview_sql(
     engine: Engine,
     schema: &str,
     relation: &str,
+    filter: &str,
     limit: usize,
     offset: usize,
 ) -> String {
-    let mut sql = format!(
-        "SELECT * FROM {} LIMIT {limit}",
-        engine.qualified(schema, relation)
-    );
+    let mut sql = format!("SELECT * FROM {}", engine.qualified(schema, relation));
+    // The `WHERE` is emitted here rather than spliced in later: this function
+    // owns the `FROM`, so it is the one place that knows where the clause goes.
+    // `sql::with_order_by` anchors on the `limit` node, so the sort still lands
+    // after the filter without knowing a filter exists.
+    let filter = filter.trim();
+    if !filter.is_empty() {
+        sql.push_str(&format!(" WHERE {filter}"));
+    }
+    sql.push_str(&format!(" LIMIT {limit}"));
     // `OFFSET` after `LIMIT`: the one order all three engines accept, and the
     // one the statement grammar reads -- it nests `offset` inside the `limit`
     // node, which is what keeps a paged preview sortable. A zero offset is
@@ -324,6 +331,7 @@ mod tests {
                 Engine::Postgres,
                 r#"odd"schema"#,
                 r#"table"name"#,
+                "",
                 PREVIEW_ROW_LIMIT,
                 0
             ),
@@ -334,8 +342,72 @@ mod tests {
     #[test]
     fn a_paged_preview_carries_its_offset_after_the_limit() {
         assert_eq!(
-            preview_sql(Engine::Postgres, "public", "accounts", 1_000, 2_000),
+            preview_sql(Engine::Postgres, "public", "accounts", "", 1_000, 2_000),
             r#"SELECT * FROM "public"."accounts" LIMIT 1000 OFFSET 2000"#
         );
+    }
+
+    #[test]
+    fn a_filter_lands_between_the_relation_and_the_limit() {
+        // The one place the WHERE can go: after the FROM this function owns,
+        // and ahead of the limit, so the filter picks the rows the page is cut
+        // out of rather than being applied to a page already cut.
+        assert_eq!(
+            preview_sql(
+                Engine::Postgres,
+                "public",
+                "accounts",
+                r#""state" = 'ok'"#,
+                100,
+                0
+            ),
+            r#"SELECT * FROM "public"."accounts" WHERE "state" = 'ok' LIMIT 100"#
+        );
+        assert_eq!(
+            preview_sql(
+                Engine::MySql,
+                "slate_dev",
+                "accounts",
+                "`state` = 'ok'",
+                100,
+                200
+            ),
+            "SELECT * FROM `slate_dev`.`accounts` WHERE `state` = 'ok' LIMIT 100 OFFSET 200"
+        );
+        assert_eq!(
+            preview_sql(
+                Engine::Sqlite,
+                "main",
+                "accounts",
+                r#""state" = 'ok'"#,
+                1_000,
+                0
+            ),
+            r#"SELECT * FROM "main"."accounts" WHERE "state" = 'ok' LIMIT 1000"#
+        );
+    }
+
+    #[test]
+    fn no_filter_generates_exactly_what_it_generated_before_there_were_filters() {
+        // Byte-identical, per engine, with and without a page offset. Every
+        // preview Slate has ever run is this statement, and a stray space or a
+        // bare WHERE would change what the gate and `with_order_by` read back.
+        for engine in [Engine::Postgres, Engine::MySql, Engine::Sqlite] {
+            let qualified = engine.qualified("public", "accounts");
+            assert_eq!(
+                preview_sql(engine, "public", "accounts", "", 1_000, 0),
+                format!("SELECT * FROM {qualified} LIMIT 1000")
+            );
+            assert_eq!(
+                preview_sql(engine, "public", "accounts", "", 1_000, 2_000),
+                format!("SELECT * FROM {qualified} LIMIT 1000 OFFSET 2000")
+            );
+            // Whitespace is not a filter: an input the user emptied by hand
+            // must not write `WHERE   ` into the statement.
+            assert_eq!(
+                preview_sql(engine, "public", "accounts", "   ", 1_000, 0),
+                format!("SELECT * FROM {qualified} LIMIT 1000")
+            );
+        }
     }
 }
