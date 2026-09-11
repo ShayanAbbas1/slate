@@ -136,9 +136,8 @@ around.
 
 ## Planned
 
-The browsing half is still growing: row insertion from the grid, setting a cell
-to `NULL`, row deletion (by primary key, with the statement shown before it
-runs), and foreign-key navigation.
+The browsing half is still growing: row deletion (by primary key, with the
+statement shown before it runs), and foreign-key navigation.
 Beyond that, SSH tunneling, notarized builds, and a Homebrew tap.
 
 ## Not planned
@@ -147,9 +146,9 @@ Visual query builders, ER diagrams, migrations. Slate assumes you can write
 SQL; it just does not make you write all of it.
 
 **Slate never writes a `DROP` or `TRUNCATE`** — not on request, not by
-accident. Generated statements pass a whitelist gate that admits `UPDATE` and
-nothing else today, so the guarantee is structural rather than a list of names
-someone remembered to check. Row deletion, when it ships, will widen that gate
+accident. Generated statements pass a whitelist gate that admits an `UPDATE`
+and a single-row `INSERT` and nothing else today, so the guarantee is structural
+rather than a list of names someone remembered to check. Row deletion, when it ships, will widen that gate
 by exactly one shape — a `DELETE` of rows named by primary key, generated only
 from an explicit ask and shown before it runs, never from a predicate Slate
 guessed at. On MySQL and SQLite, where each statement commits on its own, a

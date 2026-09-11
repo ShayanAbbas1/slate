@@ -217,14 +217,62 @@ pub fn update_row(
     ))
 }
 
-/// Whether `sql` is a statement Slate could have written: one or more `UPDATE`s
-/// and nothing else at all.
+/// An `INSERT` naming exactly the columns it was given, and no others.
+///
+/// A column the caller does not pass is not mentioned in the statement at all,
+/// which is what leaves the server's default to apply to it. That is the whole
+/// reason this takes a list of columns rather than a row: a row would have a
+/// value for every column, and every default would be unreachable.
+///
+/// The asymmetry with `update_row` is deliberate and worth stating: this needs
+/// a schema and a table but **no primary key**, because an insert has no
+/// existing row to name yet, where editing has to name a row that already
+/// exists. So a table without a primary key can be inserted into and not
+/// edited.
+///
+/// `None` on an empty list. The alternative is `INSERT INTO t DEFAULT VALUES`,
+/// a statement nobody has asked Slate for.
+// The "New row" form is the caller; until it lands, the tests are the only one.
+#[allow(dead_code)]
+pub fn insert_row(
+    engine: Engine,
+    schema: &str,
+    table: &str,
+    columns: &[(&str, Option<&str>)],
+) -> Option<String> {
+    if columns.is_empty() {
+        return None;
+    }
+
+    let names: Vec<String> = columns
+        .iter()
+        .map(|&(column, _)| engine.quote_identifier(column))
+        .collect();
+    let values: Vec<String> = columns
+        .iter()
+        .map(|&(_, value)| literal(engine, value))
+        .collect();
+    Some(format!(
+        "INSERT INTO {} ({}) VALUES ({})",
+        engine.qualified(schema, table),
+        names.join(", "),
+        values.join(", ")
+    ))
+}
+
+/// Whether `sql` is a statement Slate could have written: one or more `UPDATE`s,
+/// or a single `INSERT`, and nothing else at all.
 ///
 /// The one gate every Slate-generated statement passes before anything runs,
 /// and the code half of hard rule 1 — Slate never writes a `DROP`, `TRUNCATE`
 /// or `DELETE`, whatever the user asked for. A whitelist, because a blocklist
 /// of keywords is only a list of the spellings someone thought of.
-pub fn is_generated_update(sql: &str) -> bool {
+///
+/// Named for what it admits rather than for one of the shapes, because it
+/// admits more than one now: a rule that lets an `INSERT` through under a name
+/// promising an `UPDATE` is how a whitelist quietly becomes a list of things
+/// nobody refused.
+pub fn is_generated_write(sql: &str) -> bool {
     let Some(tree) = parse(sql) else {
         return false;
     };
@@ -235,13 +283,17 @@ pub fn is_generated_update(sql: &str) -> bool {
 
     // Comments are tree-sitter extras and land at the root too, so anything
     // that is not a statement here is something Slate did not generate.
-    !statements.is_empty()
-        && statements.iter().all(|statement| {
-            statement.kind() == "statement"
-                && statement
-                    .named_child(0)
-                    .is_some_and(|node| node.kind() == "update")
+    let kinds: Vec<&str> = statements
+        .iter()
+        .map(|statement| match statement.kind() == "statement" {
+            true => statement.named_child(0).map_or("", |node| node.kind()),
+            false => "",
         })
+        .collect();
+
+    // One insert alone, or a batch of updates. A batch of inserts is a shape
+    // nothing generates, so admitting it would widen the gate for nobody.
+    (kinds == ["insert"] || (!kinds.is_empty() && kinds.iter().all(|kind| *kind == "update")))
         && !destructive(root)
 }
 
@@ -255,7 +307,7 @@ pub fn is_generated_update(sql: &str) -> bool {
 /// filters Slate writes for itself.
 ///
 /// Not the second gate `AGENTS.md` rule 2 forbids. That rule governs the one
-/// path by which the grid writes, and `is_generated_update` remains its only
+/// path by which the grid writes, and `is_generated_write` remains its only
 /// gate; this guards a path that did not previously admit user text at all,
 /// and it admits no write -- a statement reaching it must be a query. Neither
 /// is a way around the other, and no generated statement passes through both.
@@ -951,7 +1003,7 @@ mod tests {
         // like any other, and a test here is what proves it rather than hopes.
         let statement =
             update_row(Engine::Postgres, "s", "t", &[("a", None)], &[("id", "1")]).unwrap();
-        assert!(is_generated_update(&statement), "{statement} was refused");
+        assert!(is_generated_write(&statement), "{statement} was refused");
     }
 
     #[test]
@@ -963,9 +1015,81 @@ mod tests {
     }
 
     #[test]
+    fn a_generated_insert_names_only_the_columns_it_was_given() {
+        // The omission is the design: a column absent from this list is absent
+        // from the statement, so the server's default applies to it.
+        assert_eq!(
+            insert_row(
+                Engine::Postgres,
+                "public",
+                "measurements",
+                &[("note", Some("ok")), ("depth", None)]
+            )
+            .unwrap(),
+            r#"INSERT INTO "public"."measurements" ("note", "depth") VALUES ('ok', NULL)"#
+        );
+        assert_eq!(
+            insert_row(Engine::Sqlite, "main", "t", &[("a", Some("o'hara"))]).unwrap(),
+            r#"INSERT INTO "main"."t" ("a") VALUES ('o''hara')"#
+        );
+        // The engine whose identifier quote and literal escape are both its
+        // own: a backtick doubles, and a backslash doubles before the
+        // apostrophe after it does.
+        assert_eq!(
+            insert_row(
+                Engine::MySql,
+                "slate_dev",
+                "me`as",
+                &[("no`te", Some(r"a\'b"))]
+            )
+            .unwrap(),
+            r"INSERT INTO `slate_dev`.`me``as` (`no``te`) VALUES ('a\\''b')"
+        );
+        // An empty form is not `INSERT INTO t DEFAULT VALUES`, which is a
+        // statement Slate has never been asked for.
+        assert!(insert_row(Engine::Postgres, "s", "t", &[]).is_none());
+    }
+
+    #[test]
+    fn the_gate_admits_an_insert_and_still_admits_an_update() {
+        assert!(is_generated_write(
+            r#"INSERT INTO "public"."t" ("a") VALUES ('1')"#
+        ));
+        assert!(is_generated_write("UPDATE t SET a = '1' WHERE id = '2'"));
+        assert!(is_generated_write(
+            "BEGIN;\nUPDATE t SET a = '1' WHERE id = '2';\n\
+             UPDATE t SET a = '3' WHERE id = '4';\nCOMMIT;"
+        ));
+        // And what the generator writes, which is the test that keeps the two
+        // from drifting apart.
+        let statement = insert_row(
+            Engine::Postgres,
+            "public",
+            "measurements",
+            &[("note", Some("it's fine")), ("depth", None)],
+        )
+        .unwrap();
+        assert!(is_generated_write(&statement), "{statement} was refused");
+    }
+
+    #[test]
+    fn the_gate_refuses_an_insert_carrying_something_else() {
+        // One insert, alone. A batch of them is a shape nothing generates, and
+        // a `DELETE` riding along in a CTE is the shape an injected value takes.
+        for sql in [
+            "INSERT INTO t (a) VALUES ('1'); DROP TABLE t",
+            "INSERT INTO t (a) VALUES ('1'); TRUNCATE t",
+            "WITH x AS (DELETE FROM t RETURNING *) INSERT INTO u (a) VALUES ('1')",
+            "INSERT INTO t (a) VALUES ('1'); INSERT INTO t (a) VALUES ('2')",
+        ] {
+            assert!(!is_generated_write(sql), "{sql} passed the gate");
+        }
+    }
+
+    #[test]
     fn the_gate_accepts_an_update_and_a_batch_of_updates() {
-        assert!(is_generated_update("UPDATE t SET a = '1' WHERE id = '2'"));
-        assert!(is_generated_update(
+        assert!(is_generated_write("UPDATE t SET a = '1' WHERE id = '2'"));
+        assert!(is_generated_write(
             "UPDATE t SET a = '1' WHERE id = '2'; UPDATE t SET a = '3' WHERE id = '4'"
         ));
     }
@@ -975,7 +1099,7 @@ mod tests {
         // What Slate writes for an engine that commits each statement on its
         // own. The brackets are part of the generated statement, so the gate
         // has to know the shape or it would refuse Slate's own output.
-        assert!(is_generated_update(
+        assert!(is_generated_write(
             "BEGIN;\nUPDATE t SET a = '1' WHERE id = '2';\n\
              UPDATE t SET a = '3' WHERE id = '4';\nCOMMIT;"
         ));
@@ -990,24 +1114,24 @@ mod tests {
             "BEGIN;\nUPDATE t SET a = '1' WHERE id = '2';",
             "BEGIN;\nUPDATE t SET a = '1' WHERE id = '2';\nROLLBACK;",
         ] {
-            assert!(!is_generated_update(sql), "{sql:?} passed the gate");
+            assert!(!is_generated_write(sql), "{sql:?} passed the gate");
         }
     }
 
     #[test]
     fn the_gate_refuses_a_destructive_statement_inside_the_brackets() {
         // Seeing through the transaction must not mean trusting what is in it.
-        assert!(!is_generated_update(
+        assert!(!is_generated_write(
             "BEGIN;\nUPDATE t SET a = '1' WHERE id = '2';\nDELETE FROM t;\nCOMMIT;"
         ));
     }
 
     #[test]
-    fn the_gate_refuses_everything_that_is_not_an_update() {
+    fn the_gate_refuses_everything_that_is_not_a_write_slate_writes() {
         // Hard rule 1 in code: DROP, TRUNCATE and DELETE never leave Slate,
-        // whatever the user asked for. SELECT and INSERT are here because the
-        // gate is a whitelist -- being harmless is not the test, being an
-        // UPDATE is.
+        // whatever the user asked for. SELECT is here because the gate is a
+        // whitelist -- being harmless is not the test, being one of the two
+        // shapes Slate generates is.
         for sql in [
             "DROP TABLE t",
             "DROP VIEW v",
@@ -1016,9 +1140,8 @@ mod tests {
             "TRUNCATE TABLE t",
             "DELETE FROM t WHERE a = '1'",
             "SELECT 1",
-            "INSERT INTO t (a) VALUES ('1')",
         ] {
-            assert!(!is_generated_update(sql), "{sql} passed the gate");
+            assert!(!is_generated_write(sql), "{sql} passed the gate");
         }
     }
 
@@ -1026,7 +1149,7 @@ mod tests {
     fn the_gate_refuses_a_batch_with_one_destructive_statement_in_it() {
         // Every statement is checked, not the first one. A DELETE appended to a
         // run of legitimate updates is the shape an injected value would take.
-        assert!(!is_generated_update(
+        assert!(!is_generated_write(
             "UPDATE t SET a = '1' WHERE id = '2'; DELETE FROM t; UPDATE t SET a = '3' WHERE id = '4'"
         ));
     }
@@ -1035,7 +1158,7 @@ mod tests {
     fn the_gate_refuses_a_destructive_statement_wrapped_in_a_cte() {
         // The root statement's first child here really is an `update` node, so
         // the whitelist passes it and only the subtree scan catches it.
-        assert!(!is_generated_update(
+        assert!(!is_generated_write(
             "WITH x AS (DELETE FROM t RETURNING *) UPDATE u SET a = '1' WHERE id = '2'"
         ));
     }
@@ -1051,7 +1174,7 @@ mod tests {
             "-- UPDATE t SET a = '1'",
             "",
         ] {
-            assert!(!is_generated_update(sql), "{sql:?} passed the gate");
+            assert!(!is_generated_write(sql), "{sql:?} passed the gate");
         }
     }
 
@@ -1069,8 +1192,8 @@ mod tests {
         )
         .unwrap();
 
-        assert!(is_generated_update(&statement), "{statement} was refused");
-        assert!(is_generated_update(&format!("{statement}; {statement}")));
+        assert!(is_generated_write(&statement), "{statement} was refused");
+        assert!(is_generated_write(&format!("{statement}; {statement}")));
     }
 
     #[test]

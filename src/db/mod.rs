@@ -83,7 +83,7 @@ impl Engine {
     /// MySQL's own spelling is `START TRANSACTION`, and `BEGIN` is its
     /// documented alias outside a stored program. The alias is what Slate
     /// writes because the brackets go into the statement text, where
-    /// `sql::is_generated_update` has to read them back: the tree-sitter
+    /// `sql::is_generated_write` has to read them back: the tree-sitter
     /// grammar has no `START TRANSACTION`, so the gate would refuse Slate's own
     /// batch.
     pub fn transaction_start(self) -> Option<&'static str> {
@@ -853,7 +853,7 @@ mod tests {
         // Postgres runs one submission as one transaction; the other two commit
         // each statement on its own and have to be told. `BEGIN` rather than
         // MySQL's own `START TRANSACTION` because the brackets are read back by
-        // `sql::is_generated_update`, whose grammar knows only the first.
+        // `sql::is_generated_write`, whose grammar knows only the first.
         assert_eq!(Engine::Postgres.transaction_start(), None);
         assert_eq!(Engine::MySql.transaction_start(), Some("BEGIN"));
         assert_eq!(Engine::Sqlite.transaction_start(), Some("BEGIN"));

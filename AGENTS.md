@@ -11,8 +11,7 @@ survives the change is between *whose SQL it is*. An editor buffer is the
 user's and is never touched uninvited; a browsing surface (an object tab's
 preview) runs SQL Slate generates, regenerated from visible controls and
 inspectable, never spliced into anyone's buffer. Planned under the new framing:
-row insertion, `NULL` writes, row deletion by primary key, foreign-key
-navigation.
+row deletion by primary key, foreign-key navigation.
 
 **Read this file before doing anything.** It is the source of truth for how
 Slate is built and why.
@@ -49,8 +48,8 @@ require it, stop and raise it instead.
    whatever the user asked for; and `DELETE` only as the explicit deletion of
    named rows — by primary key, from a direct ask on a browsing surface, with
    the statement shown before it runs. (That deletion flow is planned, not
-   shipped: today the gate admits `UPDATE` and nothing else, and this sentence
-   is the permission to widen it — once, by that one shape.) And it never
+   shipped: today the gate admits an `UPDATE` and a single-row `INSERT`, and
+   this sentence is the permission to widen it — once, by that one shape.) And it never
    writes into a statement it cannot parse whole:
    `sql::with_order_by` refuses rather than guessing at a clause boundary,
    because a corrupted statement is worse than an unsorted grid.
@@ -61,15 +60,28 @@ require it, stop and raise it instead.
    why "silently" is still the word that carries the rule.
 
 2. **One gate stands between the grid and the server.** The grid can write an
-   `UPDATE`, and `sql::is_generated_update` is the single gate every generated
-   statement passes first. It is a whitelist, so `DROP`, `TRUNCATE` and
-   `DELETE` are refused structurally rather than by name. Do not add a second
-   path that bypasses it. When row deletion ships (rule 1), it widens this
-   gate to admit a primary-key `DELETE` — it does not get a gate of its own.
+   `UPDATE` and an `INSERT` of one row, and `sql::is_generated_write` is the
+   single gate every generated statement passes first. Both admitted shapes are
+   named here rather than left to be read into a rule about something else:
 
-   A cell is editable only when Slate can name its row by primary key. When it
-   cannot, the grid stays read-only and says why; it never guesses at a
-   predicate.
+   - a batch of `UPDATE`s, optionally bracketed by a `BEGIN`/`COMMIT` the gate
+     can see closed;
+   - one `INSERT`, naming the columns it fills.
+
+   It is a whitelist, so `DROP`, `TRUNCATE` and `DELETE` are refused
+   structurally rather than by name, anywhere in the tree, CTEs included. Do
+   not add a second path that bypasses it. When row deletion ships (rule 1), it
+   widens this gate to admit a primary-key `DELETE` — it does not get a gate of
+   its own, which is why the gate was renamed rather than given a sibling.
+
+   A cell is editable only when Slate can name its row by primary key. An
+   `INSERT` is the one write that needs no key — it has no existing row to name
+   yet — so a table without a primary key can be inserted into and not edited.
+   That asymmetry is deliberate and belongs in anything that documents either
+   feature.
+
+   When Slate cannot name a row, the grid stays read-only and says why; it
+   never guesses at a predicate.
 3. **No environment-specific behaviour.** No vendor binary names in error
    strings, no assumption that a loopback host means plaintext, no hardcoded
    ports or hostnames. Slate is a generic client.
@@ -147,7 +159,7 @@ url = "2"
 
 **The two tree-sitter pins are correctness, not formatting.** The grammar
 decides where every statement boundary falls, which statements `sql.rs` will
-splice an `ORDER BY` into, and what `is_generated_update` accepts as a closed
+splice an `ORDER BY` into, and what `is_generated_write` accepts as a closed
 transaction. A bump changes what Slate sends to the server. Treat them like the
 driver pins.
 
@@ -261,9 +273,10 @@ Decided, recorded in the multi-engine spec, and not to be re-litigated:
 - **`Engine` is the only engine-shaped thing above `src/db/`**, and only because
   Slate writes SQL. It answers three questions — quote an identifier, quote a
   literal, qualify a name — plus the inverse used to read a sort key back.
-  There are **five** call sites that generate SQL:
+  There are **six** call sites that generate SQL:
   `explorer::preview_sql`, `sql::with_order_by`, `sql::update_row`,
-  `main::sort_expression`, and `main::filter_predicate` — the last quotes both
+  `sql::insert_row`, `main::sort_expression`, and `main::filter_predicate` —
+  the last quotes both
   the column and the value a header input writes. `main::sort_expression` is the
   one that gets forgotten, and forgetting it is silent: a double-quoted name is a
   *string literal* in MySQL, so `ORDER BY "name"` sorts every row by the same
@@ -272,7 +285,7 @@ Decided, recorded in the multi-engine spec, and not to be re-litigated:
   `BEGIN`/`COMMIT`, because each commits every statement on its own where a
   Postgres `simple_query` submission is one implicit transaction. The brackets
   go in the statement text, never around it invisibly, and
-  `sql::is_generated_update` refuses a transaction it cannot see closed.
+  `sql::is_generated_write` refuses a transaction it cannot see closed.
   `Engine::transaction_start` answers which engine needs one, with an arm per
   engine; it was a `_ =>` catch-all at `main::update_batch` until 2026-09-08,
   which is how MySQL went unbracketed while this file claimed it was atomic.

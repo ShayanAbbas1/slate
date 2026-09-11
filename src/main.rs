@@ -3737,9 +3737,10 @@ impl Workspace {
             return;
         };
         // The gate every generated statement passes before anything executes
-        // (`AGENTS.md` rule 2). Failing it means Slate wrote something that is
-        // not an `UPDATE`, which is a bug in Slate rather than a user error.
-        if !sql::is_generated_update(&batch) {
+        // (`AGENTS.md` rule 2). Failing it means Slate wrote something outside
+        // the shapes the gate names, which is a bug in Slate rather than a user
+        // error.
+        if !sql::is_generated_write(&batch) {
             self.note(
                 "Slate refused to run a statement it wrote itself: it is not an UPDATE.".into(),
                 cx,
@@ -7323,7 +7324,7 @@ mod tests {
         // The batch Slate builds has to pass the same gate Slate checks every
         // generated statement against, or the generator and the gate have
         // drifted apart.
-        assert!(sql::is_generated_update(&batch));
+        assert!(sql::is_generated_write(&batch));
     }
 
     #[test]
@@ -7340,13 +7341,13 @@ mod tests {
             let batch = update_batch(engine, &rows).unwrap();
             assert!(batch.starts_with("BEGIN;\n"), "{engine:?} {batch}");
             assert!(batch.ends_with("\nCOMMIT;"), "{engine:?} {batch}");
-            assert!(sql::is_generated_update(&batch), "{engine:?} {batch}");
+            assert!(sql::is_generated_write(&batch), "{engine:?} {batch}");
 
             // One statement is already atomic, so brackets round it would be
             // ceremony the user has to read past.
             let single = update_batch(engine, &rows[..1]).unwrap();
             assert!(!single.contains("BEGIN"), "{engine:?} {single}");
-            assert!(sql::is_generated_update(&single), "{engine:?} {single}");
+            assert!(sql::is_generated_write(&single), "{engine:?} {single}");
         }
 
         let postgres = update_batch(Engine::Postgres, &rows).unwrap();
