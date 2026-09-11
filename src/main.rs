@@ -2373,13 +2373,24 @@ impl Workspace {
             return;
         }
 
+        let sql = relation_sql(engine, &schema, &relation, filter, sort, *limit, *offset);
+        // Checked before anything leaves the machine, and before the tab's
+        // staleness is spent: a refused filter leaves the rows on screen and
+        // the text in the box, so it can be corrected rather than retyped.
+        if !sql::is_generated_select(&sql) {
+            self.note(
+                "Slate will not run a filter it cannot read as one SELECT.".into(),
+                cx,
+            );
+            return;
+        }
+
         // The one run that must not blank the grid first: a restored tab's rows
         // are the rows it was showing, and clearing them to fetch the same
         // thing again is a flash of nothing. Taken here rather than tested,
         // because every later run is replacing rows the server sent and has to
         // clear them.
         let keep_rows = std::mem::take(stale);
-        let sql = relation_sql(engine, &schema, &relation, filter, sort, *limit, *offset);
         // A preview only re-queries when it is asked to, and this is the ask.
         *query = QueryState::Idle;
         self.execute_and_then(sql, Tab::Object(id), None, keep_rows, cx);
@@ -7103,5 +7114,32 @@ mod tests {
         assert_eq!(restored.editor, "SF Mono");
         assert_eq!(restored.grid, Fonts::DEFAULT_GRID);
         assert_eq!(restored_fonts(None, &available), Fonts::default());
+    }
+
+    #[test]
+    fn the_gate_accepts_the_statement_a_filtered_preview_writes() {
+        // Keeps the generator and the gate from drifting apart, per engine:
+        // the identifier quote differs, and a MySQL preview the gate cannot
+        // read would refuse every filtered browse on MySQL.
+        for engine in [Engine::Postgres, Engine::MySql, Engine::Sqlite] {
+            let predicate = format!(
+                "{} = {}",
+                engine.quote_identifier("state"),
+                engine.quote_literal("ok")
+            );
+            let statement = relation_sql(
+                engine,
+                "public",
+                "accounts",
+                &predicate,
+                &[SortKey::new(engine.quote_identifier("id"), true)],
+                100,
+                200,
+            );
+            assert!(
+                sql::is_generated_select(&statement),
+                "{statement} was refused"
+            );
+        }
     }
 }

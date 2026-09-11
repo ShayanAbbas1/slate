@@ -236,6 +236,49 @@ pub fn is_generated_update(sql: &str) -> bool {
         && !destructive(root)
 }
 
+/// Whether `sql` is a `SELECT` Slate could have written: exactly one root
+/// statement, a query, with nothing destructive anywhere under it.
+///
+/// The filter bar is a trust boundary. Everywhere else a statement is either
+/// wholly the user's or wholly Slate's; a filter is the user's text spliced
+/// into Slate's statement, so this is what makes `id = 1; DROP TABLE t`
+/// structurally impossible rather than merely unlikely. It also guards the
+/// filters Slate writes for itself.
+///
+/// Not the second gate `AGENTS.md` rule 2 forbids. That rule governs the one
+/// path by which the grid writes, and `is_generated_update` remains its only
+/// gate; this guards a path that did not previously admit user text at all,
+/// and it admits no write -- a statement reaching it must be a query. Neither
+/// is a way around the other, and no generated statement passes through both.
+///
+/// Exactly one root statement rather than `generated_statements`' view through
+/// a transaction: a preview never brackets anything, so seeing through
+/// brackets here would only widen what is accepted.
+pub fn is_generated_select(sql: &str) -> bool {
+    let Some(tree) = parse(sql) else {
+        return false;
+    };
+    let root = tree.root_node();
+    let mut cursor = root.walk();
+    // Comments are tree-sitter extras and land at the root too, so anything
+    // that is not the one statement is something Slate did not generate.
+    let children: Vec<_> = root.named_children(&mut cursor).collect();
+    let [statement] = children.as_slice() else {
+        return false;
+    };
+    let mut cursor = statement.walk();
+
+    // A `select` among the statement's own children, not its first: `WITH`
+    // puts `keyword_with` and the cte ahead of the outer query's select, the
+    // same level `select_anchor` reads it back from. A write hides its select
+    // inside its own `insert` or `update` node, so none reaches this level.
+    statement.kind() == "statement"
+        && statement
+            .named_children(&mut cursor)
+            .any(|node| node.kind() == "select")
+        && !destructive(root)
+}
+
 /// The statements to check, seeing through the transaction that brackets a
 /// batch on an engine which does not make one submission atomic by itself.
 ///
@@ -977,5 +1020,76 @@ mod tests {
             .unwrap(),
             "WITH x AS (SELECT 1 AS a) SELECT * FROM x ORDER BY a ASC"
         );
+    }
+
+    #[test]
+    fn the_select_gate_accepts_the_shape_a_preview_has() {
+        for sql in [
+            r#"SELECT * FROM "public"."accounts" LIMIT 1000"#,
+            r#"SELECT * FROM "public"."accounts" WHERE "state" = 'ok' LIMIT 1000"#,
+            r#"SELECT * FROM "public"."accounts" WHERE "state" = 'ok' ORDER BY "id" ASC LIMIT 100 OFFSET 200"#,
+            "SELECT * FROM `slate_dev`.`accounts` WHERE `state` = 'ok' LIMIT 100",
+            r#"WITH x AS (SELECT 1 AS a) SELECT * FROM x LIMIT 10"#,
+        ] {
+            assert!(is_generated_select(sql), "{sql} was refused");
+        }
+    }
+
+    #[test]
+    fn the_select_gate_refuses_a_filter_carrying_a_second_statement() {
+        // The reason this gate exists. Whether each is refused for having two
+        // roots or for not parsing is not the point -- refused is the point.
+        for sql in [
+            r#"SELECT * FROM "public"."t" WHERE "id" = '1'; DROP TABLE "t" LIMIT 1000"#,
+            r#"SELECT * FROM "public"."t" WHERE "id" = '1' LIMIT 1000; DROP TABLE "t""#,
+            r#"SELECT * FROM "public"."t" WHERE "id" = '1'; DELETE FROM "t" LIMIT 1000"#,
+            r#"SELECT * FROM "public"."t" WHERE "id" = '1'; TRUNCATE "t" LIMIT 1000"#,
+        ] {
+            assert!(!is_generated_select(sql), "{sql} passed the gate");
+        }
+    }
+
+    #[test]
+    fn the_select_gate_refuses_a_filter_that_does_not_parse() {
+        for sql in [
+            r#"SELECT * FROM "public"."t" WHERE "id" = ((( LIMIT 1000"#,
+            r#"SELECT * FROM "public"."t" WHERE "id" = 'unclosed LIMIT 1000"#,
+            r#"SELECT * FROM "public"."t" WHERE LIMIT 1000"#,
+            "",
+        ] {
+            assert!(!is_generated_select(sql), "{sql:?} passed the gate");
+        }
+    }
+
+    #[test]
+    fn the_select_gate_refuses_a_destructive_statement_hidden_in_a_cte() {
+        // The root's first named child here is a `select`, so the whitelist
+        // alone passes it and only the recursive scan catches it. THIS TEST IS
+        // LOAD-BEARING: a later task splits `destructive` apart for the DELETE
+        // path, and this is what fails if the SELECT gate is not updated too.
+        for sql in [
+            r#"WITH x AS (DELETE FROM "t" RETURNING *) SELECT * FROM x LIMIT 1000"#,
+            r#"WITH x AS (SELECT 1 AS a) SELECT * FROM x WHERE a IN (SELECT 1); DROP TABLE "t""#,
+        ] {
+            assert!(!is_generated_select(sql), "{sql} passed the gate");
+        }
+    }
+
+    #[test]
+    fn the_select_gate_admits_no_write_at_all() {
+        // A whitelist, not a blocklist: being harmless is not the test, being
+        // a SELECT is.
+        for sql in [
+            "UPDATE t SET a = '1' WHERE id = '2'",
+            "INSERT INTO t (a) VALUES ('1')",
+            "DELETE FROM t WHERE a = '1'",
+            "DROP TABLE t",
+            "TRUNCATE t",
+            "BEGIN; SELECT 1; COMMIT",
+            "SELECT 1; SELECT 2",
+            "-- SELECT * FROM t",
+        ] {
+            assert!(!is_generated_select(sql), "{sql} passed the gate");
+        }
     }
 }
