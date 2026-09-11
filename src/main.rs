@@ -58,6 +58,16 @@ struct SortColumn {
     column: usize,
 }
 
+/// A value typed under a column header. The value travels as *text*: the filter
+/// box is what ends up holding SQL, and quoting it into some belongs where the
+/// engine is.
+#[derive(Clone, PartialEq, Eq, Deserialize, Action)]
+#[action(namespace = slate, no_json)]
+struct FilterColumn {
+    column: usize,
+    value: String,
+}
+
 /// How many rows a relation's preview asks for. Slate's own statement carries
 /// the limit, so the only thing to say is the number.
 #[derive(Clone, PartialEq, Eq, Deserialize, Action)]
@@ -3262,6 +3272,49 @@ impl Workspace {
         );
     }
 
+    /// A header input's value, quoted into a predicate and appended to the box.
+    ///
+    /// The box is written first and read back by `apply_filter`, so what runs is
+    /// what is on screen, and what the header wrote is now text the user can
+    /// edit by hand.
+    fn filter_column(
+        &mut self,
+        action: &FilterColumn,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let engine = self.engine();
+        let Some(profile) = self.profile() else {
+            return;
+        };
+        let Tab::Object(id) = profile.session.active else {
+            return;
+        };
+        let Some(results) = profile.session.active_results().cloned() else {
+            return;
+        };
+        // The column's own name, because the preview is Slate's `SELECT *` and
+        // the header is the server's word for the column, not an alias.
+        let Some(name) = results
+            .read(cx)
+            .delegate()
+            .columns()
+            .get(action.column)
+            .map(|column| column.name.to_string())
+        else {
+            return;
+        };
+        let Some(input) = self.filter_box(id) else {
+            return;
+        };
+        let filter = appended_filter(
+            &input.read(cx).value(),
+            &filter_predicate(engine, &name, &action.value),
+        );
+        input.update(cx, |input, cx| input.set_value(filter, window, cx));
+        self.apply_filter(id, cx);
+    }
+
     /// Empty the active preview's box and ask for the whole relation again.
     fn clear_filter(&mut self, _: &ClearFilter, window: &mut Window, cx: &mut Context<Self>) {
         let Some(Tab::Object(id)) = self.profile().map(|profile| profile.session.active) else {
@@ -4243,8 +4296,12 @@ impl Workspace {
                                 let produced_grid = !result.columns.is_empty();
                                 results.update(cx, |table, cx| {
                                     let sort = sort_columns(engine, &keys, &result.columns);
-                                    *table.delegate_mut() =
-                                        ResultGrid::new(result).with_sort(sort, sortable);
+                                    *table.delegate_mut() = ResultGrid::new(result)
+                                        .with_sort(sort, sortable)
+                                        // A query buffer's statement is the
+                                        // user's, and there is no box over
+                                        // it for a header to write into.
+                                        .filterable(matches!(tab, Tab::Object(_)));
                                     table.refresh(cx);
                                 });
                                 (true, produced_grid)
@@ -5510,6 +5567,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::next_page))
             .on_action(cx.listener(Self::previous_page))
             .on_action(cx.listener(Self::clear_filter))
+            .on_action(cx.listener(Self::filter_column))
             .on_action(cx.listener(Self::show_editor))
             .on_action(cx.listener(Self::cycle_theme))
             .on_action(cx.listener(Self::save_query))
@@ -5678,6 +5736,32 @@ fn changed_filter(filter: &mut String, offset: &mut usize, typed: &str) -> bool 
     *filter = typed.to_string();
     *offset = 0;
     true
+}
+
+/// One column equal to one value, quoted the way the server will read it.
+///
+/// A SQL-generating call site (`AGENTS.md`, engine divergences). Equality is
+/// the only operator offered: anything else is faster to type into the box than
+/// to build out of a dropdown, and the box is right there.
+fn filter_predicate(engine: Engine, column: &str, value: &str) -> String {
+    format!(
+        "{} = {}",
+        engine.quote_identifier(column),
+        engine.quote_literal(value)
+    )
+}
+
+/// `predicate` joined onto whatever the filter box already holds.
+///
+/// Conjoined rather than replacing, and verbatim rather than reformatted: the
+/// box is the only filter state, so what a header input wrote is now text the
+/// user can edit by hand.
+fn appended_filter(filter: &str, predicate: &str) -> String {
+    let filter = filter.trim();
+    match filter.is_empty() {
+        true => predicate.to_string(),
+        false => format!("{filter} AND {predicate}"),
+    }
 }
 
 /// Slate's statement for a relation's tab, carrying the filter and the sort the
@@ -6643,6 +6727,57 @@ mod tests {
                 data_type: None,
             })
             .collect()
+    }
+
+    #[test]
+    fn a_header_input_writes_a_quoted_equality_into_the_filter() {
+        // The identifier and the literal are both the user's text, and both are
+        // quoted the way the engine will read them -- a double-quoted name is a
+        // string literal on MySQL, which is the silent failure this exists to
+        // avoid.
+        assert_eq!(
+            filter_predicate(Engine::Postgres, "state", "ok"),
+            r#""state" = 'ok'"#
+        );
+        assert_eq!(
+            filter_predicate(Engine::MySql, "state", "ok"),
+            "`state` = 'ok'"
+        );
+        assert_eq!(
+            filter_predicate(Engine::Sqlite, "state", "ok"),
+            r#""state" = 'ok'"#
+        );
+        // An apostrophe in the value and a quote in the column name are the two
+        // ways a typed value becomes SQL of its own.
+        assert_eq!(
+            filter_predicate(Engine::Postgres, r#"od"d"#, "it's"),
+            r#""od""d" = 'it''s'"#
+        );
+        // And a backslash is the third, on the one engine that reads it as an
+        // escape.
+        assert_eq!(
+            filter_predicate(Engine::MySql, "path", r"a\b"),
+            r"`path` = 'a\\b'"
+        );
+    }
+
+    #[test]
+    fn a_second_column_joins_the_filter_already_in_the_box() {
+        // An `AND` in front of an empty box is not a statement at all.
+        assert_eq!(
+            appended_filter("", r#""state" = 'ok'"#),
+            r#""state" = 'ok'"#
+        );
+        assert_eq!(
+            appended_filter(r#""state" = 'ok'"#, r#""tier" = '2'"#),
+            r#""state" = 'ok' AND "tier" = '2'"#
+        );
+        // Whatever the user typed by hand is kept verbatim: the box is the only
+        // state, and this appends to it rather than rewriting it.
+        assert_eq!(
+            appended_filter("id > 5 OR name IS NULL", r#""tier" = '2'"#),
+            r#"id > 5 OR name IS NULL AND "tier" = '2'"#
+        );
     }
 
     #[test]

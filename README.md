@@ -136,9 +136,9 @@ around.
 
 ## Planned
 
-The browsing half is still growing: a filter bar over table previews, row
-insertion from the grid, setting a cell to `NULL`, row deletion (by primary
-key, with the statement shown before it runs), and foreign-key navigation.
+The browsing half is still growing: row insertion from the grid, setting a cell
+to `NULL`, row deletion (by primary key, with the statement shown before it
+runs), and foreign-key navigation.
 Beyond that, SSH tunneling, notarized builds, and a Homebrew tap.
 
 ## Not planned

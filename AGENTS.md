@@ -11,8 +11,8 @@ survives the change is between *whose SQL it is*. An editor buffer is the
 user's and is never touched uninvited; a browsing surface (an object tab's
 preview) runs SQL Slate generates, regenerated from visible controls and
 inspectable, never spliced into anyone's buffer. Planned under the new framing:
-a filter bar over previews, row insertion, `NULL` writes, row deletion by
-primary key, foreign-key navigation.
+row insertion, `NULL` writes, row deletion by primary key, foreign-key
+navigation.
 
 **Read this file before doing anything.** It is the source of truth for how
 Slate is built and why.
@@ -261,11 +261,13 @@ Decided, recorded in the multi-engine spec, and not to be re-litigated:
 - **`Engine` is the only engine-shaped thing above `src/db/`**, and only because
   Slate writes SQL. It answers three questions — quote an identifier, quote a
   literal, qualify a name — plus the inverse used to read a sort key back.
-  There are **four** call sites that generate SQL, not three:
-  `explorer::preview_sql`, `sql::with_order_by`, `sql::update_row`, and
-  `main::sort_expression`. The last one is the one that gets forgotten, and
-  forgetting it is silent: a double-quoted name is a *string literal* in MySQL,
-  so `ORDER BY "name"` sorts every row by the same constant with no error.
+  There are **five** call sites that generate SQL:
+  `explorer::preview_sql`, `sql::with_order_by`, `sql::update_row`,
+  `main::sort_expression`, and `main::filter_predicate` — the last quotes both
+  the column and the value a header input writes. `main::sort_expression` is the
+  one that gets forgotten, and forgetting it is silent: a double-quoted name is a
+  *string literal* in MySQL, so `ORDER BY "name"` sorts every row by the same
+  constant with no error.
 - **MySQL and SQLite both bracket a generated multi-row batch** in
   `BEGIN`/`COMMIT`, because each commits every statement on its own where a
   Postgres `simple_query` submission is one implicit transaction. The brackets
