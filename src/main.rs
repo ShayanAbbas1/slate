@@ -83,6 +83,8 @@ actions!(
         ZoomEditorIn,
         ZoomEditorOut,
         ResetEditorZoom,
+        NextPage,
+        PreviousPage,
         EditCell,
         CopyCell,
         ApplyEdits,
@@ -755,6 +757,11 @@ enum ObjectBody {
         /// (spec §4.3); this is the tab's own copy of the cap, so raising it
         /// for one wide table does not raise it everywhere.
         limit: usize,
+        /// How far into the relation this preview's page starts, in rows.
+        /// Always a multiple of `limit`: paging moves it by one page, and a
+        /// change of sort or limit puts it back to zero, because a window into
+        /// an ordering that no longer exists is not a page of anything.
+        offset: usize,
         /// Whether the rows on screen came off disk rather than from the
         /// server. Refreshed on the tab's first activation and cleared there,
         /// not at startup: a session of restored tabs would otherwise open by
@@ -2278,6 +2285,7 @@ impl Workspace {
                 query: QueryState::Idle,
                 sort: Vec::new(),
                 limit: preview_rows,
+                offset: 0,
                 stale: false,
                 hydrated: false,
             },
@@ -2315,12 +2323,12 @@ impl Workspace {
 
         let (schema, relation) = (tab.schema.clone(), tab.name.clone());
         self.load_structure(id, schema, relation, cx);
-        self.requery_relation(id, |_, _| true, cx);
+        self.requery_relation(id, |_, _, _| true, cx);
     }
 
     /// Run a relation tab's statement again, after `change` has had its say
-    /// about the tab's sort and row limit. `false` from `change` means nothing
-    /// moved, and nothing runs.
+    /// about the tab's sort, row limit and page offset. `false` from `change`
+    /// means nothing moved, and nothing runs.
     ///
     /// Every path that re-queries a relation comes through here. The statement
     /// is Slate's own, so it is regenerated from whatever the tab is now set to
@@ -2330,7 +2338,7 @@ impl Workspace {
     fn requery_relation(
         &mut self,
         id: u64,
-        change: impl FnOnce(&mut Vec<SortKey>, &mut usize) -> bool,
+        change: impl FnOnce(&mut Vec<SortKey>, &mut usize, &mut usize) -> bool,
         cx: &mut Context<Self>,
     ) {
         let engine = self.engine();
@@ -2345,13 +2353,14 @@ impl Workspace {
             sort,
             query,
             limit,
+            offset,
             stale,
             ..
         } = &mut tab.body
         else {
             return;
         };
-        if !change(sort, limit) {
+        if !change(sort, limit, offset) {
             return;
         }
 
@@ -2361,7 +2370,7 @@ impl Workspace {
         // because every later run is replacing rows the server sent and has to
         // clear them.
         let keep_rows = std::mem::take(stale);
-        let sql = relation_sql(engine, &schema, &relation, sort, *limit);
+        let sql = relation_sql(engine, &schema, &relation, sort, *limit, *offset);
         // A preview only re-queries when it is asked to, and this is the ask.
         *query = QueryState::Idle;
         self.execute_and_then(sql, Tab::Object(id), None, keep_rows, cx);
@@ -2384,8 +2393,11 @@ impl Workspace {
         };
         self.requery_relation(
             id,
-            move |sort, _| {
+            move |sort, _, offset| {
                 cycle(sort, &expression);
+                // A new ordering makes the old window meaningless: page five of
+                // one sort is not page five of another.
+                *offset = 0;
                 true
             },
             cx,
@@ -3002,6 +3014,8 @@ impl Workspace {
             Command::RecallStatement(sql) => self.recall_statement(sql, window, cx),
             Command::ShowStructure(showing) => self.show_structure(showing, cx),
             Command::RefreshRelation(id) => self.refresh_relation(id, cx),
+            Command::NextPage => self.turn_page(true, cx),
+            Command::PreviousPage => self.turn_page(false, cx),
             Command::CloseObject(id) => self.ask_before_close(CloseTarget::Object(id), cx),
             Command::ApplyEdits => self.apply_edits(&ApplyEdits, window, cx),
             Command::DiscardEdits => self.discard_edits(&DiscardEdits, window, cx),
@@ -3142,7 +3156,7 @@ impl Workspace {
     /// the only way to ask for a newer one.
     fn refresh_relation(&mut self, id: u64, cx: &mut Context<Self>) {
         self.clear_notice();
-        self.requery_relation(id, |_, _| true, cx);
+        self.requery_relation(id, |_, _, _| true, cx);
     }
 
     /// Ask a relation's preview for a different number of rows.
@@ -3158,10 +3172,69 @@ impl Workspace {
         };
         self.requery_relation(
             id,
-            move |_, limit| {
+            move |_, limit, offset| {
                 let moved = *limit != rows;
                 *limit = rows;
+                if moved {
+                    // A new page size redraws every page boundary, so the only
+                    // page that still means anything is the first.
+                    *offset = 0;
+                }
                 moved
+            },
+            cx,
+        );
+    }
+
+    /// Move a relation's preview one page of `limit` rows through the table.
+    fn next_page(&mut self, _: &NextPage, _: &mut Window, cx: &mut Context<Self>) {
+        self.turn_page(true, cx);
+    }
+
+    fn previous_page(&mut self, _: &PreviousPage, _: &mut Window, cx: &mut Context<Self>) {
+        self.turn_page(false, cx);
+    }
+
+    /// Paging is gated on what the last run brought back, not on a row count
+    /// the server was never asked for: a page shorter than its limit is the
+    /// relation's last, so there is nothing forward of it, and only a completed
+    /// page says how long it was. Backwards needs no result at all -- anywhere
+    /// but the first page, there is a page before this one.
+    fn turn_page(&mut self, forward: bool, cx: &mut Context<Self>) {
+        self.clear_notice();
+        let Some(Tab::Object(id)) = self.profile().map(|profile| profile.session.active) else {
+            return;
+        };
+        let Some(tab) = self
+            .profile()
+            .and_then(|profile| profile.session.objects.iter().find(|tab| tab.id == id))
+        else {
+            return;
+        };
+        let ObjectBody::Relation {
+            query,
+            limit,
+            offset,
+            ..
+        } = &tab.body
+        else {
+            return;
+        };
+        let can_turn = match forward {
+            true => matches!(query, QueryState::Complete { rows, .. } if *rows >= *limit),
+            false => *offset > 0,
+        };
+        if !can_turn {
+            return;
+        }
+        self.requery_relation(
+            id,
+            move |_, limit, offset| {
+                match forward {
+                    true => *offset += *limit,
+                    false => *offset = offset.saturating_sub(*limit),
+                }
+                true
             },
             cx,
         );
@@ -5323,6 +5396,8 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::discard_edits))
             .on_action(cx.listener(Self::sort_column))
             .on_action(cx.listener(Self::set_row_limit))
+            .on_action(cx.listener(Self::next_page))
+            .on_action(cx.listener(Self::previous_page))
             .on_action(cx.listener(Self::show_editor))
             .on_action(cx.listener(Self::cycle_theme))
             .on_action(cx.listener(Self::save_query))
@@ -5486,8 +5561,9 @@ fn relation_sql(
     relation: &str,
     sort: &[SortKey],
     limit: usize,
+    offset: usize,
 ) -> String {
-    let preview = preview_sql(engine, schema, relation, limit);
+    let preview = preview_sql(engine, schema, relation, limit, offset);
     sql::with_order_by(&preview, sort).unwrap_or(preview)
 }
 
@@ -6622,7 +6698,7 @@ mod tests {
     #[test]
     fn a_preview_asks_for_the_rows_its_tab_was_set_to() {
         assert_eq!(
-            relation_sql(Engine::Postgres, "public", "accounts", &[], 100),
+            relation_sql(Engine::Postgres, "public", "accounts", &[], 100, 0),
             r#"SELECT * FROM "public"."accounts" LIMIT 100"#
         );
         // A raised limit still keeps the sort ahead of it, or the rows would be
@@ -6633,9 +6709,35 @@ mod tests {
                 "public",
                 "accounts",
                 &[SortKey::new(r#""id""#, true)],
-                100_000
+                100_000,
+                0
             ),
             r#"SELECT * FROM "public"."accounts" ORDER BY "id" ASC LIMIT 100000"#
+        );
+    }
+
+    #[test]
+    fn a_paged_preview_stays_sortable() {
+        // The load-bearing pair: the sort must land ahead of a `LIMIT` that
+        // carries an `OFFSET`, and the statement must still parse afterwards,
+        // or the headers would go dark on every page but the first
+        // (`execute_and_then` reads the sort back off the statement it ran).
+        let paged = relation_sql(
+            Engine::Postgres,
+            "public",
+            "accounts",
+            &[SortKey::new(r#""id""#, true)],
+            100,
+            200,
+        );
+
+        assert_eq!(
+            paged,
+            r#"SELECT * FROM "public"."accounts" ORDER BY "id" ASC LIMIT 100 OFFSET 200"#
+        );
+        assert_eq!(
+            sql::order_by(&paged),
+            Some(vec![SortKey::new(r#""id""#, true)])
         );
     }
 
@@ -6672,6 +6774,7 @@ mod tests {
             "accounts",
             &[SortKey::new(r#""id""#, false)],
             PREVIEW_ROW_LIMIT,
+            0,
         );
 
         assert_eq!(

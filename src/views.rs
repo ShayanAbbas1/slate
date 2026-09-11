@@ -21,9 +21,9 @@ use gpui_component::{
 
 use crate::{
     CancelQuery, CloseTarget, Control, EDITOR_FONT_SIZE_MAX, EDITOR_FONT_SIZE_MIN, NewQuery,
-    ObjectBody, ObjectTab, Profile, QueryState, ResetEditorZoom, RunQuery, SaveQuery, SetRowLimit,
-    Settings, StructureState, Tab, Tone, Workspace, ZoomEditorIn, ZoomEditorOut, button,
-    button_label, compact_count, db,
+    NextPage, ObjectBody, ObjectTab, PreviousPage, Profile, QueryState, ResetEditorZoom, RunQuery,
+    SaveQuery, SetRowLimit, Settings, StructureState, Tab, Tone, Workspace, ZoomEditorIn,
+    ZoomEditorOut, button, button_label, compact_count, db,
     db::RoutineKind,
     dialog, editor_zoom_percent,
     explorer::ROW_LIMITS,
@@ -992,15 +992,24 @@ fn render_tab_strip(
     // What the preview asked the server for, and the only control over it.
     // Beside the Data | Structure pair because it belongs to the same view:
     // it is a property of these rows, not of the window.
-    let showing_rows = session.active_object().and_then(|tab| match &tab.body {
+    let preview = session.active_object().and_then(|tab| match &tab.body {
         ObjectBody::Relation {
             limit,
+            offset,
+            query,
             showing_structure: false,
             ..
-        } => Some(*limit),
+        } => Some((
+            *limit,
+            *offset,
+            // A full page may have another behind it; a short one is the
+            // relation's end. The same gate `turn_page` holds, read here only
+            // to decide whether the button is worth drawing.
+            matches!(query, QueryState::Complete { rows, .. } if *rows >= *limit),
+        )),
         _ => None,
     });
-    let row_limit = showing_rows.map(|limit| {
+    let row_limit = preview.map(|(limit, _, _)| {
         let chips: Vec<_> = ROW_LIMITS
             .into_iter()
             .map(|rows| row_limit_chip(rows, rows == limit, cx))
@@ -1017,6 +1026,53 @@ fn render_tab_strip(
                     .child("Rows"),
             )
             .children(chips)
+    });
+    // The pager appears only once there is somewhere to go: a first page
+    // shorter than its limit is the whole relation, and arrows over it are
+    // controls that can do nothing.
+    let pager = preview.and_then(|(limit, offset, full_page)| {
+        (offset > 0 || full_page).then(|| {
+            div()
+                .flex_shrink_0()
+                .flex()
+                .items_center()
+                .gap(px(layout::SPACE_XS))
+                .children((offset > 0).then(|| {
+                    icon_button(
+                        "previous-page",
+                        icon::CHEVRON_LEFT,
+                        Tone::Quiet,
+                        Control::Compact,
+                        t,
+                    )
+                    .tooltip("Previous page")
+                    .on_click(move |_, window, cx| {
+                        window.dispatch_action(Box::new(PreviousPage), cx);
+                    })
+                }))
+                .child(
+                    div()
+                        .text_size(px(layout::TEXT_SM))
+                        .text_color(t.text_faint)
+                        // Offsets are multiples of the limit by construction --
+                        // paging moves a page at a time and every other change
+                        // resets to the first -- so the page number is exact.
+                        .child(format!("Page {}", offset / limit + 1)),
+                )
+                .children(full_page.then(|| {
+                    icon_button(
+                        "next-page",
+                        icon::CHEVRON_RIGHT,
+                        Tone::Quiet,
+                        Control::Compact,
+                        t,
+                    )
+                    .tooltip("Next page")
+                    .on_click(move |_, window, cx| {
+                        window.dispatch_action(Box::new(NextPage), cx);
+                    })
+                }))
+        })
     });
 
     let zoom = editor_zoom_percent(editor_font_size);
@@ -1068,6 +1124,7 @@ fn render_tab_strip(
         )
         .children(structure_toggle)
         .children(row_limit)
+        .children(pager)
         // 100% is not information; the readout appears only once the zoom
         // has somewhere to return to.
         .children((runnable && zoom != 100).then(|| {
@@ -1241,10 +1298,7 @@ pub fn render_settings(settings: &Settings, cx: &mut Context<Workspace>) -> AnyE
                 .child(settings_section(
                     t,
                     "Theme",
-                    div()
-                        .flex()
-                        .gap(px(layout::SPACE_XS))
-                        .children(themes),
+                    div().flex().gap(px(layout::SPACE_XS)).children(themes),
                 ))
                 .child(settings_section(t, "Editor zoom", zoom))
                 .child(settings_section(
@@ -1261,14 +1315,13 @@ pub fn render_settings(settings: &Settings, cx: &mut Context<Workspace>) -> AnyE
                     "Default limit",
                     div().flex().gap(px(layout::SPACE_XS)).children(limits),
                 ))
-                .child(
-                    div().flex().justify_end().child(
-                        button("settings-done", "Done", Tone::Primary, Control::Standard, t)
-                            .on_click(cx.listener(|workspace, _: &ClickEvent, _, cx| {
-                                workspace.close_settings(cx);
-                            })),
+                .child(div().flex().justify_end().child(
+                    button("settings-done", "Done", Tone::Primary, Control::Standard, t).on_click(
+                        cx.listener(|workspace, _: &ClickEvent, _, cx| {
+                            workspace.close_settings(cx);
+                        }),
                     ),
-                ),
+                )),
         )
         .into_any_element()
 }

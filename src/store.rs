@@ -1100,7 +1100,10 @@ open_objects = []
 
         let text = toml::to_string_pretty(&file).expect("profile file must encode");
         let decoded: ProfileFile = toml::from_str(&text).expect("profile file must decode");
-        assert_eq!(decoded, file, "round trip did not preserve the file:\n{text}");
+        assert_eq!(
+            decoded, file,
+            "round trip did not preserve the file:\n{text}"
+        );
 
         // A file written before `settings` existed has no `[settings]` table
         // at all, and that is what is on disk for everyone running Slate

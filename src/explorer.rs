@@ -154,11 +154,26 @@ fn category(label: &'static str, schema_index: usize, children: Vec<TreeItem>) -
         .children(children)
 }
 
-pub fn preview_sql(engine: Engine, schema: &str, relation: &str, limit: usize) -> String {
-    format!(
+pub fn preview_sql(
+    engine: Engine,
+    schema: &str,
+    relation: &str,
+    limit: usize,
+    offset: usize,
+) -> String {
+    let mut sql = format!(
         "SELECT * FROM {} LIMIT {limit}",
         engine.qualified(schema, relation)
-    )
+    );
+    // `OFFSET` after `LIMIT`: the one order all three engines accept, and the
+    // one the statement grammar reads -- it nests `offset` inside the `limit`
+    // node, which is what keeps a paged preview sortable. A zero offset is
+    // omitted rather than written, so the first page's statement is the
+    // statement previews have always run.
+    if offset > 0 {
+        sql.push_str(&format!(" OFFSET {offset}"));
+    }
+    sql
 }
 
 fn relation_matches(relation: &Relation, filter: &str) -> bool {
@@ -309,9 +324,18 @@ mod tests {
                 Engine::Postgres,
                 r#"odd"schema"#,
                 r#"table"name"#,
-                PREVIEW_ROW_LIMIT
+                PREVIEW_ROW_LIMIT,
+                0
             ),
             r#"SELECT * FROM "odd""schema"."table""name" LIMIT 1000"#
+        );
+    }
+
+    #[test]
+    fn a_paged_preview_carries_its_offset_after_the_limit() {
+        assert_eq!(
+            preview_sql(Engine::Postgres, "public", "accounts", 1_000, 2_000),
+            r#"SELECT * FROM "public"."accounts" LIMIT 1000 OFFSET 2000"#
         );
     }
 }

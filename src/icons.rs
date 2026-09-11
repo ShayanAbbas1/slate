@@ -67,6 +67,7 @@ const ICONS: [(&str, &IconData); 34] = [
 pub mod icon {
     pub const CHEVRON_DOWN: &str = "icons/chevron-down.svg";
     pub const CHEVRON_RIGHT: &str = "icons/chevron-right.svg";
+    pub const CHEVRON_LEFT: &str = "icons/chevron-left.svg";
     pub const SWITCHER: &str = "icons/chevrons-up-down.svg";
     /// Folds the explorer column away, and brings it back.
     pub const SIDEBAR: &str = "icons/panel-left.svg";

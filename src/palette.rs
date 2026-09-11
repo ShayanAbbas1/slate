@@ -20,7 +20,7 @@ use nucleo_matcher::{
 };
 
 use crate::{
-    CatalogState, ObjectBody, Profile, Tab, Workspace,
+    CatalogState, ObjectBody, Profile, QueryState, Tab, Workspace,
     db::{RelationKind, RoutineKind},
     explorer::{ExplorerTarget, ObjectKind},
     export::Format,
@@ -64,6 +64,8 @@ pub enum Command {
     RecallStatement(String),
     ShowStructure(bool),
     RefreshRelation(u64),
+    NextPage,
+    PreviousPage,
     CloseObject(u64),
     ApplyEdits,
     DiscardEdits,
@@ -407,7 +409,11 @@ fn command_items(workspace: &Workspace, profile: &Profile, cx: &App) -> Vec<Item
 
     if let Some(tab) = session.active_object() {
         if let ObjectBody::Relation {
-            showing_structure, ..
+            showing_structure,
+            query,
+            limit,
+            offset,
+            ..
         } = &tab.body
         {
             items.push(if *showing_structure {
@@ -426,6 +432,26 @@ fn command_items(workspace: &Workspace, profile: &Profile, cx: &App) -> Vec<Item
                 icon::RUN,
                 Command::RefreshRelation(tab.id),
             ));
+            // The same gates the pager buttons stand behind: forward only off
+            // a full page, backwards only off a page that is not the first.
+            if !*showing_structure {
+                if matches!(query, QueryState::Complete { rows, .. } if *rows >= *limit) {
+                    items.push(Item::command(
+                        "Next page",
+                        "",
+                        icon::CHEVRON_RIGHT,
+                        Command::NextPage,
+                    ));
+                }
+                if *offset > 0 {
+                    items.push(Item::command(
+                        "Previous page",
+                        "",
+                        icon::CHEVRON_LEFT,
+                        Command::PreviousPage,
+                    ));
+                }
+            }
         }
         items.push(Item::command(
             "Close tab",
