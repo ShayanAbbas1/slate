@@ -155,6 +155,12 @@ pub struct StoredGrid {
     pub last_query: Option<String>,
     #[serde(default)]
     pub limit: Option<usize>,
+    /// The relation tab's filter, so reopening Slate lands on the rows that
+    /// were being read rather than on the whole table. Kept for the same reason
+    /// [`Self::order_by`] is, and unlike the page offset, which is not part of
+    /// what a tab is showing.
+    #[serde(default)]
+    pub filter: String,
     #[serde(default)]
     pub showing_structure: bool,
     #[serde(default)]
@@ -507,6 +513,7 @@ pub fn write_grid(profile_id: &str, key: &str, grid: &StoredGrid) -> Result<(), 
             active: grid.active,
             last_query: grid.last_query.clone(),
             limit: grid.limit,
+            filter: grid.filter.clone(),
             showing_structure: grid.showing_structure,
             captured: grid.captured,
         };
@@ -1370,6 +1377,7 @@ open_objects = []
                 active: None,
                 last_query: None,
                 limit: None,
+                filter: String::new(),
                 showing_structure: false,
                 captured: 0,
             };
@@ -1413,6 +1421,7 @@ open_objects = []
                 active: Some((0, 1)),
                 last_query: Some("select * from accounts".into()),
                 limit: Some(1_000),
+                filter: String::new(),
                 showing_structure: false,
                 captured: 1_700_000_000,
             };
@@ -1438,6 +1447,7 @@ open_objects = []
                 active: None,
                 last_query: None,
                 limit: None,
+                filter: String::new(),
                 showing_structure: false,
                 captured: 0,
             };
@@ -1463,5 +1473,48 @@ open_objects = []
             assert_eq!(read_grid("dev", &key), None);
             assert_eq!(read_grid("dev", &big_key), None);
         });
+    }
+
+    #[test]
+    fn a_snapshot_keeps_the_filter_its_rows_were_read_under() {
+        with_home(|| {
+            let filtered = StoredGrid {
+                columns: vec!["id".into()],
+                rows: vec![vec![Some("1".into())]],
+                total_rows: 1,
+                sort: Vec::new(),
+                order_by: vec![("\"id\"".into(), true)],
+                widths: Vec::new(),
+                active: None,
+                last_query: None,
+                limit: Some(1_000),
+                filter: r#""state" = 'ok'"#.into(),
+                showing_structure: false,
+                captured: 1_700_000_000,
+            };
+            let key = object_grid_key("public", "accounts");
+            write_grid("dev", &key, &filtered).expect("a filtered grid must write");
+
+            // Whole-struct equality: the filter is part of what the tab was
+            // showing, so a tab that forgot it would come back a different tab.
+            assert_eq!(read_grid("dev", &key), Some(filtered));
+            delete_grids("dev").expect("the profile's grids must be removable");
+        });
+    }
+
+    #[test]
+    fn a_snapshot_written_before_filters_reads_back_as_unfiltered() {
+        // Which is what it was running with. No home needed: this is the decode
+        // of a file on someone's disk right now.
+        let older = r#"{
+            "columns": ["id"],
+            "rows": [["1"]],
+            "total_rows": 1,
+            "captured": 1700000000
+        }"#;
+        let grid: StoredGrid = serde_json::from_str(older).expect("an older grid must decode");
+
+        assert_eq!(grid.filter, "");
+        assert_eq!(grid.limit, None);
     }
 }

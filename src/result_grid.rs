@@ -267,6 +267,7 @@ impl ResultGrid {
             active: self.active,
             last_query: None,
             limit: None,
+            filter: String::new(),
             showing_structure: false,
             // A snapshot that is written back unchanged keeps its own age: it
             // is still the rows it was, and restamping it would make every
@@ -993,6 +994,7 @@ mod tests {
             active: None,
             last_query: None,
             limit: None,
+            filter: String::new(),
             showing_structure: false,
             captured: 1_700_000_000,
         });

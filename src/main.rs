@@ -2581,6 +2581,7 @@ impl Workspace {
                         showing_structure,
                         query,
                         sort,
+                        filter,
                         limit,
                         stale,
                         ..
@@ -2596,6 +2597,10 @@ impl Workspace {
                         .iter()
                         .map(|(expression, ascending)| SortKey::new(expression.clone(), *ascending))
                         .collect();
+                    // The filter the snapshot's rows were read under, so the
+                    // refresh asks the same question rather than the whole
+                    // table's.
+                    *filter = snapshot.filter.clone();
                     *limit = snapshot.limit.unwrap_or(preview_rows);
                     *stale = true;
                 }
@@ -5784,6 +5789,7 @@ fn write_grids(profile: &Profile, cx: &App) {
             results,
             query,
             sort,
+            filter,
             limit,
             showing_structure,
             ..
@@ -5803,6 +5809,7 @@ fn write_grids(profile: &Profile, cx: &App) {
             &store::object_grid_key(&tab.schema, &tab.name),
             &store::StoredGrid {
                 limit: Some(*limit),
+                filter: filter.clone(),
                 showing_structure: *showing_structure,
                 order_by: sort
                     .iter()
