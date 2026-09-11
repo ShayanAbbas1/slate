@@ -524,6 +524,28 @@ impl ResultGrid {
         true
     }
 
+    /// Stage a `NULL` on a cell, closing any input open over it. `false` when
+    /// the cell is not editable, and nothing happens then.
+    ///
+    /// The one implementation behind both gestures. The editor's `NULL` button
+    /// dispatches the same action the palette and the keystroke do, so there is
+    /// nothing here that can behave differently depending on which was used.
+    pub fn set_null(&mut self, row: usize, col: usize) -> bool {
+        if !self.set_pending(row, col, None) {
+            return false;
+        }
+        // An input still holding the old text would commit it back on the next
+        // `Enter`, over the NULL that was just asked for.
+        if self
+            .editing
+            .as_ref()
+            .is_some_and(|editing| (editing.row, editing.col) == (row, col))
+        {
+            self.editing = None;
+        }
+        true
+    }
+
     pub fn has_pending(&self) -> bool {
         !self.pending.is_empty()
     }
@@ -906,17 +928,35 @@ impl TableDelegate for ResultGrid {
         if let Some(input) = self.editing_input(row_ix, col_ix, window, cx) {
             return base
                 .bg(edited_bg)
+                .gap(px(layout::SPACE_SM))
                 .child(
-                    Input::new(&input)
-                        // The cell is the frame; a second border and background
-                        // inside one would read as a control in a hole.
-                        .appearance(false)
-                        .px_0()
-                        // The cell is the frame, so take its height rather than
-                        // the control's own `rems`-based one, which is sized for
-                        // a standalone field and overflows the row.
-                        .h_full()
-                        .text_size(px(layout::TEXT_MD)),
+                    div().flex_1().min_w_0().child(
+                        Input::new(&input)
+                            // The cell is the frame; a second border and
+                            // background inside one would read as a control in
+                            // a hole.
+                            .appearance(false)
+                            .px_0()
+                            // The cell is the frame, so take its height rather
+                            // than the control's own `rems`-based one, which is
+                            // sized for a standalone field and overflows the
+                            // row.
+                            .h_full()
+                            .text_size(px(layout::TEXT_MD)),
+                    ),
+                )
+                // How the action is found. It dispatches rather than nulling the
+                // cell itself, so the button and the keystroke cannot drift.
+                .child(
+                    div()
+                        .id(("null", row_ix * self.columns.len() + col_ix))
+                        .flex_shrink_0()
+                        .italic()
+                        .text_color(faint)
+                        .child(NULL_LABEL)
+                        .on_click(cx.listener(move |_, _, window, cx| {
+                            window.dispatch_action(Box::new(crate::SetNull), cx);
+                        })),
                 )
                 // The input has focus, so both keystrokes arrive here on their
                 // way out of it. Consumed rather than propagated: `escape`
@@ -1332,6 +1372,30 @@ mod tests {
         // sends it down the cell's own italic branch.
         assert!(grid.set_pending(0, 1, None));
         assert!(grid.pending_at(0, 1).unwrap().shown.is_none());
+    }
+
+    #[test]
+    fn one_gesture_stages_a_null_and_closes_the_input_over_it() {
+        // Both ways of asking end here: the action on the active cell, and the
+        // editor's own affordance, which dispatches that same action rather
+        // than doing this a second time.
+        let mut grid = editable_grid();
+
+        assert!(grid.begin_edit(0, 1));
+        assert!(grid.set_null(0, 1));
+        assert!(
+            grid.editing.is_none(),
+            "an input left open over a nulled cell would commit its text back"
+        );
+        assert_eq!(
+            grid.pending_updates()[0].sets,
+            vec![("body".to_string(), None)]
+        );
+
+        // A key column is no more nullable than it is editable, and the same
+        // predicate refuses both.
+        assert!(!grid.set_null(0, 0));
+        assert!(!grid.set_null(0, 2));
     }
 
     #[test]

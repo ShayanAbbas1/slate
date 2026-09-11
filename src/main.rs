@@ -98,6 +98,7 @@ actions!(
         ClearFilter,
         EditCell,
         CopyCell,
+        SetNull,
         ApplyEdits,
         DiscardEdits,
         FuzzyOpen,
@@ -3082,6 +3083,7 @@ impl Workspace {
             Command::FilterRows => self.focus_filter(window, cx),
             Command::ClearFilter => self.clear_filter(&ClearFilter, window, cx),
             Command::CloseObject(id) => self.ask_before_close(CloseTarget::Object(id), cx),
+            Command::SetNull => self.set_null(&SetNull, window, cx),
             Command::ApplyEdits => self.apply_edits(&ApplyEdits, window, cx),
             Command::DiscardEdits => self.discard_edits(&DiscardEdits, window, cx),
             Command::ExportResults(format) => self.export_results(format, cx),
@@ -3141,6 +3143,20 @@ impl Workspace {
                 .session
                 .active_results()
                 .is_some_and(|results| results.read(cx).delegate().has_pending())
+        })
+    }
+
+    /// Whether the cell the ring is on can be written at all. Read off the grid
+    /// for the reason [`Workspace::has_pending_edits`] is: nothing may disagree
+    /// with the cells about what is editable.
+    fn has_editable_cell(&self, cx: &App) -> bool {
+        self.profile().is_some_and(|profile| {
+            profile.session.active_results().is_some_and(|results| {
+                let grid = results.read(cx);
+                grid.delegate()
+                    .active()
+                    .is_some_and(|(row, col)| grid.delegate().editable(row, col))
+            })
         })
     }
 
@@ -3522,6 +3538,37 @@ impl Workspace {
             },
             cx,
         );
+    }
+
+    /// Stage a `NULL` on the active cell, from the keystroke, the palette, or
+    /// the `NULL` beside an open cell input — one action behind all three, so
+    /// none of them can mean something different (spec §3).
+    fn set_null(&mut self, _: &SetNull, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(profile) = self.profile() else {
+            return;
+        };
+        // The gate `edit_cell` holds, for its reason: a batch already on screen
+        // was generated from the pending set as it stood.
+        if profile.session.apply_review.is_some() {
+            return;
+        }
+        let Some(results) = profile.session.active_results().cloned() else {
+            return;
+        };
+        let Some((row, col)) = results.read(cx).delegate().active() else {
+            return;
+        };
+        if results.update(cx, |table, cx| {
+            let nulled = table.delegate_mut().set_null(row, col);
+            cx.notify();
+            nulled
+        }) {
+            // The input this just closed had focus, and a window with nothing
+            // focused has no dispatch path at all.
+            results.focus_handle(cx).focus(window);
+            return;
+        }
+        self.note("This column cannot be edited.".into(), cx);
     }
 
     /// `cmd+c` on the active cell, whole value and all.
@@ -6616,6 +6663,11 @@ fn main() {
             // `cmd+c` wins there and the grid's copy never steals a text
             // selection.
             KeyBinding::new("cmd-c", CopyCell, Some("Table")),
+            // Scoped to the grid like the two above, but unlike them it has to
+            // keep working with a cell's input open, which is where the NULL
+            // affordance beside it dispatches the same action from. A `ctrl`
+            // stroke because a text field owns every `cmd` letter it is given.
+            KeyBinding::new("ctrl-shift-n", SetNull, Some("Table")),
             // The input binds `tab` to indent and never asks its own
             // completion popup first, so the popup would never see the
             // keystroke. Scoped to the buffer, and registered after

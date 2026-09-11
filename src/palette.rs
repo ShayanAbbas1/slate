@@ -71,6 +71,9 @@ pub enum Command {
     FilterRows,
     ClearFilter,
     CloseObject(u64),
+    /// Stage a `NULL` on the active cell. The row is how the gesture stops
+    /// being folklore; the editor's own affordance dispatches the same action.
+    SetNull,
     ApplyEdits,
     DiscardEdits,
     /// The format here only picks the extension the save dialog suggests. What
@@ -495,6 +498,16 @@ fn command_items(workspace: &Workspace, profile: &Profile, cx: &App) -> Vec<Item
             "",
             icon::SAVE,
             Command::ExportResults(Format::Json),
+        ));
+    }
+
+    // Only where the ring is on a cell that can actually take one.
+    if workspace.has_editable_cell(cx) {
+        items.push(Item::command(
+            "Set cell to NULL",
+            "⌃⇧N",
+            icon::RENAME,
+            Command::SetNull,
         ));
     }
 
