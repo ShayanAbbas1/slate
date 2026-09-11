@@ -183,7 +183,12 @@ pub fn with_order_by(statement: &str, keys: &[SortKey]) -> Option<String> {
 /// column's assignment cast, so `'123'` lands in an `int4` exactly as `123`
 /// would, and SQLite applies the column's type affinity to the same effect. A
 /// cast Slate chose for itself could only ever be the wrong one. A cleared cell
-/// is therefore the empty string; writing a NULL is not expressible here.
+/// is therefore the empty string, and a `None` in `sets` is a `NULL`: the two
+/// are different writes, which is the whole point of spelling one of them as an
+/// absence.
+///
+/// `keys` carries no `None`, because a row identified by a `NULL` is a row `=`
+/// does not find; the caller drops such a row before it gets here.
 ///
 /// `None` when either list is empty. A statement with no `WHERE` rewrites every
 /// row in the table and one with no `SET` is not a statement at all, so a caller
@@ -193,18 +198,22 @@ pub fn update_row(
     engine: Engine,
     schema: &str,
     table: &str,
-    sets: &[(&str, &str)],
+    sets: &[(&str, Option<&str>)],
     keys: &[(&str, &str)],
 ) -> Option<String> {
     if sets.is_empty() || keys.is_empty() {
         return None;
     }
 
+    let keys: Vec<(&str, Option<&str>)> = keys
+        .iter()
+        .map(|&(column, value)| (column, Some(value)))
+        .collect();
     Some(format!(
         "UPDATE {} SET {} WHERE {}",
         engine.qualified(schema, table),
         assignments(engine, sets, ", "),
-        assignments(engine, keys, " AND ")
+        assignments(engine, &keys, " AND ")
     ))
 }
 
@@ -309,18 +318,27 @@ fn generated_statements<'tree>(root: &Node<'tree>) -> Option<Vec<Node<'tree>>> {
     }
 }
 
-fn assignments(engine: Engine, columns: &[(&str, &str)], separator: &str) -> String {
+fn assignments(engine: Engine, columns: &[(&str, Option<&str>)], separator: &str) -> String {
     columns
         .iter()
-        .map(|(column, value)| {
+        .map(|&(column, value)| {
             format!(
                 "{} = {}",
                 engine.quote_identifier(column),
-                engine.quote_literal(value)
+                literal(engine, value)
             )
         })
         .collect::<Vec<_>>()
         .join(separator)
+}
+
+/// A value as it goes into a statement: quoted, or the keyword for there being
+/// no value. Unquoted is the only way to write it — `'NULL'` is the word.
+fn literal(engine: Engine, value: Option<&str>) -> String {
+    match value {
+        Some(value) => engine.quote_literal(value),
+        None => "NULL".to_string(),
+    }
 }
 
 /// The grammar offers no `drop` or `truncate` node to look for. `DROP TABLE` is
@@ -825,7 +843,7 @@ mod tests {
                 Engine::Postgres,
                 "public",
                 "measurements",
-                &[("note", "ok")],
+                &[("note", Some("ok"))],
                 &[("id", "7")]
             )
             .unwrap(),
@@ -836,7 +854,7 @@ mod tests {
                 Engine::Postgres,
                 "public",
                 "measurements",
-                &[("note", "ok"), ("depth", "12")],
+                &[("note", Some("ok")), ("depth", Some("12"))],
                 &[("id", "7")]
             )
             .unwrap(),
@@ -853,7 +871,7 @@ mod tests {
                 Engine::Postgres,
                 "app",
                 "memberships",
-                &[("role", "owner")],
+                &[("role", Some("owner"))],
                 &[("org_id", "1"), ("user_id", "2")]
             )
             .unwrap(),
@@ -870,7 +888,7 @@ mod tests {
                 Engine::Postgres,
                 "s",
                 "t",
-                &[("a", "it's")],
+                &[("a", Some("it's"))],
                 &[("id", "o'hara")]
             )
             .unwrap(),
@@ -881,7 +899,7 @@ mod tests {
                 Engine::Postgres,
                 "s",
                 r#"od"d"#,
-                &[(r#"we"ird"#, "x")],
+                &[(r#"we"ird"#, Some("x"))],
                 &[("id", "1")]
             )
             .unwrap(),
@@ -890,10 +908,57 @@ mod tests {
     }
 
     #[test]
+    fn a_null_goes_in_as_the_keyword_and_never_as_a_quoted_word() {
+        // `'NULL'` is a four-letter string and `NULL` is the absence of a
+        // value. The whole worth of the gesture is that the two differ.
+        assert_eq!(
+            update_row(
+                Engine::Postgres,
+                "public",
+                "measurements",
+                &[("note", None)],
+                &[("id", "7")]
+            )
+            .unwrap(),
+            r#"UPDATE "public"."measurements" SET "note" = NULL WHERE "id" = '7'"#
+        );
+        // Mixed, on the engine whose identifier quote is its own: a NULL beside
+        // a value must not disturb the separator between them.
+        assert_eq!(
+            update_row(
+                Engine::MySql,
+                "slate_dev",
+                "measurements",
+                &[("note", None), ("depth", Some("12"))],
+                &[("id", "7")]
+            )
+            .unwrap(),
+            "UPDATE `slate_dev`.`measurements` SET `note` = NULL, `depth` = '12' WHERE `id` = '7'"
+        );
+        // And the word itself, typed into a cell, is still a string.
+        assert_eq!(
+            update_row(
+                Engine::Sqlite,
+                "main",
+                "measurements",
+                &[("note", Some("NULL"))],
+                &[("id", "7")]
+            )
+            .unwrap(),
+            r#"UPDATE "main"."measurements" SET "note" = 'NULL' WHERE "id" = '7'"#
+        );
+        // The gate is untouched by this: `SET x = NULL` is an `update` node
+        // like any other, and a test here is what proves it rather than hopes.
+        let statement =
+            update_row(Engine::Postgres, "s", "t", &[("a", None)], &[("id", "1")]).unwrap();
+        assert!(is_generated_update(&statement), "{statement} was refused");
+    }
+
+    #[test]
     fn an_update_with_nothing_to_match_on_is_refused() {
         // No WHERE rewrites every row in the table. It must not be possible to
         // produce that statement, so a caller with no key gets nothing.
-        assert!(update_row(Engine::Postgres, "s", "t", &[("a", "1")], &[]).is_none());
+        assert!(update_row(Engine::Postgres, "s", "t", &[("a", Some("1"))], &[]).is_none());
         assert!(update_row(Engine::Postgres, "s", "t", &[], &[("id", "1")]).is_none());
     }
 
@@ -999,7 +1064,7 @@ mod tests {
             Engine::Postgres,
             "public",
             "measurements",
-            &[("note", "it's fine"), ("depth", "12")],
+            &[("note", Some("it's fine")), ("depth", Some("12"))],
             &[("id", "7"), ("run", "a'b")],
         )
         .unwrap();

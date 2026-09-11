@@ -107,9 +107,13 @@ struct PendingEdit {
     row: usize,
     col: usize,
     /// What will be written. Whole, because this is what the `UPDATE` carries.
-    value: SharedString,
-    /// What the column paints, clipped for the same reason `display` is.
-    shown: SharedString,
+    /// `None` is a `NULL`, which is a different write from the empty string.
+    value: Option<SharedString>,
+    /// What the column paints, clipped for the same reason `display` is, and
+    /// absent for the same reason a fetched NULL's display cell is: the cell
+    /// already paints an absence in italics, and a second spelling of `NULL`
+    /// on screen is one too many.
+    shown: Option<SharedString>,
 }
 
 struct Filtering {
@@ -132,8 +136,9 @@ struct Editing {
 pub struct PendingRow {
     pub schema: String,
     pub table: String,
-    /// Real column name and its new value, one per changed column.
-    pub sets: Vec<(String, String)>,
+    /// Real column name and its new value, one per changed column. `None` is a
+    /// `NULL`.
+    pub sets: Vec<(String, Option<String>)>,
     /// The key columns' real names against their **as-fetched** values: the row
     /// is identified by what the server holds, not by what the user has typed.
     pub keys: Vec<(String, String)>,
@@ -472,9 +477,9 @@ impl ResultGrid {
         self.filtering.as_ref().map(|filtering| filtering.col)
     }
 
-    /// Record a new value for a cell. `false` when the cell is not editable, in
-    /// which case nothing is recorded.
-    pub fn set_pending(&mut self, row: usize, col: usize, value: String) -> bool {
+    /// Record a new value for a cell, where `None` is a `NULL`. `false` when
+    /// the cell is not editable, in which case nothing is recorded.
+    pub fn set_pending(&mut self, row: usize, col: usize, value: Option<String>) -> bool {
         if !self.editable(row, col) {
             return false;
         }
@@ -482,23 +487,24 @@ impl ResultGrid {
         // An input seeds itself with the value as fetched, so opening an edit
         // and closing it without typing arrives here carrying the server's own
         // value back. That is not an edit, and recording it would write a
-        // rendered value over the value it was rendered from. A NULL renders as
-        // nothing, which is why the empty string is what it compares against —
-        // typing the empty string into a cell that holds text is still an edit,
-        // and still recorded.
-        if self.cell(row, col).unwrap_or_default() == value {
+        // rendered value over the value it was rendered from. Nulling a cell
+        // the server already left NULL is the same non-edit, which comparing
+        // the absences rather than their renderings is what catches.
+        if self.cell(row, col) == value.as_deref() {
             self.pending
                 .retain(|edit| (edit.row, edit.col) != (row, col));
             return true;
         }
 
-        let value: SharedString = value.into();
+        let value: Option<SharedString> = value.map(SharedString::from);
         // Bytes, not characters: it only has to be cheap and never under-count,
         // and `clip` is a no-op on anything that turns out to fit.
-        let shown = match value.len() > CELL_DISPLAY_LIMIT {
-            true => clip(&value).into(),
-            false => value.clone(),
-        };
+        let shown = value
+            .as_ref()
+            .map(|value| match value.len() > CELL_DISPLAY_LIMIT {
+                true => SharedString::from(clip(value)),
+                false => value.clone(),
+            });
         match self
             .pending
             .iter_mut()
@@ -548,13 +554,13 @@ impl ResultGrid {
 
         rows.into_iter()
             .filter_map(|row| {
-                let sets: Vec<(String, String)> = self
+                let sets: Vec<(String, Option<String>)> = self
                     .pending
                     .iter()
                     .filter(|pending| pending.row == row)
                     .filter_map(|pending| {
                         let name = edit.columns.get(pending.col)?.clone()?;
-                        Some((name, pending.value.to_string()))
+                        Some((name, pending.value.as_ref().map(SharedString::to_string)))
                     })
                     .collect();
                 if sets.is_empty() {
@@ -606,10 +612,11 @@ impl ResultGrid {
         }
 
         // The whole value, not the clipped one: this is the value being
-        // changed, and a NULL is edited as the empty string because there is no
-        // way to type one back (spec §3).
+        // changed. A NULL seeds as the empty string because that is the only
+        // thing an input can hold; typing one back is the `SetNull` action's
+        // job, not the input's (spec §3).
         let seed = match self.pending_at(row, col) {
-            Some(pending) => pending.value.clone(),
+            Some(pending) => pending.value.clone().unwrap_or_default(),
             None => self
                 .cell(row, col)
                 .map(|value| SharedString::from(value.to_string()))
@@ -656,7 +663,11 @@ impl ResultGrid {
         let Some(input) = editing.input else {
             return;
         };
-        self.set_pending(editing.row, editing.col, input.read(cx).value().to_string());
+        self.set_pending(
+            editing.row,
+            editing.col,
+            Some(input.read(cx).value().to_string()),
+        );
     }
 }
 
@@ -932,7 +943,9 @@ impl TableDelegate for ResultGrid {
         // patching `display`, which stays exactly as fetched.
         let pending = self.pending_at(row_ix, col_ix);
         let cell = match pending {
-            Some(pending) => Some(pending.shown.clone()),
+            // A staged NULL has no `shown`, so it falls into the same italic
+            // branch a fetched one does while still wearing the edited wash.
+            Some(pending) => pending.shown.clone(),
             // Rows are not guaranteed rectangular and an index can outlive the
             // result set it was taken from. Indexing here would abort the
             // process mid-paint and take the user's editor buffer with it.
@@ -1020,12 +1033,28 @@ mod tests {
         })
     }
 
+    /// The same shape as [`editable_grid`], but with the editable column left
+    /// NULL by the server: the one row a staged NULL has to be told apart from.
+    fn grid_with_a_null() -> ResultGrid {
+        ResultGrid::new(QueryResult {
+            columns: vec![column("id"), column("note")],
+            rows: vec![vec![Some("7".into()), None]],
+            edit: Some(EditTarget {
+                schema: "public".into(),
+                table: "measurements".into(),
+                columns: vec![Some("id".into()), Some("body".into())],
+                keys: vec![0],
+            }),
+            ..QueryResult::default()
+        })
+    }
+
     #[test]
     fn a_pending_edit_leaves_the_fetched_rows_alone() {
         // The grid shows changed-against-server by holding both. Writing the
         // edit into `result.rows` would lose the server's value for good.
         let mut grid = editable_grid();
-        assert!(grid.set_pending(0, 1, "changed".into()));
+        assert!(grid.set_pending(0, 1, Some("changed".into())));
 
         assert_eq!(grid.result.rows[0][1].as_deref(), Some("first"));
         assert_eq!(
@@ -1041,8 +1070,8 @@ mod tests {
         // One statement per row, not per cell: two `UPDATE`s against the same
         // key would be two round trips writing over each other's work.
         let mut grid = editable_grid();
-        assert!(grid.set_pending(0, 1, "once".into()));
-        assert!(grid.set_pending(0, 1, "twice".into()));
+        assert!(grid.set_pending(0, 1, Some("once".into())));
+        assert!(grid.set_pending(0, 1, Some("twice".into())));
 
         let updates = grid.pending_updates();
         assert_eq!(updates.len(), 1);
@@ -1052,15 +1081,15 @@ mod tests {
         // column the table actually has.
         assert_eq!(
             updates[0].sets,
-            vec![("body".to_string(), "twice".to_string())]
+            vec![("body".to_string(), Some("twice".to_string()))]
         );
     }
 
     #[test]
     fn two_edited_rows_become_two_updates() {
         let mut grid = editable_grid();
-        assert!(grid.set_pending(1, 1, "later".into()));
-        assert!(grid.set_pending(0, 1, "earlier".into()));
+        assert!(grid.set_pending(1, 1, Some("later".into())));
+        assert!(grid.set_pending(0, 1, Some("earlier".into())));
 
         let updates = grid.pending_updates();
         assert_eq!(updates.len(), 2);
@@ -1079,7 +1108,7 @@ mod tests {
         grid.set_widths(&[px(120.), px(64.), px(200.)]);
         grid.set_active(1, 2);
         // An edit nobody applied stays with the session that typed it.
-        assert!(grid.set_pending(0, 1, "changed".into()));
+        assert!(grid.set_pending(0, 1, Some("changed".into())));
 
         let restored = ResultGrid::restored(&grid.stored());
 
@@ -1172,13 +1201,13 @@ mod tests {
         // The `WHERE` names the row the server holds. Taking a key value from
         // the pending set would build a predicate that matches nothing.
         let mut grid = editable_grid();
-        assert!(grid.set_pending(0, 1, "changed".into()));
+        assert!(grid.set_pending(0, 1, Some("changed".into())));
 
         let updates = grid.pending_updates();
         assert_eq!(updates[0].keys, vec![("id".to_string(), "7".to_string())]);
         assert_eq!(
             updates[0].sets,
-            vec![("body".to_string(), "changed".to_string())]
+            vec![("body".to_string(), Some("changed".to_string()))]
         );
     }
 
@@ -1198,7 +1227,7 @@ mod tests {
             ..QueryResult::default()
         });
 
-        assert!(grid.set_pending(0, 1, "changed".into()));
+        assert!(grid.set_pending(0, 1, Some("changed".into())));
         assert!(grid.pending_updates().is_empty());
     }
 
@@ -1210,7 +1239,7 @@ mod tests {
 
         assert!(!grid.editable(0, 0));
         assert!(!grid.begin_edit(0, 0));
-        assert!(!grid.set_pending(0, 0, "99".into()));
+        assert!(!grid.set_pending(0, 0, Some("99".into())));
         assert!(!grid.has_pending());
     }
 
@@ -1220,11 +1249,11 @@ mod tests {
         let mut grid = editable_grid();
 
         assert!(!grid.editable(0, 2));
-        assert!(!grid.set_pending(0, 2, "99".into()));
+        assert!(!grid.set_pending(0, 2, Some("99".into())));
         // Nor does a column past the end of the result set become editable.
-        assert!(!grid.set_pending(0, 9, "99".into()));
+        assert!(!grid.set_pending(0, 9, Some("99".into())));
         // Nor a row past the end of it.
-        assert!(!grid.set_pending(9, 1, "99".into()));
+        assert!(!grid.set_pending(9, 1, Some("99".into())));
         assert!(!grid.has_pending());
     }
 
@@ -1255,7 +1284,7 @@ mod tests {
 
             assert!(!grid.editable(0, 1), "{data_type}");
             assert!(!grid.begin_edit(0, 1), "{data_type}");
-            assert!(!grid.set_pending(0, 1, "x'CD'".into()), "{data_type}");
+            assert!(!grid.set_pending(0, 1, Some("x'CD'".into())), "{data_type}");
             assert!(!grid.has_pending(), "{data_type}");
         }
     }
@@ -1266,41 +1295,67 @@ mod tests {
         // pressing Enter arrives here with that value: two keystrokes must not
         // become a write.
         let mut grid = editable_grid();
-        assert!(grid.set_pending(0, 1, "first".into()));
+        assert!(grid.set_pending(0, 1, Some("first".into())));
         assert!(!grid.has_pending());
 
         // Typed back to what the server sent, an edit already recorded goes.
-        assert!(grid.set_pending(0, 1, "changed".into()));
+        assert!(grid.set_pending(0, 1, Some("changed".into())));
         assert!(grid.has_pending());
-        assert!(grid.set_pending(0, 1, "first".into()));
+        assert!(grid.set_pending(0, 1, Some("first".into())));
         assert!(!grid.has_pending());
 
         // Emptying a cell that holds text is still a deliberate edit.
-        assert!(grid.set_pending(0, 1, String::new()));
+        assert!(grid.set_pending(0, 1, Some(String::new())));
         assert_eq!(
             grid.pending_updates()[0].sets,
-            vec![("body".to_string(), String::new())]
+            vec![("body".to_string(), Some(String::new()))]
         );
     }
 
     #[test]
-    fn an_untouched_null_stays_null() {
-        // A NULL is edited as the empty string because there is no way to type
-        // one back, so an untouched input on one carries the empty string --
-        // which written back would replace the NULL with a value.
-        let mut grid = ResultGrid::new(QueryResult {
-            columns: vec![column("id"), column("note")],
-            rows: vec![vec![Some("7".into()), None]],
-            edit: Some(EditTarget {
-                schema: "public".into(),
-                table: "measurements".into(),
-                columns: vec![Some("id".into()), Some("body".into())],
-                keys: vec![0],
-            }),
-            ..QueryResult::default()
-        });
+    fn a_staged_null_is_an_absence_and_not_the_empty_string() {
+        let mut grid = editable_grid();
 
-        assert!(grid.set_pending(0, 1, String::new()));
+        assert!(grid.set_pending(0, 1, None));
+        assert_eq!(
+            grid.pending_updates()[0].sets,
+            vec![("body".to_string(), None)]
+        );
+
+        assert!(grid.set_pending(0, 1, Some(String::new())));
+        assert_eq!(
+            grid.pending_updates()[0].sets,
+            vec![("body".to_string(), Some(String::new()))]
+        );
+
+        // It paints the word a fetched NULL paints: the absent `shown` is what
+        // sends it down the cell's own italic branch.
+        assert!(grid.set_pending(0, 1, None));
+        assert!(grid.pending_at(0, 1).unwrap().shown.is_none());
+    }
+
+    #[test]
+    fn the_empty_string_over_a_null_is_an_edit() {
+        // It was not, while the two were the same three characters of SQL.
+        // What now keeps an untouched input on a NULL from writing an empty
+        // string over it is the editor -- `begin_edit` is a deliberate gesture
+        // and `cancel_edit` records nothing -- not `set_pending`, which can no
+        // longer tell a typed empty string from a seeded one and must not try.
+        let mut grid = grid_with_a_null();
+
+        assert!(grid.set_pending(0, 1, Some(String::new())));
+        assert_eq!(
+            grid.pending_updates()[0].sets,
+            vec![("body".to_string(), Some(String::new()))]
+        );
+    }
+
+    #[test]
+    fn nulling_a_cell_the_server_already_left_null_records_nothing() {
+        // Same reason an untouched value records nothing: this is not an edit.
+        let mut grid = grid_with_a_null();
+
+        assert!(grid.set_pending(0, 1, None));
         assert!(!grid.has_pending());
         assert!(grid.pending_updates().is_empty());
     }
@@ -1313,7 +1368,7 @@ mod tests {
 
         assert!(!grid.editable(0, 0));
         assert!(!grid.begin_edit(0, 0));
-        assert!(!grid.set_pending(0, 0, "y".into()));
+        assert!(!grid.set_pending(0, 0, Some("y".into())));
         assert!(grid.pending_updates().is_empty());
     }
 
@@ -1322,7 +1377,7 @@ mod tests {
         // Discarding is dropping a collection, which is the whole reason the
         // fetched rows are never written.
         let mut grid = editable_grid();
-        grid.set_pending(0, 1, "changed".into());
+        grid.set_pending(0, 1, Some("changed".into()));
         grid.begin_edit(1, 1);
 
         grid.discard_pending();
@@ -1339,12 +1394,18 @@ mod tests {
         // fits, the statement carries the value.
         let value = "x".repeat(CELL_DISPLAY_LIMIT * 2);
         let mut grid = editable_grid();
-        assert!(grid.set_pending(0, 1, value.clone()));
+        assert!(grid.set_pending(0, 1, Some(value.clone())));
 
         let pending = grid.pending_at(0, 1).unwrap();
-        assert_eq!(pending.value.as_ref(), value);
-        assert_eq!(pending.shown.chars().count(), CELL_DISPLAY_LIMIT + 1);
-        assert_eq!(grid.pending_updates()[0].sets[0].1, value);
+        assert_eq!(
+            pending.value.as_ref().map(SharedString::as_ref),
+            Some(value.as_str())
+        );
+        assert_eq!(
+            pending.shown.as_ref().unwrap().chars().count(),
+            CELL_DISPLAY_LIMIT + 1
+        );
+        assert_eq!(grid.pending_updates()[0].sets[0].1, Some(value));
     }
 
     #[test]

@@ -5804,6 +5804,12 @@ fn update_batch(engine: Engine, rows: &[PendingRow]) -> Option<String> {
             .map(|(column, value)| (column.as_str(), value.as_str()))
             .collect()
     }
+    fn borrowed_sets(pairs: &[(String, Option<String>)]) -> Vec<(&str, Option<&str>)> {
+        pairs
+            .iter()
+            .map(|(column, value)| (column.as_str(), value.as_deref()))
+            .collect()
+    }
     let statements: Option<Vec<String>> = rows
         .iter()
         .map(|row| {
@@ -5811,7 +5817,7 @@ fn update_batch(engine: Engine, rows: &[PendingRow]) -> Option<String> {
                 engine,
                 &row.schema,
                 &row.table,
-                &borrowed(&row.sets),
+                &borrowed_sets(&row.sets),
                 &borrowed(&row.keys),
             )
             // Terminated, not separated: the last statement carries its
@@ -7222,7 +7228,7 @@ mod tests {
         assert_eq!(human_bytes(1_500_000), "1.5 MB");
     }
 
-    fn pending_row(sets: &[(&str, &str)], keys: &[(&str, &str)]) -> PendingRow {
+    fn pending_row(sets: &[(&str, Option<&str>)], keys: &[(&str, &str)]) -> PendingRow {
         fn owned(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
             pairs
                 .iter()
@@ -7232,16 +7238,28 @@ mod tests {
         PendingRow {
             schema: "public".to_string(),
             table: "accounts".to_string(),
-            sets: owned(sets),
+            sets: sets
+                .iter()
+                .map(|(column, value)| (column.to_string(), value.map(str::to_string)))
+                .collect(),
             keys: owned(keys),
         }
     }
 
     #[test]
+    fn a_nulled_cell_reaches_the_batch_as_the_keyword() {
+        let rows = vec![pending_row(&[("name", None)], &[("id", "1")])];
+        assert_eq!(
+            update_batch(Engine::Postgres, &rows).unwrap(),
+            "UPDATE \"public\".\"accounts\" SET \"name\" = NULL WHERE \"id\" = '1';"
+        );
+    }
+
+    #[test]
     fn several_pending_rows_become_one_semicolon_joined_batch() {
         let rows = vec![
-            pending_row(&[("name", "Ada")], &[("id", "1")]),
-            pending_row(&[("name", "Bo")], &[("id", "2")]),
+            pending_row(&[("name", Some("Ada"))], &[("id", "1")]),
+            pending_row(&[("name", Some("Bo"))], &[("id", "2")]),
         ];
 
         let batch = update_batch(Engine::Postgres, &rows).unwrap();
@@ -7262,8 +7280,8 @@ mod tests {
         // batch could apply half the user's edits and report the failure of the
         // rest.
         let rows = vec![
-            pending_row(&[("name", "Ada")], &[("id", "1")]),
-            pending_row(&[("name", "Bo")], &[("id", "2")]),
+            pending_row(&[("name", Some("Ada"))], &[("id", "1")]),
+            pending_row(&[("name", Some("Bo"))], &[("id", "2")]),
         ];
 
         for engine in [Engine::MySql, Engine::Sqlite] {
@@ -7286,10 +7304,10 @@ mod tests {
     #[test]
     fn a_row_with_no_key_to_find_it_by_refuses_the_whole_batch() {
         let rows = vec![
-            pending_row(&[("name", "Ada")], &[("id", "1")]),
+            pending_row(&[("name", Some("Ada"))], &[("id", "1")]),
             // No keys at all: sql::update_row refuses this one, since there is
             // nothing to identify the row it would touch.
-            pending_row(&[("name", "Bo")], &[]),
+            pending_row(&[("name", Some("Bo"))], &[]),
         ];
 
         assert!(
@@ -7297,7 +7315,7 @@ mod tests {
                 Engine::Postgres,
                 "public",
                 "accounts",
-                &[("name", "Bo")],
+                &[("name", Some("Bo"))],
                 &[]
             )
             .is_none()
