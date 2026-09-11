@@ -20,9 +20,9 @@ use gpui_component::{
 };
 
 use crate::{
-    CancelQuery, CloseTarget, Control, EDITOR_FONT_SIZE_MAX, EDITOR_FONT_SIZE_MIN, NewQuery,
-    NextPage, ObjectBody, ObjectTab, PreviousPage, Profile, QueryState, ResetEditorZoom, RunQuery,
-    SaveQuery, SetRowLimit, Settings, StructureState, Tab, Tone, Workspace, ZoomEditorIn,
+    CancelQuery, ClearFilter, CloseTarget, Control, EDITOR_FONT_SIZE_MAX, EDITOR_FONT_SIZE_MIN,
+    NewQuery, NextPage, ObjectBody, ObjectTab, PreviousPage, Profile, QueryState, ResetEditorZoom,
+    RunQuery, SaveQuery, SetRowLimit, Settings, StructureState, Tab, Tone, Workspace, ZoomEditorIn,
     ZoomEditorOut, button, button_label, compact_count, db,
     db::RoutineKind,
     dialog, editor_zoom_percent,
@@ -151,6 +151,8 @@ fn render_object(tab: &ObjectTab, cx: &mut Context<Workspace>) -> AnyElement {
         structure,
         results,
         query,
+        filter,
+        filter_input,
         ..
     } = &tab.body
     else {
@@ -166,7 +168,51 @@ fn render_object(tab: &ObjectTab, cx: &mut Context<Workspace>) -> AnyElement {
             .into_any_element();
     }
 
-    render_results(query, results, false, cx)
+    div()
+        .size_full()
+        .flex()
+        .flex_col()
+        .child(render_filter_bar(filter, filter_input, t))
+        .child(
+            div()
+                .flex_1()
+                .min_h_0()
+                .child(render_results(query, results, false, cx)),
+        )
+        .into_any_element()
+}
+
+/// The filter over a preview's rows, above the grid the pager sits over —
+/// gated on the same one state, because a structure listing has no rows to
+/// narrow.
+fn render_filter_bar(filter: &str, input: &Entity<InputState>, t: Theme) -> AnyElement {
+    div()
+        .w_full()
+        .h(px(layout::TAB_HEIGHT))
+        .flex_shrink_0()
+        .flex()
+        .items_center()
+        .gap(px(layout::SPACE_XS))
+        .pl(px(layout::SPACE_MD))
+        .pr(px(layout::SPACE_SM))
+        .child(row_icon(t, icon::SEARCH))
+        .child(Input::new(input).small().min_w_0().flex_1())
+        // Only once there is something to clear: a button that does nothing is
+        // a control to read past.
+        .children((!filter.is_empty()).then(|| {
+            icon_button(
+                "clear-filter",
+                icon::CLOSE,
+                Tone::Quiet,
+                Control::Compact,
+                t,
+            )
+            .tooltip("Clear filter")
+            .on_click(move |_, window, cx| {
+                window.dispatch_action(Box::new(ClearFilter), cx);
+            })
+        }))
+        .into_any_element()
 }
 
 fn render_routine(tab: &ObjectTab, cx: &mut Context<Workspace>) -> AnyElement {
@@ -804,9 +850,9 @@ fn render_tab_strip(
                             ),
                     )
                 })
-                .on_click(move |_, _, cx| {
+                .on_click(move |_, window, cx| {
                     _ = open_workspace.update(cx, |workspace, cx| {
-                        workspace.activate_tab(Tab::Query(id), cx);
+                        workspace.activate_tab(Tab::Query(id), window, cx);
                     });
                 })
                 .into_any_element()
@@ -922,9 +968,9 @@ fn render_tab_strip(
                         }),
                     ),
             )
-            .on_click(move |_, _, cx| {
+            .on_click(move |_, window, cx| {
                 _ = open_workspace.update(cx, |workspace, cx| {
-                    workspace.activate_tab(Tab::Object(id), cx);
+                    workspace.activate_tab(Tab::Object(id), window, cx);
                 });
             })
             .into_any_element()

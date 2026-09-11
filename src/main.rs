@@ -85,6 +85,7 @@ actions!(
         ResetEditorZoom,
         NextPage,
         PreviousPage,
+        ClearFilter,
         EditCell,
         CopyCell,
         ApplyEdits,
@@ -760,6 +761,10 @@ enum ObjectBody {
         /// the tab's snapshot — a tab that forgot its filter would come back as
         /// a different tab.
         filter: String,
+        /// The box the filter is typed into. Per tab, because the filter is,
+        /// and the only place the text being edited lives: `apply_filter`
+        /// reads it rather than keeping a second copy beside it.
+        filter_input: Entity<InputState>,
         /// How many rows this preview asks for. Every result set is capped
         /// (spec §4.3); this is the tab's own copy of the cap, so raising it
         /// for one wide table does not raise it everywhere.
@@ -818,6 +823,20 @@ fn restored_state(grid: &store::StoredGrid) -> QueryState {
         elapsed: std::time::Duration::ZERO,
         rows_affected: None,
     }
+}
+
+/// A preview's filter box, wired to the tab it belongs to. Enter is the apply:
+/// a filter that ran on every keystroke would put a half-typed predicate on the
+/// wire.
+fn filter_input(id: u64, window: &mut Window, cx: &mut Context<Workspace>) -> Entity<InputState> {
+    let input = cx.new(|cx| InputState::new(window, cx).placeholder("Filter rows…"));
+    cx.subscribe(&input, move |workspace, _, event: &InputEvent, cx| {
+        if matches!(event, InputEvent::PressEnter { .. }) {
+            workspace.apply_filter(id, cx);
+        }
+    })
+    .detach();
+    input
 }
 
 fn result_grid(window: &mut Window, cx: &mut Context<Workspace>) -> Entity<TableState<ResultGrid>> {
@@ -2148,7 +2167,7 @@ impl Workspace {
         self.cycle_profile(-1, cx);
     }
 
-    fn cycle_tab(&mut self, step: isize, cx: &mut Context<Self>) {
+    fn cycle_tab(&mut self, step: isize, window: &mut Window, cx: &mut Context<Self>) {
         let Some(session) = self.profile().map(|profile| &profile.session) else {
             return;
         };
@@ -2167,15 +2186,15 @@ impl Workspace {
             return;
         };
         let next = tabs[(index as isize + step).rem_euclid(tabs.len() as isize) as usize];
-        self.activate_tab(next, cx);
+        self.activate_tab(next, window, cx);
     }
 
-    fn next_tab(&mut self, _: &NextTab, _: &mut Window, cx: &mut Context<Self>) {
-        self.cycle_tab(1, cx);
+    fn next_tab(&mut self, _: &NextTab, window: &mut Window, cx: &mut Context<Self>) {
+        self.cycle_tab(1, window, cx);
     }
 
-    fn previous_tab(&mut self, _: &PreviousTab, _: &mut Window, cx: &mut Context<Self>) {
-        self.cycle_tab(-1, cx);
+    fn previous_tab(&mut self, _: &PreviousTab, window: &mut Window, cx: &mut Context<Self>) {
+        self.cycle_tab(-1, window, cx);
     }
 
     fn remove_profile(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -2253,7 +2272,7 @@ impl Workspace {
         if let Some(opened) = opened
             && let Some(id) = self.open_object(opened, window, cx)
         {
-            self.activate_tab(Tab::Object(id), cx);
+            self.activate_tab(Tab::Object(id), window, cx);
             self.remember_profiles(cx);
         }
     }
@@ -2292,6 +2311,7 @@ impl Workspace {
                 query: QueryState::Idle,
                 sort: Vec::new(),
                 filter: String::new(),
+                filter_input: filter_input(id, window, cx),
                 limit: preview_rows,
                 offset: 0,
                 stale: false,
@@ -2514,7 +2534,7 @@ impl Workspace {
     /// once per tab; and a tab whose state is anything but `Idle` has a run of
     /// its own -- in flight, finished or failed -- so it is left alone even on
     /// that one attempt.
-    fn hydrate_tab(&mut self, tab: Tab, cx: &mut Context<Self>) {
+    fn hydrate_tab(&mut self, tab: Tab, window: &mut Window, cx: &mut Context<Self>) {
         let Some(profile) = self.profile_mut() else {
             return;
         };
@@ -2576,12 +2596,14 @@ impl Workspace {
                 }
             }
             Tab::Object(id) => {
+                let mut restored_box = None;
                 if let Some(object) = profile.session.objects.iter_mut().find(|tab| tab.id == id)
                     && let ObjectBody::Relation {
                         showing_structure,
                         query,
                         sort,
                         filter,
+                        filter_input,
                         limit,
                         stale,
                         ..
@@ -2601,14 +2623,20 @@ impl Workspace {
                     // refresh asks the same question rather than the whole
                     // table's.
                     *filter = snapshot.filter.clone();
+                    // And into the box, or the bar would claim the whole
+                    // relation is on screen while a filter is applied.
+                    restored_box = Some((filter_input.clone(), snapshot.filter.clone()));
                     *limit = snapshot.limit.unwrap_or(preview_rows);
                     *stale = true;
+                }
+                if let Some((input, filter)) = restored_box {
+                    input.update(cx, |input, cx| input.set_value(filter, window, cx));
                 }
             }
         }
     }
 
-    fn activate_tab(&mut self, tab: Tab, cx: &mut Context<Self>) {
+    fn activate_tab(&mut self, tab: Tab, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(profile) = self.profile_mut() {
             profile.session.active = tab;
             profile.session.clear_prompts();
@@ -2617,7 +2645,7 @@ impl Workspace {
         // Before `load_relation`, which decides whether to re-query from the
         // state the snapshot leaves the tab in: hydrating afterwards would
         // arrive over a run already in flight and be refused.
-        self.hydrate_tab(tab, cx);
+        self.hydrate_tab(tab, window, cx);
         if let Tab::Object(id) = tab {
             self.load_relation(id, cx);
         }
@@ -2719,7 +2747,7 @@ impl Workspace {
             }
         }
         match restored_active {
-            Some(id) => self.activate_tab(Tab::Object(id), cx),
+            Some(id) => self.activate_tab(Tab::Object(id), window, cx),
             // Nothing to activate, but the pending list was drained, so what is
             // on disk has to be rewritten from the tabs that actually resolved.
             None => self.remember_profiles(cx),
@@ -3041,6 +3069,8 @@ impl Workspace {
             Command::RefreshRelation(id) => self.refresh_relation(id, cx),
             Command::NextPage => self.turn_page(true, cx),
             Command::PreviousPage => self.turn_page(false, cx),
+            Command::FilterRows => self.focus_filter(window, cx),
+            Command::ClearFilter => self.clear_filter(&ClearFilter, window, cx),
             Command::CloseObject(id) => self.ask_before_close(CloseTarget::Object(id), cx),
             Command::ApplyEdits => self.apply_edits(&ApplyEdits, window, cx),
             Command::DiscardEdits => self.discard_edits(&DiscardEdits, window, cx),
@@ -3209,6 +3239,62 @@ impl Workspace {
             },
             cx,
         );
+    }
+
+    /// Run what is in a preview's filter box. The box is the only state there
+    /// is: it is read here rather than copied anywhere, so the text on screen
+    /// and the text that ran cannot disagree.
+    fn apply_filter(&mut self, id: u64, cx: &mut Context<Self>) {
+        self.clear_notice();
+        let Some(typed) = self.profile().and_then(|profile| {
+            let tab = profile.session.objects.iter().find(|tab| tab.id == id)?;
+            match &tab.body {
+                ObjectBody::Relation { filter_input, .. } => Some(filter_input.read(cx).value()),
+                ObjectBody::Routine(_) => None,
+            }
+        }) else {
+            return;
+        };
+        self.requery_relation(
+            id,
+            move |filter, _, _, offset| changed_filter(filter, offset, &typed),
+            cx,
+        );
+    }
+
+    /// Empty the active preview's box and ask for the whole relation again.
+    fn clear_filter(&mut self, _: &ClearFilter, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(Tab::Object(id)) = self.profile().map(|profile| profile.session.active) else {
+            return;
+        };
+        let Some(input) = self.filter_box(id) else {
+            return;
+        };
+        input.update(cx, |input, cx| input.set_value("", window, cx));
+        self.apply_filter(id, cx);
+    }
+
+    /// Put the cursor in the active preview's filter box.
+    fn focus_filter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(Tab::Object(id)) = self.profile().map(|profile| profile.session.active) else {
+            return;
+        };
+        if let Some(input) = self.filter_box(id) {
+            input.focus_handle(cx).focus(window);
+        }
+    }
+
+    fn filter_box(&self, id: u64) -> Option<Entity<InputState>> {
+        let tab = self
+            .profile()?
+            .session
+            .objects
+            .iter()
+            .find(|tab| tab.id == id)?;
+        match &tab.body {
+            ObjectBody::Relation { filter_input, .. } => Some(filter_input.clone()),
+            ObjectBody::Routine(_) => None,
+        }
     }
 
     /// Move a relation's preview one page of `limit` rows through the table.
@@ -3835,7 +3921,7 @@ impl Workspace {
         let profile_id = profile.id.clone();
         profile.session.queries.push(tab);
         self.install_completions(&profile_id, cx);
-        self.activate_tab(Tab::Query(id), cx);
+        self.activate_tab(Tab::Query(id), window, cx);
     }
 
     /// Close an unsaved buffer. Its scratch file goes with it: an unnamed
@@ -3882,7 +3968,7 @@ impl Workspace {
             .profile()
             .and_then(|profile| profile.session.tab_holding(&name))
         {
-            self.activate_tab(Tab::Query(id), cx);
+            self.activate_tab(Tab::Query(id), window, cx);
             return;
         }
         if let Err(message) = self.persist_buffer(cx) {
@@ -3930,7 +4016,7 @@ impl Workspace {
         profile.session.queries.push(tab);
         profile.session.notice = notice;
         self.install_completions(&profile_id, cx);
-        self.activate_tab(Tab::Query(id), cx);
+        self.activate_tab(Tab::Query(id), window, cx);
     }
 
     /// A statement out of the history, back in the buffer.
@@ -3955,7 +4041,7 @@ impl Workspace {
             editor.set_value(appended, window, cx);
             editor.set_cursor_position(Position::new(line, 0), window, cx);
         });
-        self.activate_tab(Tab::Query(id), cx);
+        self.activate_tab(Tab::Query(id), window, cx);
     }
 
     /// The first unsaved buffer, or a new one when every open tab has a name.
@@ -3972,7 +4058,7 @@ impl Workspace {
                 .map(|tab| tab.id)
         });
         match unsaved {
-            Some(id) => self.activate_tab(Tab::Query(id), cx),
+            Some(id) => self.activate_tab(Tab::Query(id), window, cx),
             None => self.new_query(&NewQuery, window, cx),
         }
     }
@@ -5239,7 +5325,7 @@ impl Render for Workspace {
         // Gated on a flag rather than on the disk, so every later frame is a
         // bool test.
         if let Some(active @ Tab::Query(_)) = self.profile().map(|profile| profile.session.active) {
-            self.hydrate_tab(active, cx);
+            self.hydrate_tab(active, window, cx);
         }
 
         // Deferred for the same reason plus one: an element has to be mounted
@@ -5423,6 +5509,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::set_row_limit))
             .on_action(cx.listener(Self::next_page))
             .on_action(cx.listener(Self::previous_page))
+            .on_action(cx.listener(Self::clear_filter))
             .on_action(cx.listener(Self::show_editor))
             .on_action(cx.listener(Self::cycle_theme))
             .on_action(cx.listener(Self::save_query))
@@ -5577,6 +5664,22 @@ impl Render for Workspace {
 /// into partitions, an eye for the kinds that are a saved query over a table, a
 /// disk for the one that stores its answer, and a globe for the one that lives
 /// on another server entirely.
+/// One filter against the tab's, trimmed. `false` when nothing moved, so
+/// retyping the same expression does not re-run the statement.
+///
+/// A change puts the page back to the first, for the reason a sort or a limit
+/// change does: page three of a different question is not a page the user
+/// asked for.
+fn changed_filter(filter: &mut String, offset: &mut usize, typed: &str) -> bool {
+    let typed = typed.trim();
+    if filter == typed {
+        return false;
+    }
+    *filter = typed.to_string();
+    *offset = 0;
+    true
+}
+
 /// Slate's statement for a relation's tab, carrying the filter and the sort the
 /// controls asked for. Regenerated rather than edited, so the row limit and the
 /// quoting stay in one place.
@@ -6540,6 +6643,38 @@ mod tests {
                 data_type: None,
             })
             .collect()
+    }
+
+    #[test]
+    fn a_new_filter_puts_the_preview_back_on_its_first_page() {
+        // Page three of a different question is not a page anyone asked for.
+        let mut filter = String::new();
+        let mut offset = 2_000;
+
+        assert!(changed_filter(
+            &mut filter,
+            &mut offset,
+            r#""state" = 'ok'"#
+        ));
+        assert_eq!(filter, r#""state" = 'ok'"#);
+        assert_eq!(offset, 0);
+
+        // The same filter again is not a change, so nothing re-runs and the
+        // page the user is on survives.
+        offset = 2_000;
+        assert!(!changed_filter(
+            &mut filter,
+            &mut offset,
+            r#"  "state" = 'ok'  "#
+        ));
+        assert_eq!(offset, 2_000);
+
+        // Clearing is a change like any other, and lands on the first page too.
+        assert!(changed_filter(&mut filter, &mut offset, ""));
+        assert_eq!(filter, "");
+        assert_eq!(offset, 0);
+        // And clearing what is already clear is not a change.
+        assert!(!changed_filter(&mut filter, &mut offset, "   "));
     }
 
     #[test]

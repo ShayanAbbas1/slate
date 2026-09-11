@@ -66,6 +66,10 @@ pub enum Command {
     RefreshRelation(u64),
     NextPage,
     PreviousPage,
+    /// Put the cursor in the preview's filter box. The palette does not type
+    /// the filter; it gets the user to the place they would have clicked.
+    FilterRows,
+    ClearFilter,
     CloseObject(u64),
     ApplyEdits,
     DiscardEdits,
@@ -411,6 +415,7 @@ fn command_items(workspace: &Workspace, profile: &Profile, cx: &App) -> Vec<Item
         if let ObjectBody::Relation {
             showing_structure,
             query,
+            filter,
             limit,
             offset,
             ..
@@ -449,6 +454,21 @@ fn command_items(workspace: &Workspace, profile: &Profile, cx: &App) -> Vec<Item
                         "",
                         icon::CHEVRON_LEFT,
                         Command::PreviousPage,
+                    ));
+                }
+                items.push(Item::command(
+                    "Filter rows…",
+                    "",
+                    icon::SEARCH,
+                    Command::FilterRows,
+                ));
+                // A row that would do nothing is worse than no row at all.
+                if !filter.is_empty() {
+                    items.push(Item::command(
+                        "Clear filter",
+                        "",
+                        icon::CLOSE,
+                        Command::ClearFilter,
                     ));
                 }
             }
@@ -647,6 +667,15 @@ mod tests {
         let sql = "SELECT *\n  FROM accounts\n WHERE id = 1;";
         assert_eq!(one_line(sql), "SELECT * FROM accounts WHERE id = 1;");
         assert_eq!(matched(&[&one_line(sql)], "from accounts").len(), 1);
+    }
+
+    #[test]
+    fn the_filter_rows_are_found_by_the_word_the_user_would_type() {
+        // A palette row nobody can find by typing the obvious word is a row
+        // that is not in the palette.
+        let labels = ["Filter rows…", "Clear filter", "Next page"];
+        assert_eq!(matched(&labels, "filter"), ["Filter rows…", "Clear filter"]);
+        assert_eq!(matched(&labels, "clear"), ["Clear filter"]);
     }
 
     #[test]
