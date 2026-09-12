@@ -748,10 +748,12 @@ impl ObjectTab {
     /// something only.
     fn filters(&self, engine: Engine, cx: &App) -> Vec<store::StoredFilter> {
         match &self.body {
-            ObjectBody::Relation { filters, .. } => applied_filters(engine, &filter_bars(filters, cx))
-                .iter()
-                .map(stored_filter)
-                .collect(),
+            ObjectBody::Relation { filters, .. } => {
+                applied_filters(engine, &filter_bars(filters, cx))
+                    .iter()
+                    .map(stored_filter)
+                    .collect()
+            }
             ObjectBody::Routine(_) => Vec::new(),
         }
     }
@@ -3939,7 +3941,12 @@ impl Workspace {
     /// Turn a bar into a raw one. The value it already holds stays: it is the
     /// only thing the two shapes have in common, and dropping it would lose
     /// what was typed to a dropdown.
-    fn set_filter_raw(&mut self, action: &SetFilterRaw, window: &mut Window, cx: &mut Context<Self>) {
+    fn set_filter_raw(
+        &mut self,
+        action: &SetFilterRaw,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(id) = self.active_object_id() else {
             return;
         };
@@ -6779,10 +6786,30 @@ fn filter_predicate(
         Operator::IsNotNull => Some(format!("{name} IS NOT NULL")),
         Operator::IsEmpty => Some(format!("{name} = {}", literal(""))),
         Operator::IsNotEmpty => Some(format!("{name} <> {}", literal(""))),
-        Operator::Contains => Some(like(engine, &name, true, format!("%{}%", like_pattern(value)))),
-        Operator::NotContains => Some(like(engine, &name, false, format!("%{}%", like_pattern(value)))),
-        Operator::StartsWith => Some(like(engine, &name, true, format!("{}%", like_pattern(value)))),
-        Operator::EndsWith => Some(like(engine, &name, true, format!("%{}", like_pattern(value)))),
+        Operator::Contains => Some(like(
+            engine,
+            &name,
+            true,
+            format!("%{}%", like_pattern(value)),
+        )),
+        Operator::NotContains => Some(like(
+            engine,
+            &name,
+            false,
+            format!("%{}%", like_pattern(value)),
+        )),
+        Operator::StartsWith => Some(like(
+            engine,
+            &name,
+            true,
+            format!("{}%", like_pattern(value)),
+        )),
+        Operator::EndsWith => Some(like(
+            engine,
+            &name,
+            true,
+            format!("%{}", like_pattern(value)),
+        )),
         Operator::InList | Operator::NotInList => {
             let items: Vec<_> = value
                 .split(',')

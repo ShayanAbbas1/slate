@@ -14,6 +14,7 @@ use gpui::{
 };
 use gpui_component::{
     Disableable, IconName, Sizable,
+    button::Button,
     input::{Input, InputState},
     menu::DropdownMenu,
     resizable::{resizable_panel, v_resizable},
@@ -22,12 +23,13 @@ use gpui_component::{
 };
 
 use crate::{
-    AddFilter, CancelQuery, CloseTarget, Control, EDITOR_FONT_SIZE_MAX, EDITOR_FONT_SIZE_MIN,
-    FilterRow, NewQuery, NewRow, NextPage, ObjectBody, ObjectTab, PreviousPage, Profile,
-    QueryState, RemoveFilter, ResetEditorZoom, RunQuery, SaveQuery, SetFilterColumn, SetRowLimit,
-    Settings, StructureState, Tab, Tone, Workspace, ZoomEditorIn, ZoomEditorOut, button,
+    AddFilter, CancelQuery, CloseTarget, Conjunction, Control, EDITOR_FONT_SIZE_MAX,
+    EDITOR_FONT_SIZE_MIN, FilterRow, NewQuery, NewRow, NextPage, ObjectBody, ObjectTab, Operator,
+    PreviousPage, Profile, QueryState, RemoveFilter, ResetEditorZoom, RunQuery, SaveQuery,
+    SetFilterColumn, SetFilterOperator, SetFilterRaw, SetRowLimit, Settings, StructureState, Tab,
+    ToggleFilterJoin, ToggleNextJoin, Tone, Workspace, ZoomEditorIn, ZoomEditorOut, button,
     button_label, compact_count, db,
-    db::RoutineKind,
+    db::{Engine, RoutineKind},
     dialog, editor_zoom_percent,
     explorer::ROW_LIMITS,
     group_thousands, icon_button,
@@ -46,7 +48,7 @@ pub fn render_main_content(
     cx: &mut Context<Workspace>,
 ) -> AnyElement {
     let body = match profile.session.active_object() {
-        Some(tab) => render_object(tab, cx),
+        Some(tab) => render_object(tab, profile.config.engine(), cx),
         None => render_query_surface(profile, editor_font_size, cx),
     };
 
@@ -147,7 +149,7 @@ fn render_query_surface(
 /// An opened object. A relation's generated `SELECT` is an ordinary buffer
 /// the user can edit and run; only a routine, which has nothing to run, is
 /// read-only.
-fn render_object(tab: &ObjectTab, cx: &mut Context<Workspace>) -> AnyElement {
+fn render_object(tab: &ObjectTab, engine: Engine, cx: &mut Context<Workspace>) -> AnyElement {
     let t = *theme(cx);
     let ObjectBody::Relation {
         showing_structure,
@@ -155,6 +157,7 @@ fn render_object(tab: &ObjectTab, cx: &mut Context<Workspace>) -> AnyElement {
         results,
         query,
         filters,
+        next_join,
         ..
     } = &tab.body
     else {
@@ -177,6 +180,8 @@ fn render_object(tab: &ObjectTab, cx: &mut Context<Workspace>) -> AnyElement {
         .child(render_filter_bar(
             filters,
             results.read(cx).delegate().columns(),
+            engine,
+            *next_join,
             t,
         ))
         .child(
@@ -192,10 +197,15 @@ fn render_object(tab: &ObjectTab, cx: &mut Context<Workspace>) -> AnyElement {
 /// grid the pager sits over — gated on the same one state, because a structure
 /// listing has no rows to narrow.
 ///
-/// A bar is a column, an equals and a value, and the stack is conjoined
-/// (spec §2.4). There is no expression field: a preview runs SQL Slate
-/// generates from visible controls, and arbitrary SQL belongs in a query tab.
-fn render_filter_bar(filters: &[FilterRow], columns: &[db::Column], t: Theme) -> AnyElement {
+/// A bar is a column, an operator, a value and the joiner to the bar above it,
+/// or the user's own SQL where the column dropdown says so (spec §2.4).
+fn render_filter_bar(
+    filters: &[FilterRow],
+    columns: &[db::Column],
+    engine: Engine,
+    next_join: Conjunction,
+    t: Theme,
+) -> AnyElement {
     let names: Vec<SharedString> = columns
         .iter()
         .map(|column| SharedString::from(column.name.clone()))
@@ -207,13 +217,24 @@ fn render_filter_bar(filters: &[FilterRow], columns: &[db::Column], t: Theme) ->
         .flex_col()
         .children(filters.iter().enumerate().map(|(row, filter)| {
             filter_bar_row()
+                // The first bar joins to nothing above it.
+                .children((row > 0).then(|| {
+                    join_button(("filter-join", row), filter.conjunction, t).on_click(
+                        move |_, window, cx| {
+                            window.dispatch_action(Box::new(ToggleFilterJoin { row }), cx);
+                        },
+                    )
+                }))
                 .child(
                     button(
                         ("filter-column", row),
-                        filter
-                            .column
-                            .clone()
-                            .unwrap_or_else(|| "Column…".to_string()),
+                        match filter.raw {
+                            true => RAW_SQL.to_string(),
+                            false => filter
+                                .column
+                                .clone()
+                                .unwrap_or_else(|| "Column…".to_string()),
+                        },
                         Tone::Quiet,
                         Control::Compact,
                         t,
@@ -232,33 +253,73 @@ fn render_filter_bar(filters: &[FilterRow], columns: &[db::Column], t: Theme) ->
                     .dropdown_menu({
                         let names = names.clone();
                         let chosen = filter.column.clone();
+                        let raw = filter.raw;
                         move |menu, _, _| {
-                            names.iter().fold(
-                                menu.scrollable(true).max_h(px(layout::MENU_MAX_HEIGHT)),
-                                |menu, name| {
-                                    menu.menu_with_check(
-                                        name.clone(),
-                                        chosen.as_deref() == Some(name.as_ref()),
-                                        Box::new(SetFilterColumn {
-                                            row,
-                                            column: name.to_string(),
-                                        }),
-                                    )
-                                },
-                            )
+                            names
+                                .iter()
+                                .fold(
+                                    menu.scrollable(true).max_h(px(layout::MENU_MAX_HEIGHT)),
+                                    |menu, name| {
+                                        menu.menu_with_check(
+                                            name.clone(),
+                                            !raw && chosen.as_deref() == Some(name.as_ref()),
+                                            Box::new(SetFilterColumn {
+                                                row,
+                                                column: name.to_string(),
+                                            }),
+                                        )
+                                    },
+                                )
+                                // Below the names and behind a rule, because it
+                                // is not one of them: it replaces the bar with
+                                // a statement of the user's own.
+                                .separator()
+                                .menu_with_check(RAW_SQL, raw, Box::new(SetFilterRaw { row }))
                         }
                     }),
                 )
-                // Equality is the only operator, so this says what the bar
-                // means rather than offering a choice that does not exist.
-                .child(
-                    div()
-                        .flex_shrink_0()
-                        .text_size(px(layout::TEXT_SM))
-                        .text_color(t.text_faint)
-                        .child("="),
+                // A raw bar is one wide input: there is no column to compare
+                // and no operator to compare it with.
+                .children((!filter.raw).then(|| {
+                    button(
+                        ("filter-operator", row),
+                        filter.operator.symbol(),
+                        Tone::Quiet,
+                        Control::Compact,
+                        t,
+                    )
+                    .child(
+                        icon(icon::CHEVRON_DOWN)
+                            .size(px(layout::ICON_SIZE))
+                            .text_color(t.text_faint),
+                    )
+                    .dropdown_menu({
+                        let chosen = filter.operator;
+                        move |menu, _, _| {
+                            Operator::ALL
+                                .into_iter()
+                                // An operator the engine cannot express is not
+                                // offered: SQLite has no regex (spec §7).
+                                .filter(|operator| operator.on(engine))
+                                .fold(
+                                    menu.scrollable(true).max_h(px(layout::MENU_MAX_HEIGHT)),
+                                    |menu, operator| {
+                                        menu.menu_with_check(
+                                            operator.label(),
+                                            operator == chosen,
+                                            Box::new(SetFilterOperator { row, operator }),
+                                        )
+                                    },
+                                )
+                        }
+                    })
+                }))
+                // An absence needs no value, and a box that cannot change what
+                // runs is a box to read past.
+                .children(
+                    (filter.raw || filter.operator.takes_value())
+                        .then(|| Input::new(&filter.value).small().min_w_0().flex_1()),
                 )
-                .child(Input::new(&filter.value).small().min_w_0().flex_1())
                 .child(
                     icon_button(
                         ("remove-filter", row),
@@ -273,14 +334,33 @@ fn render_filter_bar(filters: &[FilterRow], columns: &[db::Column], t: Theme) ->
                     }),
                 )
         }))
-        .child(filter_bar_row().child(
-            button("add-filter", "Add filter", Tone::Quiet, Control::Compact, t).on_click(
-                |_, window, cx| {
-                    window.dispatch_action(Box::new(AddFilter), cx);
-                },
-            ),
-        ))
+        .child(
+            filter_bar_row()
+                // The joiner the next bar will carry, so it is chosen where the
+                // bar is added rather than after it lands.
+                .children((!filters.is_empty()).then(|| {
+                    join_button("next-join", next_join, t).on_click(|_, window, cx| {
+                        window.dispatch_action(Box::new(ToggleNextJoin), cx);
+                    })
+                }))
+                .child(
+                    button("add-filter", "Add filter", Tone::Quiet, Control::Compact, t).on_click(
+                        |_, window, cx| {
+                            window.dispatch_action(Box::new(AddFilter), cx);
+                        },
+                    ),
+                ),
+        )
         .into_any_element()
+}
+
+/// The column dropdown's last entry, which is not a column.
+const RAW_SQL: &str = "Raw SQL";
+
+/// `AND` or `OR`, as the two-state button it is. A dropdown of two rows is a
+/// menu to open for something a click already says.
+fn join_button(id: impl Into<gpui::ElementId>, conjunction: Conjunction, t: Theme) -> Button {
+    button(id, conjunction.as_str(), Tone::Quiet, Control::Compact, t).tooltip("AND or OR")
 }
 
 /// One line of the filter stack, at the height every other control strip is.
