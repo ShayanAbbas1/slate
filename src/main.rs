@@ -3921,19 +3921,21 @@ impl Workspace {
     fn set_filter_column(
         &mut self,
         action: &SetFilterColumn,
-        _: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let Some(id) = self.active_object_id() else {
             return;
         };
-        match self.filter_row_mut(id, action.row) {
-            Some(filter) => {
-                filter.column = Some(action.column.clone());
-                filter.raw = false;
-            }
-            None => return,
-        }
+        let Some(filter) = self.filter_row_mut(id, action.row) else {
+            return;
+        };
+        filter.column = Some(action.column.clone());
+        filter.raw = false;
+        let (operator, input) = (filter.operator, filter.value.clone());
+        input.update(cx, |input, cx| {
+            input.set_placeholder(value_placeholder(false, operator), window, cx);
+        });
         self.apply_filter(id, cx);
         cx.notify();
     }

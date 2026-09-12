@@ -1713,6 +1713,14 @@ mod tests {
         assert!(!grid.follows_a_key(0));
         assert!(grid.follows_a_key(1));
         assert!(!grid.follows_a_key(2));
+        // One hover group per key column, built here rather than per cell per
+        // frame, and none at all for a column with nothing to follow.
+        assert_eq!(grid.follow_group(0), None);
+        assert_eq!(
+            grid.follow_group(1).map(SharedString::as_ref),
+            Some("follow-key-1")
+        );
+        assert_eq!(grid.follow_group(2), None);
     }
 
     #[test]
