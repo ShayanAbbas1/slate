@@ -100,6 +100,11 @@ pub struct ResultGrid {
     /// a query result: a statement can join as many relations as it likes, so
     /// there is no one relation whose keys these columns could be.
     foreign_keys: Vec<usize>,
+    /// The hover group each key column's cells share, one per key column and
+    /// built where the keys are marked. `render_td` runs for every visible cell
+    /// every frame under a no-allocation rule, and a group named there would be
+    /// a `format!` per cell per frame.
+    follow_groups: Vec<SharedString>,
 }
 
 /// One changed cell, held beside the fetched value rather than over it.
@@ -180,6 +185,7 @@ impl ResultGrid {
             captured: None,
             restored_total: None,
             foreign_keys: Vec::new(),
+            follow_groups: Vec::new(),
         }
     }
 
@@ -321,6 +327,18 @@ impl ResultGrid {
             .filter(|(_, column)| columns.contains(&column.name))
             .map(|(index, _)| index)
             .collect();
+        self.follow_groups = self
+            .foreign_keys
+            .iter()
+            .map(|col| SharedString::from(format!("follow-key-{col}")))
+            .collect();
+    }
+
+    /// The hover group a key column's cells share, and `None` for a column
+    /// nothing can be followed from.
+    fn follow_group(&self, col: usize) -> Option<&SharedString> {
+        let key = self.foreign_keys.iter().position(|key| *key == col)?;
+        self.follow_groups.get(key)
     }
 
     /// Whether this column's cells can be followed to the row they reference.
@@ -922,15 +940,17 @@ impl TableDelegate for ResultGrid {
                 .cloned(),
         };
 
-        // ponytail: the active cell only, not every cell of a key's column.
-        // `render_td` runs for every visible cell every frame under a
-        // no-allocation rule, and a per-cell hover group is a `format!` per cell
-        // per frame. The upgrade path is one group id per column, built once per
-        // result rather than once per frame.
-        let follows_a_key = self.active == Some((row_ix, col_ix))
-            && self.follows_a_key(col_ix)
+        let follows_a_key = self.follows_a_key(col_ix)
             // A NULL references nothing, so there is nothing to follow it to.
             && self.cell(row_ix, col_ix).is_some();
+        let group = follows_a_key
+            .then(|| self.follow_group(col_ix).cloned())
+            .flatten();
+        // Faint on hover over any cell of the column, and always on the active
+        // one, so the gesture is reachable from the keyboard as well as the
+        // mouse. Present either way rather than added on hover: a cell that
+        // reflows under the pointer is a cell that moves as it is read.
+        let active = self.active == Some((row_ix, col_ix));
 
         base.overflow_hidden()
             .whitespace_nowrap()
@@ -942,7 +962,8 @@ impl TableDelegate for ResultGrid {
             .child(cell.unwrap_or(NULL_LABEL))
             // The workspace owns the statement and the tabs and the grid owns
             // neither, so this leaves exactly as a header's sort click does.
-            .children(follows_a_key.then(|| {
+            .when_some(group.clone(), |cell, group| cell.group(group))
+            .children(group.map(|group| {
                 div()
                     .id(("follow-key", row_ix * self.columns.len() + col_ix))
                     .ml_auto()
@@ -950,6 +971,11 @@ impl TableDelegate for ResultGrid {
                     .flex()
                     .items_center()
                     .text_color(faint)
+                    .when(!active, |hidden| {
+                        hidden
+                            .opacity(0.)
+                            .group_hover(group, |shown| shown.opacity(1.))
+                    })
                     .child(icon(icon::FOLLOW_KEY).size(px(12.)))
                     .on_click(cx.listener(move |_, _, window, cx| {
                         // Or the cell underneath takes the click as a move of
