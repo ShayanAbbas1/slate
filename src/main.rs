@@ -1,3 +1,4 @@
+mod actions;
 mod completion;
 mod db;
 mod explorer;
@@ -33,6 +34,15 @@ use gpui_component::{
 };
 use serde::Deserialize;
 
+use actions::{
+    AcceptCompletion, AddFilter, ApplyEdits, CancelQuery, ClearFilter, CloseTab, CommandPalette,
+    CopyCell, CycleTheme, DeleteRow, DiscardEdits, EditCell, FollowForeignKey, FuzzyOpen,
+    NewConnection, NewQuery, NewRow, NextPage, NextProfile, NextTab, OpenSettings, PaletteNext,
+    PalettePrevious, PreviousPage, PreviousProfile, PreviousTab, Quit, RemoveFilter,
+    ResetEditorZoom, RunQuery, SaveQuery, SetFilterColumn, SetFilterOperator, SetFilterRaw,
+    SetNull, SetRowLimit, ShowEditor, SortColumn, ToggleFilterJoin, ToggleNextJoin, ToggleSidebar,
+    ZoomEditorIn, ZoomEditorOut,
+};
 use completion::SchemaCompletions;
 use db::{
     Catalog, Connection, ConnectionConfig, DbError, Engine, RelationKind, Routine, ServerConfig,
@@ -56,103 +66,6 @@ use ui::{
     Control, Tone, button, button_label, dialog, group_thousands, human_bytes, icon_button,
     object_icon, relative_age, row_icon, row_icon_tinted, row_readout, section_label, titlebar,
 };
-
-/// A header click. The column is the one in the grid; which statement it
-/// belongs to is whatever surface is in front, because that is the grid the
-/// click came from.
-#[derive(Clone, PartialEq, Eq, Deserialize, Action)]
-#[action(namespace = slate, no_json)]
-struct SortColumn {
-    column: usize,
-}
-
-/// The column a filter bar narrows on, picked from the bar's dropdown. The bar
-/// is named by position in the stack, which is how every one of these reaches
-/// it: the stack is what the user is pointing at.
-#[derive(Clone, PartialEq, Eq, Deserialize, Action)]
-#[action(namespace = slate, no_json)]
-struct SetFilterColumn {
-    row: usize,
-    column: String,
-}
-
-/// Turn a bar into one the user writes SQL into, which has no column and no
-/// operator left to pick.
-#[derive(Clone, PartialEq, Eq, Deserialize, Action)]
-#[action(namespace = slate, no_json)]
-struct SetFilterRaw {
-    row: usize,
-}
-
-#[derive(Clone, PartialEq, Eq, Deserialize, Action)]
-#[action(namespace = slate, no_json)]
-struct SetFilterOperator {
-    row: usize,
-    operator: Operator,
-}
-
-/// Flip how a bar joins to the bar above it.
-#[derive(Clone, PartialEq, Eq, Deserialize, Action)]
-#[action(namespace = slate, no_json)]
-struct ToggleFilterJoin {
-    row: usize,
-}
-
-#[derive(Clone, PartialEq, Eq, Deserialize, Action)]
-#[action(namespace = slate, no_json)]
-struct RemoveFilter {
-    row: usize,
-}
-
-/// How many rows a relation's preview asks for. Slate's own statement carries
-/// the limit, so the only thing to say is the number.
-#[derive(Clone, PartialEq, Eq, Deserialize, Action)]
-#[action(namespace = slate, no_json)]
-struct SetRowLimit {
-    rows: usize,
-}
-
-actions!(
-    slate,
-    [
-        RunQuery,
-        CancelQuery,
-        ShowEditor,
-        CycleTheme,
-        SaveQuery,
-        NewQuery,
-        NextProfile,
-        PreviousProfile,
-        NextTab,
-        PreviousTab,
-        NewConnection,
-        ZoomEditorIn,
-        ZoomEditorOut,
-        ResetEditorZoom,
-        NextPage,
-        PreviousPage,
-        ClearFilter,
-        AddFilter,
-        ToggleNextJoin,
-        NewRow,
-        EditCell,
-        CopyCell,
-        SetNull,
-        FollowForeignKey,
-        DeleteRow,
-        ApplyEdits,
-        DiscardEdits,
-        FuzzyOpen,
-        CommandPalette,
-        PaletteNext,
-        PalettePrevious,
-        CloseTab,
-        ToggleSidebar,
-        AcceptCompletion,
-        OpenSettings,
-        Quit,
-    ]
-);
 
 const EDITOR_FONT_SIZE_DEFAULT: f32 = 14.0;
 const EDITOR_FONT_SIZE_MIN: f32 = 11.0;
