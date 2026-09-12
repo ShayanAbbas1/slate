@@ -1,0 +1,282 @@
+//! The connection form: the fields a profile is created and edited through.
+//!
+//! The form holds inputs rather than a config, because a half-typed connection
+//! is not one yet -- `config` is where the fields become something that can be
+//! opened.
+//!
+//! This was a plain type at the crate root. It moved out whole; nothing changed
+//! but its visibility.
+
+use gpui::{App, AppContext, Context, Entity, Window};
+use gpui_component::input::InputState;
+
+use crate::{
+    Workspace,
+    db::{ConnectionConfig, Engine, ServerConfig, SslMode},
+    session::Profile,
+    theme::ConnectionColor,
+};
+
+pub(crate) struct ConnectionForm {
+    pub(crate) url: Entity<InputState>,
+    /// Which set of fields below is the connection. Every input is built once
+    /// and kept; the engine decides which are drawn and which are read, so
+    /// switching engine and switching back does not lose what was typed.
+    pub(crate) engine: Engine,
+    pub(crate) name: Entity<InputState>,
+    pub(crate) color: Option<ConnectionColor>,
+    /// SQLite's entire connection. No host, no credentials, no transport.
+    pub(crate) path: Entity<InputState>,
+    pub(crate) host: Entity<InputState>,
+    pub(crate) port: Entity<InputState>,
+    pub(crate) database: Entity<InputState>,
+    pub(crate) user: Entity<InputState>,
+    pub(crate) password: Entity<InputState>,
+    pub(crate) sslmode: SslMode,
+    /// Only reachable while the mode consults one, so the field cannot sit
+    /// there filled in and doing nothing.
+    pub(crate) root_certificate: Entity<InputState>,
+    /// Seconds, and blank is the same as 0: no limit. Every engine has one, so
+    /// unlike the credential fields it is drawn whichever chip is selected.
+    pub(crate) statement_timeout: Entity<InputState>,
+    /// An input to focus once it has been mounted.
+    ///
+    /// A chip can unmount the field the user was typing in, and a window with
+    /// nothing focused has no dispatch path — every keybinding in the app goes
+    /// dead until something is clicked. So whichever chip takes a field away
+    /// names the one that replaces it, and `Workspace::render` hands focus over
+    /// on the next frame, once it exists to receive it.
+    pub(crate) needs_focus: Option<Entity<InputState>>,
+    pub(crate) error: Option<String>,
+    /// The id of the profile being edited, or `None` for a new connection.
+    pub(crate) editing: Option<String>,
+}
+
+impl ConnectionForm {
+    pub(crate) fn new(
+        config: Option<&ConnectionConfig>,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) -> Self {
+        let value = |value: Option<&str>| value.unwrap_or_default().to_string();
+        let server = config.and_then(ConnectionConfig::server);
+        let file = match config {
+            Some(ConnectionConfig::Sqlite { path, .. }) => Some(path.as_str()),
+            _ => None,
+        };
+
+        let url =
+            cx.new(|cx| InputState::new(window, cx).placeholder("postgresql://…  or  sqlite://…"));
+        let name = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Display name")
+                .default_value(value(
+                    server
+                        .map(|server| server.database.as_str())
+                        .or_else(|| file.map(file_stem)),
+                ))
+        });
+        let path = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Database file")
+                .default_value(value(file))
+        });
+        let host = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Host")
+                .default_value(value(server.map(|server| server.host.as_str())))
+        });
+        let port = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Port (optional)")
+                .default_value(
+                    server
+                        .and_then(|server| server.port)
+                        .map(|port| port.to_string())
+                        .unwrap_or_default(),
+                )
+        });
+        let database = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Database")
+                .default_value(value(server.map(|server| server.database.as_str())))
+        });
+        let user = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Username")
+                .default_value(value(server.map(|server| server.user.as_str())))
+        });
+        let password = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Password (optional)")
+                .default_value(value(server.map(|server| server.password.as_str())))
+                .masked(true)
+        });
+
+        let root_certificate = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Root certificate file (optional)")
+                .default_value(value(
+                    server.and_then(|server| server.root_certificate.as_deref()),
+                ))
+        });
+        let statement_timeout = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Seconds (0 for no limit)")
+                .default_value(
+                    config
+                        .map(ConnectionConfig::statement_timeout)
+                        .filter(|seconds| *seconds > 0)
+                        .map(|seconds| seconds.to_string())
+                        .unwrap_or_default(),
+                )
+        });
+
+        Self {
+            // The form is the whole window on a first launch, and a window
+            // with nothing focused has no dispatch path -- every binding is
+            // dead until a field is clicked. So the field the user is meant to
+            // start in asks for focus the moment it is mounted.
+            needs_focus: Some(url.clone()),
+            url,
+            engine: config.map(ConnectionConfig::engine).unwrap_or_default(),
+            name,
+            color: None,
+            path,
+            host,
+            port,
+            database,
+            user,
+            password,
+            sslmode: server.map(|server| server.sslmode).unwrap_or_default(),
+            root_certificate,
+            statement_timeout,
+            error: None,
+            editing: None,
+        }
+    }
+
+    /// The same form, pointed at a profile that already exists.
+    ///
+    /// Its name is the profile's own rather than the database name a fresh form
+    /// falls back to, and the password starts blank: what the Keychain holds is
+    /// never read back onto the screen, so leaving it alone keeps it.
+    pub(crate) fn editing(
+        profile: &Profile,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) -> Self {
+        let mut form = Self::new(Some(&profile.config), window, cx);
+        form.editing = Some(profile.id.clone());
+        form.color = profile.color;
+        form.name.update(cx, |name, cx| {
+            name.set_value(profile.name.clone(), window, cx);
+        });
+        form.password
+            .update(cx, |password, cx| password.set_value("", window, cx));
+        form
+    }
+
+    pub(crate) fn config(&self, cx: &App) -> Result<(String, ConnectionConfig), String> {
+        let read = |input: &Entity<InputState>| input.read(cx).value().trim().to_string();
+        let name = read(&self.name);
+        if name.is_empty() {
+            return Err("Display name is required.".into());
+        }
+
+        let statement_timeout = self.statement_timeout(cx)?;
+        let config = match self.engine {
+            Engine::Sqlite => {
+                let path = read(&self.path);
+                if path.is_empty() {
+                    return Err("Database file is required.".into());
+                }
+                ConnectionConfig::Sqlite {
+                    path,
+                    statement_timeout,
+                }
+            }
+            Engine::Postgres => ConnectionConfig::Postgres(self.server(cx)?),
+            Engine::MySql => ConnectionConfig::MySql(self.server(cx)?),
+        };
+
+        Ok((name, config))
+    }
+
+    /// Blank is 0 is no limit, so a user who never had an opinion about it is
+    /// not made to have one.
+    pub(crate) fn statement_timeout(&self, cx: &App) -> Result<u32, String> {
+        let value = self.statement_timeout.read(cx).value().trim().to_string();
+        if value.is_empty() {
+            return Ok(0);
+        }
+        value
+            .parse()
+            .map_err(|_| "Statement timeout must be a whole number of seconds.".to_string())
+    }
+
+    pub(crate) fn server(&self, cx: &App) -> Result<ServerConfig, String> {
+        let read = |input: &Entity<InputState>| input.read(cx).value().trim().to_string();
+        let host = read(&self.host);
+        let database = read(&self.database);
+        let user = read(&self.user);
+        let port = read(&self.port);
+
+        for (label, value) in [
+            ("Host", &host),
+            ("Database", &database),
+            ("Username", &user),
+        ] {
+            if value.is_empty() {
+                return Err(format!("{label} is required."));
+            }
+        }
+
+        let port = if port.is_empty() {
+            None
+        } else {
+            Some(
+                port.parse()
+                    .map_err(|_| "Port must be a number from 1 to 65535.".to_string())?,
+            )
+        };
+
+        // Kept only where it is consulted. A path left behind by switching down
+        // to `require` would be stored and shown as though it were in force.
+        let root_certificate = self
+            .sslmode
+            .checks_certificate()
+            .then(|| read(&self.root_certificate))
+            .filter(|path| !path.is_empty());
+
+        Ok(ServerConfig {
+            host,
+            port,
+            database,
+            user,
+            password: self.password.read(cx).unmask_value().to_string(),
+            sslmode: self.sslmode,
+            root_certificate,
+            statement_timeout: self.statement_timeout(cx)?,
+        })
+    }
+}
+
+/// What a profile is called when nobody has named it: the database for an
+/// engine that has one, and the file for an engine that is one.
+pub(crate) fn default_profile_name(config: &ConnectionConfig) -> String {
+    match config {
+        ConnectionConfig::Postgres(server) | ConnectionConfig::MySql(server) => {
+            server.database.clone()
+        }
+        ConnectionConfig::Sqlite { path, .. } => file_stem(path).to_string(),
+    }
+}
+
+/// A database file's name without its directory or extension.
+pub(crate) fn file_stem(path: &str) -> &str {
+    std::path::Path::new(path)
+        .file_stem()
+        .and_then(std::ffi::OsStr::to_str)
+        .unwrap_or(path)
+}
