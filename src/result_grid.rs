@@ -977,7 +977,11 @@ impl TableDelegate for ResultGrid {
                             .group_hover(group, |shown| shown.opacity(1.))
                     })
                     .child(icon(icon::FOLLOW_KEY).size(px(12.)))
-                    .on_click(cx.listener(move |_, _, window, cx| {
+                    .on_click(cx.listener(move |table, _, window, cx| {
+                        // The action follows the active cell, and this one is
+                        // only hovered: without the move it would open the row
+                        // the ring happens to be on instead of the row clicked.
+                        table.delegate_mut().set_active(row_ix, col_ix);
                         // Or the cell underneath takes the click as a move of
                         // the ring it is already on.
                         cx.stop_propagation();
