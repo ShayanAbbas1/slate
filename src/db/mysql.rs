@@ -28,8 +28,8 @@ use ::mysql::{Conn, OptsBuilder, SslOpts, Value};
 
 use super::{
     Catalog, Cell, Column, DbError, EditTarget, Engine, QueryResult, ServerConfig, SslMode,
-    Structure, assemble_catalog, assemble_structure, non_utf8_error, percent_decoded, plain_error,
-    required_cell,
+    Structure, assemble_catalog, assemble_foreign_keys, assemble_structure, non_utf8_error,
+    percent_decoded, plain_error, required_cell,
 };
 
 /// Without this the driver waits out the OS SYN retry budget, so a host that
@@ -94,7 +94,7 @@ WHERE routine.ROUTINE_SCHEMA NOT IN {system}
 ORDER BY routine.ROUTINE_SCHEMA, routine.ROUTINE_NAME
 ";
 
-// The three structure queries name one relation, so they carry `{schema}` and
+// The four structure queries name one relation, so they carry `{schema}` and
 // `{relation}` placeholders substituted by `structure_sql`.
 const STRUCTURE_COLUMNS_SQL: &str = "
 SELECT COLUMN_NAME AS column_name,
@@ -165,6 +165,24 @@ WHERE table_constraint.TABLE_SCHEMA = {schema}
   AND table_constraint.TABLE_NAME = {relation}
   AND table_constraint.CONSTRAINT_TYPE IN ('PRIMARY KEY', 'UNIQUE', 'FOREIGN KEY')
 ORDER BY table_constraint.CONSTRAINT_NAME
+";
+
+// A sibling of the constraint query rather than a second reading of its text:
+// that one renders DDL for the Structure tab, this one wants the fields, and one
+// query doing both would have to pick. `REFERENCED_TABLE_NAME IS NOT NULL` is
+// what separates the foreign keys from every other key sharing the view, and
+// `REFERENCED_TABLE_SCHEMA` is read rather than assumed because InnoDB takes a
+// foreign key across databases.
+const STRUCTURE_FOREIGN_KEYS_SQL: &str = "
+SELECT COLUMN_NAME AS column_name,
+       REFERENCED_TABLE_SCHEMA AS referenced_schema,
+       REFERENCED_TABLE_NAME AS referenced_table,
+       REFERENCED_COLUMN_NAME AS referenced_column
+FROM information_schema.KEY_COLUMN_USAGE
+WHERE TABLE_SCHEMA = {schema}
+  AND TABLE_NAME = {relation}
+  AND REFERENCED_TABLE_NAME IS NOT NULL
+ORDER BY CONSTRAINT_NAME, ORDINAL_POSITION
 ";
 
 /// The columns a constraint covers, in key order. Spliced into the query above
@@ -486,7 +504,12 @@ impl Connection {
             schema,
             relation,
         ))?;
-        assemble_structure(columns, indexes, constraints)
+        let keys =
+            self.internal_query(&structure_sql(STRUCTURE_FOREIGN_KEYS_SQL, schema, relation))?;
+
+        let mut structure = assemble_structure(columns, indexes, constraints)?;
+        structure.foreign_keys = assemble_foreign_keys(&keys)?;
+        Ok(structure)
     }
 }
 
@@ -811,7 +834,7 @@ fn describe(error: &::mysql::Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::{ColumnDefinition, RelationKind, RoutineKind};
+    use crate::db::{ColumnDefinition, ForeignKey, RelationKind, RoutineKind};
 
     /// The server the `live_` tests talk to, from `SLATE_MYSQL_URL`.
     fn live() -> Connection {
@@ -1366,5 +1389,77 @@ mod tests {
             .query("SELECT count(*) AS rows_seeded FROM slate_archive.closed_accounts")
             .expect("query should succeed");
         assert_eq!(closed.rows[0][0].as_deref(), Some("2"));
+    }
+
+    #[test]
+    #[ignore = "requires the repository development database configured through SLATE_MYSQL_URL"]
+    fn live_a_composite_foreign_key_arrives_as_one_key_per_column_in_key_order() {
+        let structure = live()
+            .structure("slate_dev", "order_items")
+            .expect("structure should load");
+
+        assert_eq!(
+            structure.foreign_keys,
+            vec![
+                ForeignKey {
+                    column: "order_account_id".into(),
+                    referenced_schema: "slate_dev".into(),
+                    referenced_table: "orders".into(),
+                    referenced_column: "account_id".into(),
+                },
+                ForeignKey {
+                    column: "order_number".into(),
+                    referenced_schema: "slate_dev".into(),
+                    referenced_table: "orders".into(),
+                    referenced_column: "number".into(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    #[ignore = "requires the repository development database configured through SLATE_MYSQL_URL"]
+    fn live_a_foreign_key_across_databases_names_the_database_it_references() {
+        let structure = live()
+            .structure("slate_archive", "closed_accounts")
+            .expect("structure should load");
+
+        assert_eq!(
+            structure.foreign_keys,
+            vec![ForeignKey {
+                column: "account_id".into(),
+                referenced_schema: "slate_dev".into(),
+                referenced_table: "accounts".into(),
+                referenced_column: "id".into(),
+            }]
+        );
+    }
+
+    #[test]
+    #[ignore = "requires the repository development database configured through SLATE_MYSQL_URL"]
+    fn live_a_table_referencing_nothing_reports_no_foreign_keys() {
+        let structure = live()
+            .structure("slate_dev", "accounts")
+            .expect("structure should load");
+
+        assert!(structure.foreign_keys.is_empty());
+    }
+
+    #[test]
+    #[ignore = "requires the repository development database configured through SLATE_MYSQL_URL"]
+    fn live_the_rendered_foreign_key_ddl_survives_beside_the_structured_form() {
+        let structure = live()
+            .structure("slate_dev", "order_items")
+            .expect("structure should load");
+
+        assert!(
+            structure.constraints.iter().any(|constraint| {
+                constraint.definition
+                    == "FOREIGN KEY (order_account_id, order_number) \
+                        REFERENCES orders (account_id, number)"
+            }),
+            "{:?}",
+            structure.constraints
+        );
     }
 }
