@@ -428,7 +428,12 @@ Use these rather than hand-rolling: `InputState::new(window, cx).code_editor("sq
 it is `pub(crate)` in the library and cannot be named from here),
 `src/highlighter/` (tree-sitter; SQL via
 `tree_sitter_sequel`), `src/table/` (grid virtualized on both axes),
-`src/dock/` (panels, tab bars), `Root` dialog layers (modal overlays), and
+`src/dock/` (panels, tab bars), `Root` dialog layers (modal overlays),
+`src/menu/` (`PopupMenu` and the `DropdownMenu` trait it implements for
+`Button` -- an anchored menu whose open state the library owns, which is the
+answer to the "GPUI drops view state the same frame the view unmounts" hazard
+below rather than a dropdown of ours; the filter bar's column picker is the one
+caller), and
 `src/input/lsp/` plus `src/input/popovers/` (the completion provider trait and
 the caret-anchored popup it drives).
 

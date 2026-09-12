@@ -58,10 +58,35 @@ struct SortColumn {
     column: usize,
 }
 
-/// Which filter bar a gesture is aimed at, by position in the stack.
+/// The column a filter bar narrows on, picked from the bar's dropdown. The bar
+/// is named by position in the stack, which is how every one of these reaches
+/// it: the stack is what the user is pointing at.
 #[derive(Clone, PartialEq, Eq, Deserialize, Action)]
 #[action(namespace = slate, no_json)]
-struct PickFilterColumn {
+struct SetFilterColumn {
+    row: usize,
+    column: String,
+}
+
+/// Turn a bar into one the user writes SQL into, which has no column and no
+/// operator left to pick.
+#[derive(Clone, PartialEq, Eq, Deserialize, Action)]
+#[action(namespace = slate, no_json)]
+struct SetFilterRaw {
+    row: usize,
+}
+
+#[derive(Clone, PartialEq, Eq, Deserialize, Action)]
+#[action(namespace = slate, no_json)]
+struct SetFilterOperator {
+    row: usize,
+    operator: Operator,
+}
+
+/// Flip how a bar joins to the bar above it.
+#[derive(Clone, PartialEq, Eq, Deserialize, Action)]
+#[action(namespace = slate, no_json)]
+struct ToggleFilterJoin {
     row: usize,
 }
 
@@ -100,6 +125,7 @@ actions!(
         PreviousPage,
         ClearFilter,
         AddFilter,
+        ToggleNextJoin,
         NewRow,
         EditCell,
         CopyCell,
@@ -154,6 +180,7 @@ impl Profile {
     }
 
     fn stored(&self, cx: &App) -> store::StoredProfile {
+        let engine = self.config.engine();
         // Tabs read back from disk that the catalog has not named yet are still
         // the truth about this profile: writing the live list instead would
         // drop every restored object the first time anything else is saved.
@@ -164,7 +191,7 @@ impl Profile {
             .iter()
             .map(|tab| store::StoredObject {
                 active: active == Tab::Object(tab.id),
-                ..tab.stored(cx)
+                ..tab.stored(engine, cx)
             })
             .collect::<Vec<_>>();
         // Both lists, because a restore now opens the relations first and
@@ -717,20 +744,27 @@ impl ObjectTab {
         }
     }
 
-    /// The bars this tab's `WHERE` was derived from, complete ones only.
-    fn filters(&self, cx: &App) -> Vec<(String, String)> {
+    /// The bars this tab's `WHERE` was derived from, the ones that narrow
+    /// something only.
+    fn filters(&self, engine: Engine, cx: &App) -> Vec<store::StoredFilter> {
         match &self.body {
-            ObjectBody::Relation { filters, .. } => applied_filters(&filter_pairs(filters, cx)),
+            ObjectBody::Relation { filters, .. } => applied_filters(engine, &filter_bars(filters, cx))
+                .iter()
+                .map(stored_filter)
+                .collect(),
             ObjectBody::Routine(_) => Vec::new(),
         }
     }
 
-    fn stored(&self, cx: &App) -> store::StoredObject {
+    fn stored(&self, engine: Engine, cx: &App) -> store::StoredObject {
         store::StoredObject {
             schema: self.schema.clone(),
             name: self.name.clone(),
             filter: self.filter().to_string(),
-            filters: self.filters(cx),
+            // Nothing writes the two-field rows an older build did; they are
+            // read once on the way in and superseded by `bars` on this save.
+            filters: Vec::new(),
+            bars: self.filters(engine, cx),
             routine: matches!(self.kind, ObjectKind::Routine(_)),
             kind: match self.kind {
                 ObjectKind::Relation(kind) => kind,
@@ -756,7 +790,7 @@ enum OpenedObject {
         /// controls that produced it rather than with an expression nothing can
         /// edit. Derived and expression travel together for the length of the
         /// open: nothing parses one back into the other.
-        filters: Vec<(String, String)>,
+        filters: Vec<FilterBar>,
     },
     Routine {
         schema: String,
@@ -816,7 +850,7 @@ impl OpenedObject {
                 name: relation.name.clone(),
                 kind: relation.kind,
                 filter: stored.filter.clone(),
-                filters: stored.filters.clone(),
+                filters: stored_bars(stored),
             })
         }
     }
@@ -887,6 +921,10 @@ enum ObjectBody {
         /// The filter bars, stacked above the grid, which are the editable
         /// state (spec §2.4). Per tab, because the filter is.
         filters: Vec<FilterRow>,
+        /// The joiner the next bar added will carry, shown on the "Add filter"
+        /// row. Not persisted: it is a choice about a bar that does not exist
+        /// yet, and a restart that forgot it has forgotten nothing.
+        next_join: Conjunction,
         /// How many rows this preview asks for. Every result set is capped
         /// (spec §4.3); this is the tab's own copy of the cap, so raising it
         /// for one wide table does not raise it everywhere.
@@ -947,12 +985,223 @@ fn restored_state(grid: &store::StoredGrid) -> QueryState {
     }
 }
 
-/// One filter bar: a column, equality, and a value. Equality is the only
-/// operator (spec §2.4) — anything else is a query tab's job.
-struct FilterRow {
+/// What a filter bar compares its column against.
+///
+/// The whole list is equality-shaped in the sense that matters here: every arm
+/// is one predicate over one column, so the bar stays a control and never
+/// becomes an expression. `Raw` is the exception and is not an operator at all
+/// — see [`FilterBar::raw`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Deserialize)]
+enum Operator {
+    #[default]
+    Equals,
+    NotEquals,
+    Contains,
+    NotContains,
+    StartsWith,
+    EndsWith,
+    Greater,
+    GreaterOrEqual,
+    Less,
+    LessOrEqual,
+    IsNull,
+    IsNotNull,
+    IsEmpty,
+    IsNotEmpty,
+    InList,
+    NotInList,
+    Between,
+    Regex,
+}
+
+impl Operator {
+    /// Every operator in the order the dropdown offers them, which is the order
+    /// they were asked for: the common comparisons, then the absences, then the
+    /// set and range shapes.
+    const ALL: [Self; 18] = [
+        Self::Equals,
+        Self::NotEquals,
+        Self::Contains,
+        Self::NotContains,
+        Self::StartsWith,
+        Self::EndsWith,
+        Self::Greater,
+        Self::GreaterOrEqual,
+        Self::Less,
+        Self::LessOrEqual,
+        Self::IsNull,
+        Self::IsNotNull,
+        Self::IsEmpty,
+        Self::IsNotEmpty,
+        Self::InList,
+        Self::NotInList,
+        Self::Between,
+        Self::Regex,
+    ];
+
+    /// What the bar's own button shows: the SQL shape rather than the English,
+    /// because the bar is read beside the statement it writes.
+    fn symbol(self) -> &'static str {
+        match self {
+            Self::Equals => "=",
+            Self::NotEquals => "!=",
+            Self::Contains => "LIKE %..%",
+            Self::NotContains => "NOT LIKE %..%",
+            Self::StartsWith => "LIKE ..%",
+            Self::EndsWith => "LIKE %..",
+            Self::Greater => ">",
+            Self::GreaterOrEqual => ">=",
+            Self::Less => "<",
+            Self::LessOrEqual => "<=",
+            Self::IsNull => "is NULL",
+            Self::IsNotNull => "is not NULL",
+            Self::IsEmpty => "is empty",
+            Self::IsNotEmpty => "is not empty",
+            Self::InList => "IN (..)",
+            Self::NotInList => "NOT IN (..)",
+            Self::Between => "BETWEEN",
+            Self::Regex => "~",
+        }
+    }
+
+    /// What the dropdown row reads: the symbol and the English for it, so the
+    /// list can be scanned by either.
+    fn label(self) -> &'static str {
+        match self {
+            Self::Equals => "= equals",
+            Self::NotEquals => "!= not equals",
+            Self::Contains => "LIKE %..% contains",
+            Self::NotContains => "NOT LIKE %..% not contains",
+            Self::StartsWith => "LIKE ..% starts with",
+            Self::EndsWith => "LIKE %.. ends with",
+            Self::Greater => "> greater than",
+            Self::GreaterOrEqual => ">= greater or equal",
+            Self::Less => "< less than",
+            Self::LessOrEqual => "<= less or equal",
+            Self::InList => "IN (..) in list",
+            Self::NotInList => "NOT IN (..) not in list",
+            Self::Between => "BETWEEN between",
+            Self::Regex => "~ matches regex",
+            // The four that are their own English already.
+            other => other.symbol(),
+        }
+    }
+
+    /// Whether the bar shows a value input at all. An absence needs no value,
+    /// and a box that cannot change what runs is a box to read past.
+    fn takes_value(self) -> bool {
+        !matches!(
+            self,
+            Self::IsNull | Self::IsNotNull | Self::IsEmpty | Self::IsNotEmpty
+        )
+    }
+
+    /// What the value input asks for, where the shape is not a plain value.
+    fn placeholder(self) -> &'static str {
+        match self {
+            Self::Between => "min..max",
+            Self::InList | Self::NotInList => "a, b, c",
+            _ => "Value…",
+        }
+    }
+
+    /// Whether this engine can express the operator at all. Only the regex
+    /// match cannot: SQLite ships no `REGEXP` implementation, so the operator is
+    /// a syntax error until an application registers the function (spec §7).
+    fn on(self, engine: Engine) -> bool {
+        self != Self::Regex || engine != Engine::Sqlite
+    }
+
+    /// How the operator is written to disk. A name rather than an index, so
+    /// inserting an arm cannot silently rewrite everyone's saved bars, and one
+    /// this build does not know reads back as the default it always had.
+    fn slug(self) -> &'static str {
+        match self {
+            Self::Equals => "equals",
+            Self::NotEquals => "not-equals",
+            Self::Contains => "contains",
+            Self::NotContains => "not-contains",
+            Self::StartsWith => "starts-with",
+            Self::EndsWith => "ends-with",
+            Self::Greater => "greater",
+            Self::GreaterOrEqual => "greater-or-equal",
+            Self::Less => "less",
+            Self::LessOrEqual => "less-or-equal",
+            Self::IsNull => "is-null",
+            Self::IsNotNull => "is-not-null",
+            Self::IsEmpty => "is-empty",
+            Self::IsNotEmpty => "is-not-empty",
+            Self::InList => "in-list",
+            Self::NotInList => "not-in-list",
+            Self::Between => "between",
+            Self::Regex => "regex",
+        }
+    }
+
+    fn from_slug(slug: &str) -> Self {
+        Self::ALL
+            .into_iter()
+            .find(|operator| operator.slug() == slug)
+            .unwrap_or_default()
+    }
+}
+
+/// How a bar joins to the bar above it. The first bar in a stack has nothing to
+/// join to and its own value is never read.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Deserialize)]
+enum Conjunction {
+    #[default]
+    And,
+    Or,
+}
+
+impl Conjunction {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::And => "AND",
+            Self::Or => "OR",
+        }
+    }
+
+    fn toggled(self) -> Self {
+        match self {
+            Self::And => Self::Or,
+            Self::Or => Self::And,
+        }
+    }
+
+    /// `AND` for anything this build cannot read, which is what every bar
+    /// written before the joiner existed was.
+    fn from_str(value: &str) -> Self {
+        match value {
+            "OR" => Self::Or,
+            _ => Self::And,
+        }
+    }
+}
+
+/// One filter bar as the UI holds it, with no window in sight: the value type
+/// every predicate is derived from and the shape that goes to disk.
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+struct FilterBar {
     /// `None` until the dropdown has been used, which is a bar that narrows
-    /// nothing.
+    /// nothing. Unread on a raw bar.
     column: Option<String>,
+    operator: Operator,
+    conjunction: Conjunction,
+    /// Whether the value is SQL of the user's own, conjoined verbatim rather
+    /// than built from a column and an operator. `sql::is_generated_select` is
+    /// what stands behind it, and is why nothing here inspects the text.
+    raw: bool,
+    value: String,
+}
+
+/// One filter bar on screen: [`FilterBar`] with its value in an input.
+struct FilterRow {
+    column: Option<String>,
+    operator: Operator,
+    conjunction: Conjunction,
+    raw: bool,
     value: Entity<InputState>,
 }
 
@@ -960,14 +1209,14 @@ struct FilterRow {
 /// that ran on every keystroke would put a half-typed predicate on the wire.
 fn filter_row(
     id: u64,
-    column: Option<String>,
-    value: String,
+    bar: FilterBar,
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) -> FilterRow {
+    let placeholder = value_placeholder(bar.raw, bar.operator);
     let input = cx.new(|cx| {
-        let mut state = InputState::new(window, cx).placeholder("Value…");
-        state.set_value(value, window, cx);
+        let mut state = InputState::new(window, cx).placeholder(placeholder);
+        state.set_value(bar.value, window, cx);
         state
     });
     cx.subscribe(&input, move |workspace, _, event: &InputEvent, cx| {
@@ -977,41 +1226,82 @@ fn filter_row(
     })
     .detach();
     FilterRow {
-        column,
+        column: bar.column,
+        operator: bar.operator,
+        conjunction: bar.conjunction,
+        raw: bar.raw,
         value: input,
     }
 }
 
+fn value_placeholder(raw: bool, operator: Operator) -> &'static str {
+    match raw {
+        true => "SQL…",
+        false => operator.placeholder(),
+    }
+}
+
 /// Every bar as it stands, unfinished ones included.
-fn filter_pairs(filters: &[FilterRow], cx: &App) -> Vec<(Option<String>, String)> {
+fn filter_bars(filters: &[FilterRow], cx: &App) -> Vec<FilterBar> {
     filters
         .iter()
-        .map(|row| (row.column.clone(), row.value.read(cx).value().to_string()))
+        .map(|row| FilterBar {
+            column: row.column.clone(),
+            operator: row.operator,
+            conjunction: row.conjunction,
+            raw: row.raw,
+            value: row.value.read(cx).value().to_string(),
+        })
         .collect()
 }
 
-/// The bars that narrow anything. A bar with no column picked or an empty value
-/// is one the user is still filling in, so it reaches neither the statement nor
-/// the file.
-fn applied_filters(rows: &[(Option<String>, String)]) -> Vec<(String, String)> {
-    rows.iter()
-        .filter_map(|(column, value)| {
-            let column = column.clone()?;
-            (!value.is_empty()).then(|| (column, value.clone()))
-        })
+/// The bars that narrow anything, which is the same question as whether a bar
+/// has a predicate: an unfinished one reaches neither the statement nor the
+/// file.
+fn applied_filters(engine: Engine, bars: &[FilterBar]) -> Vec<FilterBar> {
+    bars.iter()
+        .filter(|bar| bar_predicate(engine, bar).is_some())
+        .cloned()
         .collect()
 }
 
 /// The `WHERE` the bars add up to, without the keyword and empty for no bars.
 ///
-/// Conjoined, because a stack of bars reads as "all of these" and because an
-/// `OR` between two of them is a question a query tab answers.
-fn derived_filter(engine: Engine, applied: &[(String, String)]) -> String {
-    applied
-        .iter()
-        .map(|(column, value)| filter_predicate(engine, column, value))
-        .collect::<Vec<_>>()
-        .join(" AND ")
+/// Folded left to right with each side parenthesised, so the stack means what
+/// it looks like: `a OR b` then `AND c` reads `(a OR b) AND c` and not the
+/// `a OR (b AND c)` that SQL's own precedence would give it. A lone bar is
+/// unwrapped, which is also what keeps a tab filtered before joiners existed
+/// on the grid-snapshot key it already had.
+fn derived_filter(engine: Engine, bars: &[FilterBar]) -> String {
+    let mut folded: Option<String> = None;
+    for bar in bars {
+        let Some(predicate) = bar_predicate(engine, bar) else {
+            continue;
+        };
+        folded = Some(match folded {
+            None => predicate,
+            Some(left) => format!("({left}) {} ({predicate})", bar.conjunction.as_str()),
+        });
+    }
+    folded.unwrap_or_default()
+}
+
+/// The predicate one bar contributes, or `None` for a bar that narrows nothing:
+/// no column picked, no value where the operator needs one, an empty list, half
+/// a range, or an operator this engine does not have.
+fn bar_predicate(engine: Engine, bar: &FilterBar) -> Option<String> {
+    let value = bar.value.trim();
+    if bar.raw {
+        // Verbatim, and checked as a whole statement by `is_generated_select`
+        // rather than inspected here: a filter Slate does not understand is
+        // exactly what the gate is for (spec §2.3).
+        return (!value.is_empty()).then(|| value.to_string());
+    }
+    let column = bar.column.as_deref()?;
+    if !bar.operator.on(engine) || (bar.operator.takes_value() && value.is_empty()) {
+        return None;
+    }
+    filter_predicate(engine, column, bar.operator, value)
 }
 
 fn result_grid(window: &mut Window, cx: &mut Context<Workspace>) -> Entity<TableState<ResultGrid>> {
@@ -2489,7 +2779,7 @@ impl Workspace {
             } => {
                 let filters = filters
                     .into_iter()
-                    .map(|(column, value)| filter_row(id, Some(column), value, window, cx))
+                    .map(|bar| filter_row(id, bar, window, cx))
                     .collect();
                 ObjectBody::Relation {
                     showing_structure: false,
@@ -2499,6 +2789,7 @@ impl Workspace {
                     sort: Vec::new(),
                     filter,
                     filters,
+                    next_join: Conjunction::default(),
                     limit: preview_rows,
                     offset: 0,
                     stale: false,
@@ -2774,10 +3065,10 @@ impl Workspace {
         else {
             return;
         };
-        let Some(pair) = foreign_key_filter(&key, grid.active_value()) else {
+        let Some(bar) = foreign_key_filter(&key, grid.active_value()) else {
             return;
         };
-        let filters = vec![pair];
+        let filters = vec![bar];
         let filter = derived_filter(engine, &filters);
         // The catalog is the only authority on what the referenced relation is;
         // a default is what a tab opened before it loaded would have worn too.
@@ -3017,7 +3308,7 @@ impl Workspace {
                             })
                             .unwrap_or(stored.kind),
                         filter: stored.filter.clone(),
-                        filters: stored.filters.clone(),
+                        filters: stored_bars(stored),
                     },
                     stored.active,
                 ));
@@ -3387,7 +3678,6 @@ impl Workspace {
             Command::CycleTheme => self.cycle_theme(&CycleTheme, window, cx),
             Command::PickFont(slot) => self.open_palette(PaletteMode::Font(slot), window, cx),
             Command::SetFont(slot, family) => self.set_font(slot, family, cx),
-            Command::SetFilterColumn(row, column) => self.set_filter_column(row, column, cx),
             Command::ToggleSidebar => self.toggle_sidebar(&ToggleSidebar, window, cx),
             Command::ResetEditorZoom => self.reset_editor_zoom(&ResetEditorZoom, window, cx),
             Command::OpenSettings => self.open_settings(&OpenSettings, window, cx),
@@ -3582,18 +3872,16 @@ impl Workspace {
     fn apply_filter(&mut self, id: u64, cx: &mut Context<Self>) {
         self.clear_notice();
         let engine = self.engine();
-        let Some(applied) = self.profile().and_then(|profile| {
+        let Some(bars) = self.profile().and_then(|profile| {
             let tab = profile.session.objects.iter().find(|tab| tab.id == id)?;
             match &tab.body {
-                ObjectBody::Relation { filters, .. } => {
-                    Some(applied_filters(&filter_pairs(filters, cx)))
-                }
+                ObjectBody::Relation { filters, .. } => Some(filter_bars(filters, cx)),
                 ObjectBody::Routine(_) => None,
             }
         }) else {
             return;
         };
-        let derived = derived_filter(engine, &applied);
+        let derived = derived_filter(engine, &bars);
         self.requery_relation(
             id,
             move |filter, _, _, offset| changed_filter(filter, offset, &derived),
@@ -3627,31 +3915,93 @@ impl Workspace {
         cx.notify();
     }
 
-    /// The column list for one bar. The palette is the list Slate already picks
-    /// a name out of, so the dropdown is that list in another mode rather than
-    /// a popup of its own to keep alive across a frame.
-    fn pick_filter_column(
+    /// Point a bar at a column and ask again.
+    fn set_filter_column(
         &mut self,
-        action: &PickFilterColumn,
-        window: &mut Window,
+        action: &SetFilterColumn,
+        _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.open_palette(PaletteMode::FilterColumn(action.row), window, cx);
-    }
-
-    /// Point a bar at a column and ask again.
-    fn set_filter_column(&mut self, row: usize, column: String, cx: &mut Context<Self>) {
-        let Some(Tab::Object(id)) = self.profile().map(|profile| profile.session.active) else {
+        let Some(id) = self.active_object_id() else {
             return;
         };
-        match self
-            .filter_rows_mut(id)
-            .and_then(|filters| filters.get_mut(row))
-        {
-            Some(filter) => filter.column = Some(column),
+        match self.filter_row_mut(id, action.row) {
+            Some(filter) => {
+                filter.column = Some(action.column.clone());
+                filter.raw = false;
+            }
             None => return,
         }
         self.apply_filter(id, cx);
+        cx.notify();
+    }
+
+    /// Turn a bar into a raw one. The value it already holds stays: it is the
+    /// only thing the two shapes have in common, and dropping it would lose
+    /// what was typed to a dropdown.
+    fn set_filter_raw(&mut self, action: &SetFilterRaw, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(id) = self.active_object_id() else {
+            return;
+        };
+        let Some(filter) = self.filter_row_mut(id, action.row) else {
+            return;
+        };
+        filter.raw = true;
+        let input = filter.value.clone();
+        input.update(cx, |input, cx| {
+            input.set_placeholder(value_placeholder(true, Operator::default()), window, cx);
+        });
+        self.apply_filter(id, cx);
+        cx.notify();
+    }
+
+    fn set_filter_operator(
+        &mut self,
+        action: &SetFilterOperator,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(id) = self.active_object_id() else {
+            return;
+        };
+        let Some(filter) = self.filter_row_mut(id, action.row) else {
+            return;
+        };
+        filter.operator = action.operator;
+        let input = filter.value.clone();
+        input.update(cx, |input, cx| {
+            input.set_placeholder(value_placeholder(false, action.operator), window, cx);
+        });
+        self.apply_filter(id, cx);
+        cx.notify();
+    }
+
+    fn toggle_filter_join(
+        &mut self,
+        action: &ToggleFilterJoin,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(id) = self.active_object_id() else {
+            return;
+        };
+        match self.filter_row_mut(id, action.row) {
+            Some(filter) => filter.conjunction = filter.conjunction.toggled(),
+            None => return,
+        }
+        self.apply_filter(id, cx);
+        cx.notify();
+    }
+
+    /// Flip the joiner the next bar will carry. Shown on the "Add filter" row
+    /// so the choice is made where the bar is added rather than after it lands.
+    fn toggle_next_join(&mut self, _: &ToggleNextJoin, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(id) = self.active_object_id() else {
+            return;
+        };
+        if let Some(ObjectBody::Relation { next_join, .. }) = self.object_body_mut(id) {
+            *next_join = next_join.toggled();
+        }
         cx.notify();
     }
 
@@ -3692,23 +4042,50 @@ impl Workspace {
     }
 
     fn push_filter_row(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
-        let row = filter_row(id, None, String::new(), window, cx);
+        let conjunction = match self.object_body_mut(id) {
+            Some(ObjectBody::Relation { next_join, .. }) => *next_join,
+            _ => return,
+        };
+        let row = filter_row(
+            id,
+            FilterBar {
+                conjunction,
+                ..FilterBar::default()
+            },
+            window,
+            cx,
+        );
         if let Some(filters) = self.filter_rows_mut(id) {
             filters.push(row);
         }
     }
 
-    fn filter_rows_mut(&mut self, id: u64) -> Option<&mut Vec<FilterRow>> {
+    fn active_object_id(&self) -> Option<u64> {
+        match self.profile()?.session.active {
+            Tab::Object(id) => Some(id),
+            Tab::Query(_) => None,
+        }
+    }
+
+    fn object_body_mut(&mut self, id: u64) -> Option<&mut ObjectBody> {
         let tab = self
             .profile_mut()?
             .session
             .objects
             .iter_mut()
             .find(|tab| tab.id == id)?;
-        match &mut tab.body {
+        Some(&mut tab.body)
+    }
+
+    fn filter_rows_mut(&mut self, id: u64) -> Option<&mut Vec<FilterRow>> {
+        match self.object_body_mut(id)? {
             ObjectBody::Relation { filters, .. } => Some(filters),
             ObjectBody::Routine(_) => None,
         }
+    }
+
+    fn filter_row_mut(&mut self, id: u64, row: usize) -> Option<&mut FilterRow> {
+        self.filter_rows_mut(id)?.get_mut(row)
     }
 
     /// Open the "New row" form over the preview in front, one field per column
@@ -6195,7 +6572,11 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::clear_filter))
             .on_action(cx.listener(Self::add_filter))
             .on_action(cx.listener(Self::remove_filter))
-            .on_action(cx.listener(Self::pick_filter_column))
+            .on_action(cx.listener(Self::set_filter_column))
+            .on_action(cx.listener(Self::set_filter_raw))
+            .on_action(cx.listener(Self::set_filter_operator))
+            .on_action(cx.listener(Self::toggle_filter_join))
+            .on_action(cx.listener(Self::toggle_next_join))
             .on_action(cx.listener(Self::new_row))
             .on_action(cx.listener(Self::show_editor))
             .on_action(cx.listener(Self::cycle_theme))
@@ -6368,18 +6749,111 @@ fn changed_filter(filter: &mut String, offset: &mut usize, typed: &str) -> bool 
     true
 }
 
-/// One column equal to one value, quoted the way the server will read it.
+/// One column against one value under one operator, quoted the way the server
+/// will read it. `None` where the value does not add up to a predicate.
 ///
 /// A SQL-generating call site (`AGENTS.md`, engine divergences), and the only
-/// place a filter bar's column and value become SQL. Equality is the only
-/// operator offered: anything else is a statement, and a query tab is where a
-/// statement belongs.
-fn filter_predicate(engine: Engine, column: &str, value: &str) -> String {
+/// place a filter bar becomes SQL -- every operator composes here, through
+/// `quote_identifier` and `quote_literal`, so there is one place a quote can be
+/// got wrong rather than one per operator.
+fn filter_predicate(
+    engine: Engine,
+    column: &str,
+    operator: Operator,
+    value: &str,
+) -> Option<String> {
+    let name = engine.quote_identifier(column);
+    let literal = |value: &str| engine.quote_literal(value);
+    let comparison = |symbol: &str| Some(format!("{name} {symbol} {}", literal(value)));
+    // `<>` rather than `!=` on both of the negations, because it is the
+    // spelling all three engines agree on; the dropdown says `!=` because that
+    // is the one people read.
+    match operator {
+        Operator::Equals => comparison("="),
+        Operator::NotEquals => comparison("<>"),
+        Operator::Greater => comparison(">"),
+        Operator::GreaterOrEqual => comparison(">="),
+        Operator::Less => comparison("<"),
+        Operator::LessOrEqual => comparison("<="),
+        Operator::IsNull => Some(format!("{name} IS NULL")),
+        Operator::IsNotNull => Some(format!("{name} IS NOT NULL")),
+        Operator::IsEmpty => Some(format!("{name} = {}", literal(""))),
+        Operator::IsNotEmpty => Some(format!("{name} <> {}", literal(""))),
+        Operator::Contains => Some(like(engine, &name, true, format!("%{}%", like_pattern(value)))),
+        Operator::NotContains => Some(like(engine, &name, false, format!("%{}%", like_pattern(value)))),
+        Operator::StartsWith => Some(like(engine, &name, true, format!("{}%", like_pattern(value)))),
+        Operator::EndsWith => Some(like(engine, &name, true, format!("%{}", like_pattern(value)))),
+        Operator::InList | Operator::NotInList => {
+            let items: Vec<_> = value
+                .split(',')
+                .map(str::trim)
+                .filter(|item| !item.is_empty())
+                .map(|item| literal(item))
+                .collect();
+            // An empty list is `IN ()`, which does not parse anywhere.
+            if items.is_empty() {
+                return None;
+            }
+            let keyword = match operator {
+                Operator::NotInList => "NOT IN",
+                _ => "IN",
+            };
+            Some(format!("{name} {keyword} ({})", items.join(", ")))
+        }
+        Operator::Between => {
+            // One input rather than two, split on the ellipsis the placeholder
+            // shows. Half a range is not a range.
+            let (low, high) = value.split_once("..")?;
+            let (low, high) = (low.trim(), high.trim());
+            if low.is_empty() || high.is_empty() {
+                return None;
+            }
+            Some(format!(
+                "{name} BETWEEN {} AND {}",
+                literal(low),
+                literal(high)
+            ))
+        }
+        // Postgres spells it as an operator and MySQL as a keyword; SQLite has
+        // no regex at all, which `Operator::on` is what refuses (spec §7).
+        Operator::Regex => match engine {
+            Engine::Postgres => comparison("~"),
+            Engine::MySql => comparison("REGEXP"),
+            Engine::Sqlite => None,
+        },
+    }
+}
+
+/// A `LIKE` against a pattern, with the escape clause that makes the escaping
+/// [`like_pattern`] did mean anything.
+///
+/// The clause is written out rather than left to the server's default: MySQL's
+/// default happens to be the same backslash, but saying so is what keeps the
+/// pattern and the escape from being decided in two places.
+fn like(engine: Engine, name: &str, positive: bool, pattern: String) -> String {
     format!(
-        "{} = {}",
-        engine.quote_identifier(column),
-        engine.quote_literal(value)
+        "{name} {}LIKE {} ESCAPE {}",
+        match positive {
+            true => "",
+            false => "NOT ",
+        },
+        engine.quote_literal(&pattern),
+        engine.quote_literal("\\")
     )
+}
+
+/// The user's text as a `LIKE` pattern's literal part: the wildcards it holds
+/// are escaped, so a value containing `%` matches a percent sign rather than
+/// silently widening the match to anything.
+fn like_pattern(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        if matches!(character, '\\' | '%' | '_') {
+            escaped.push('\\');
+        }
+        escaped.push(character);
+    }
+    escaped
 }
 
 /// The filter bar following a foreign key writes: the referenced column against
@@ -6393,8 +6867,52 @@ fn filter_predicate(engine: Engine, column: &str, value: &str) -> String {
 /// `None` for a NULL, which references nothing. `<column> = NULL` is a filter
 /// that parses, runs, matches no row, and looks like a bug in the data rather
 /// than in the gesture.
-fn foreign_key_filter(key: &db::ForeignKey, value: Option<&str>) -> Option<(String, String)> {
-    Some((key.referenced_column.clone(), value?.to_string()))
+fn foreign_key_filter(key: &db::ForeignKey, value: Option<&str>) -> Option<FilterBar> {
+    Some(FilterBar {
+        column: Some(key.referenced_column.clone()),
+        value: value?.to_string(),
+        ..FilterBar::default()
+    })
+}
+
+/// A bar on its way to disk. The operator and the joiner travel as names and
+/// the raw flag as itself, because a `WHERE` is never read back into controls.
+fn stored_filter(bar: &FilterBar) -> store::StoredFilter {
+    store::StoredFilter {
+        column: bar.column.clone().unwrap_or_default(),
+        value: bar.value.clone(),
+        operator: bar.operator.slug().to_string(),
+        conjunction: bar.conjunction.as_str().to_string(),
+        raw: bar.raw,
+    }
+}
+
+/// The bars a stored tab comes back with. `bars` is what this build writes;
+/// `filters` is the column-and-value pair an older one wrote, which restores as
+/// the equality joined by `AND` that it was.
+fn stored_bars(stored: &store::StoredObject) -> Vec<FilterBar> {
+    if stored.bars.is_empty() {
+        return stored
+            .filters
+            .iter()
+            .map(|(column, value)| FilterBar {
+                column: Some(column.clone()),
+                value: value.clone(),
+                ..FilterBar::default()
+            })
+            .collect();
+    }
+    stored
+        .bars
+        .iter()
+        .map(|bar| FilterBar {
+            column: Some(bar.column.clone()).filter(|column| !column.is_empty()),
+            operator: Operator::from_slug(&bar.operator),
+            conjunction: Conjunction::from_str(&bar.conjunction),
+            raw: bar.raw,
+            value: bar.value.clone(),
+        })
+        .collect()
 }
 
 /// Slate's statement for a relation's tab, carrying the filter and the sort the

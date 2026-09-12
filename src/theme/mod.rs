@@ -104,6 +104,9 @@ pub mod layout {
     /// capped so a catalog of thousands scrolls rather than filling the window.
     pub const PALETTE_WIDTH: f32 = 520.0;
     pub const PALETTE_MAX_HEIGHT: f32 = 360.0;
+    /// An anchored menu, capped so a wide relation's column list scrolls rather
+    /// than running off the window.
+    pub const MENU_MAX_HEIGHT: f32 = 320.0;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

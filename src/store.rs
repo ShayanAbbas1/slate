@@ -128,12 +128,9 @@ pub struct StoredObject {
     /// had open. Meaningless for a routine.
     #[serde(default)]
     pub filter: String,
-    /// The filter bars [`Self::filter`] was derived from, as column and value.
-    /// The bars are the editable state and the expression is what runs, so both
-    /// are kept: nothing here parses a `WHERE` back into controls. Absent is a
-    /// profile written before the bars existed, and comes back as a tab whose
-    /// expression still applies and whose bar row is empty. Meaningless for a
-    /// routine.
+    /// The column-and-value bars a build before operators wrote. Read only:
+    /// [`Self::bars`] supersedes it and is written in its place, and a pair
+    /// read back here is the equality joined by `AND` that it was.
     #[serde(default)]
     pub filters: Vec<(String, String)>,
     /// Which tab was in front. A flag on the object rather than a pointer to
@@ -141,6 +138,36 @@ pub struct StoredObject {
     /// schema from a relation in a key.
     #[serde(default)]
     pub active: bool,
+    /// The filter bars [`Self::filter`] was derived from. The bars are the
+    /// editable state and the expression is what runs, so both are kept:
+    /// nothing here parses a `WHERE` back into controls. Last, because TOML
+    /// cannot emit a scalar after a table and every bar is one. Meaningless for
+    /// a routine.
+    #[serde(default)]
+    pub bars: Vec<StoredFilter>,
+}
+
+/// One filter bar on disk (spec §2.4). Every field defaults, so a bar written
+/// by a build that knew fewer of them still loads -- and an operator or joiner
+/// this build cannot read comes back as the equality joined by `AND` that every
+/// bar was before they existed.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct StoredFilter {
+    #[serde(default)]
+    pub column: String,
+    #[serde(default)]
+    pub value: String,
+    /// `main::Operator::slug`. A name rather than an index, so inserting an
+    /// operator cannot silently rewrite what everyone's saved bars mean.
+    #[serde(default)]
+    pub operator: String,
+    /// `AND` or `OR`: how this bar joins to the one above it.
+    #[serde(default)]
+    pub conjunction: String,
+    /// Whether the value is the user's own SQL rather than a column and an
+    /// operator.
+    #[serde(default)]
+    pub raw: bool,
 }
 
 /// A tab's last-seen grid, kept so reopening a profile shows a query's or a
@@ -797,6 +824,7 @@ mod tests {
                     filter: String::new(),
                     filters: Vec::new(),
                     active: true,
+                    bars: Vec::new(),
                 },
                 StoredObject {
                     schema: "public".into(),
@@ -806,6 +834,7 @@ mod tests {
                     filter: String::new(),
                     filters: Vec::new(),
                     active: false,
+                    bars: Vec::new(),
                 },
             ],
         };
@@ -885,6 +914,7 @@ open_objects = []
                 filter: String::new(),
                 filters: Vec::new(),
                 active: true,
+                bars: Vec::new(),
             }],
         };
         let file = ProfileFile {
@@ -943,6 +973,7 @@ open_objects = []
                 filter: String::new(),
                 filters: Vec::new(),
                 active: true,
+                bars: Vec::new(),
             }],
         };
         let file = ProfileFile {
@@ -1046,6 +1077,7 @@ open_objects = []
                 filter: String::new(),
                 filters: Vec::new(),
                 active: true,
+                bars: Vec::new(),
             }],
         };
         let text = toml::to_string_pretty(&ProfileFile {
@@ -1377,6 +1409,7 @@ open_objects = []
                 filter: String::new(),
                 filters: Vec::new(),
                 active: true,
+                bars: Vec::new(),
             }],
         };
         let text = toml::to_string_pretty(&ProfileFile {
@@ -1620,6 +1653,7 @@ name = \"accounts\"
                     filter: String::new(),
                     filters: Vec::new(),
                     active: false,
+                    bars: Vec::new(),
                 },
                 StoredObject {
                     schema: "public".into(),
@@ -1627,8 +1661,15 @@ name = \"accounts\"
                     routine: false,
                     kind: RelationKind::Table,
                     filter: r#""id" = '42'"#.into(),
-                    filters: vec![("id".into(), "42".into())],
+                    filters: Vec::new(),
                     active: true,
+                    bars: vec![StoredFilter {
+                        column: "id".into(),
+                        value: "42".into(),
+                        operator: "equals".into(),
+                        conjunction: "AND".into(),
+                        raw: false,
+                    }],
                 },
             ],
         };
@@ -1655,12 +1696,25 @@ name = \"accounts\"
             name: "customers".into(),
             routine: false,
             kind: RelationKind::Table,
-            filter: r#""state" = 'it''s ok' AND "tier" = '2'"#.into(),
-            filters: vec![
-                ("state".into(), "it's ok".into()),
-                ("tier".into(), "2".into()),
-            ],
+            filter: r#"("state" = 'it''s ok') OR ("tier" LIKE '%2%' ESCAPE '\')"#.into(),
+            filters: Vec::new(),
             active: true,
+            bars: vec![
+                StoredFilter {
+                    column: "state".into(),
+                    value: "it's ok".into(),
+                    operator: "equals".into(),
+                    conjunction: "AND".into(),
+                    raw: false,
+                },
+                StoredFilter {
+                    column: "tier".into(),
+                    value: "2".into(),
+                    operator: "contains".into(),
+                    conjunction: "OR".into(),
+                    raw: false,
+                },
+            ],
         };
         let profile = StoredProfile {
             id: "dev".into(),

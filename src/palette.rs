@@ -41,10 +41,6 @@ pub enum Mode {
     /// with the slot in it rather than three: the list is the same list, and
     /// only the row's destination differs.
     Font(FontSlot),
-    /// The preview's columns, for one filter bar. This is the bar's column
-    /// dropdown: a list Slate already knows how to show, rather than a popup
-    /// whose open state something has to own across a frame.
-    FilterColumn(usize),
 }
 
 /// What a row does when it is confirmed.
@@ -100,9 +96,6 @@ pub enum Command {
     /// [`Command::QueryHistory`] does for the history.
     PickFont(FontSlot),
     SetFont(FontSlot, String),
-    /// The column one filter bar narrows on, picked from the preview's own
-    /// columns.
-    SetFilterColumn(usize, String),
     ToggleSidebar,
     ResetEditorZoom,
     OpenSettings,
@@ -147,7 +140,6 @@ impl Palette {
                 Mode::Commands => command_items(workspace, profile, cx),
                 Mode::History => history_items(profile),
                 Mode::Font(slot) => font_items(slot, cx),
-                Mode::FilterColumn(row) => filter_column_items(row, profile, cx),
             },
             None => Vec::new(),
         };
@@ -178,7 +170,6 @@ impl Palette {
             Mode::Commands => "Run a command…",
             Mode::History => "Recall a statement you have run…",
             Mode::Font(_) => "Pick a font…",
-            Mode::FilterColumn(_) => "Filter on a column…",
         }
     }
 }
@@ -371,28 +362,6 @@ fn font_items(slot: FontSlot, cx: &App) -> Vec<Item> {
             icon: icon::FONT,
             command: Command::SetFont(slot, name.clone()),
             label: name,
-        })
-        .collect()
-}
-
-/// The active preview's columns, for the bar at `row`.
-///
-/// The grid's own column names, because the preview is Slate's `SELECT *` and a
-/// header is the server's word for the column rather than an alias.
-fn filter_column_items(row: usize, profile: &Profile, cx: &App) -> Vec<Item> {
-    let Some(results) = profile.session.active_results() else {
-        return Vec::new();
-    };
-    results
-        .read(cx)
-        .delegate()
-        .columns()
-        .iter()
-        .map(|column| Item {
-            label: column.name.to_string(),
-            hint: "".into(),
-            icon: icon::TABLE,
-            command: Command::SetFilterColumn(row, column.name.to_string()),
         })
         .collect()
 }

@@ -9,11 +9,13 @@
 
 use gpui::{
     AnyElement, ClickEvent, Context, Entity, FontWeight, InteractiveElement, IntoElement,
-    ParentElement, StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder, px,
+    ParentElement, SharedString, StatefulInteractiveElement, Styled, Window, div,
+    prelude::FluentBuilder, px,
 };
 use gpui_component::{
     Disableable, IconName, Sizable,
     input::{Input, InputState},
+    menu::DropdownMenu,
     resizable::{resizable_panel, v_resizable},
     spinner::Spinner,
     table::{Table, TableDelegate, TableState},
@@ -21,10 +23,10 @@ use gpui_component::{
 
 use crate::{
     AddFilter, CancelQuery, CloseTarget, Control, EDITOR_FONT_SIZE_MAX, EDITOR_FONT_SIZE_MIN,
-    FilterRow, NewQuery, NewRow, NextPage, ObjectBody, ObjectTab, PickFilterColumn, PreviousPage,
-    Profile, QueryState, RemoveFilter, ResetEditorZoom, RunQuery, SaveQuery, SetRowLimit, Settings,
-    StructureState, Tab, Tone, Workspace, ZoomEditorIn, ZoomEditorOut, button, button_label,
-    compact_count, db,
+    FilterRow, NewQuery, NewRow, NextPage, ObjectBody, ObjectTab, PreviousPage, Profile,
+    QueryState, RemoveFilter, ResetEditorZoom, RunQuery, SaveQuery, SetFilterColumn, SetRowLimit,
+    Settings, StructureState, Tab, Tone, Workspace, ZoomEditorIn, ZoomEditorOut, button,
+    button_label, compact_count, db,
     db::RoutineKind,
     dialog, editor_zoom_percent,
     explorer::ROW_LIMITS,
@@ -172,7 +174,11 @@ fn render_object(tab: &ObjectTab, cx: &mut Context<Workspace>) -> AnyElement {
         .size_full()
         .flex()
         .flex_col()
-        .child(render_filter_bar(filters, t))
+        .child(render_filter_bar(
+            filters,
+            results.read(cx).delegate().columns(),
+            t,
+        ))
         .child(
             div()
                 .flex_1()
@@ -189,7 +195,11 @@ fn render_object(tab: &ObjectTab, cx: &mut Context<Workspace>) -> AnyElement {
 /// A bar is a column, an equals and a value, and the stack is conjoined
 /// (spec §2.4). There is no expression field: a preview runs SQL Slate
 /// generates from visible controls, and arbitrary SQL belongs in a query tab.
-fn render_filter_bar(filters: &[FilterRow], t: Theme) -> AnyElement {
+fn render_filter_bar(filters: &[FilterRow], columns: &[db::Column], t: Theme) -> AnyElement {
+    let names: Vec<SharedString> = columns
+        .iter()
+        .map(|column| SharedString::from(column.name.clone()))
+        .collect();
     div()
         .w_full()
         .flex_shrink_0()
@@ -208,8 +218,35 @@ fn render_filter_bar(filters: &[FilterRow], t: Theme) -> AnyElement {
                         Control::Compact,
                         t,
                     )
-                    .on_click(move |_, window, cx| {
-                        window.dispatch_action(Box::new(PickFilterColumn { row }), cx);
+                    // So it reads as a dropdown rather than as a button that
+                    // does something. Its own colour, for the reason every
+                    // button's content carries one.
+                    .child(
+                        icon(icon::CHEVRON_DOWN)
+                            .size(px(layout::ICON_SIZE))
+                            .text_color(t.text_faint),
+                    )
+                    // The grid's own column names, because the preview is
+                    // Slate's `SELECT *` and a header is the server's word for
+                    // the column rather than an alias.
+                    .dropdown_menu({
+                        let names = names.clone();
+                        let chosen = filter.column.clone();
+                        move |menu, _, _| {
+                            names.iter().fold(
+                                menu.scrollable(true).max_h(px(layout::MENU_MAX_HEIGHT)),
+                                |menu, name| {
+                                    menu.menu_with_check(
+                                        name.clone(),
+                                        chosen.as_deref() == Some(name.as_ref()),
+                                        Box::new(SetFilterColumn {
+                                            row,
+                                            column: name.to_string(),
+                                        }),
+                                    )
+                                },
+                            )
+                        }
                     }),
                 )
                 // Equality is the only operator, so this says what the bar
