@@ -295,14 +295,16 @@ Decided, recorded in the multi-engine spec, and not to be re-litigated:
 - **`Engine` is the only engine-shaped thing above `src/db/`**, and only because
   Slate writes SQL. It answers three questions — quote an identifier, quote a
   literal, qualify a name — plus the inverse used to read a sort key back.
-  There are **seven** call sites that generate SQL:
+  There are **eight** call sites that generate SQL:
   `explorer::preview_sql`, `sql::with_order_by`, `sql::update_row`,
-  `sql::insert_row`, `sql::delete_row`, `main::sort_expression`, and
-  `main::filter_predicate` — the last quotes both
-  the column and the value a header input writes. `main::sort_expression` is the
-  one that gets forgotten, and forgetting it is silent: a double-quoted name is a
-  *string literal* in MySQL, so `ORDER BY "name"` sorts every row by the same
-  constant with no error.
+  `main::sort_expression`, `main::filter_predicate`, `sql::insert_row`,
+  `sql::delete_row`, and `main::foreign_key_filter`. `main::sort_expression` is
+  the one that gets forgotten, and forgetting it is silent: a double-quoted name
+  is a *string literal* in MySQL, so `ORDER BY "name"` sorts every row by the
+  same constant with no error. `main::filter_predicate` and
+  `main::foreign_key_filter` quote a *value the user supplied* rather than only
+  an identifier — the header input's text and the cell's contents respectively —
+  which is the other half of the same hazard.
 - **MySQL and SQLite both bracket a generated multi-row batch** in
   `BEGIN`/`COMMIT`, because each commits every statement on its own where a
   Postgres `simple_query` submission is one implicit transaction. The brackets

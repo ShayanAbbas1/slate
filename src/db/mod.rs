@@ -544,9 +544,6 @@ pub struct NamedDefinition {
 /// Engine-agnostic by rule, not by accident: hard rule 4. No oid, no attribute
 /// number, no `information_schema` row and no driver value reaches these four
 /// owned strings, and nothing here says which engine answered.
-// The three engine modules are the pending callers; each fills this in from its
-// own catalog query in the tasks that follow this one.
-#[allow(dead_code)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ForeignKey {
     pub column: String,
@@ -700,7 +697,6 @@ pub(super) fn assemble_structure(
 /// four aliases, so the row-to-struct step is the same work twice; SQLite does
 /// not use this at all, because `PRAGMA foreign_key_list` reports a different
 /// shape. No engine branches here and no engine has to route through it.
-#[allow(dead_code)] // See `ForeignKey`: the engine modules are the pending callers.
 pub(super) fn assemble_foreign_keys(result: &QueryResult) -> Result<Vec<ForeignKey>, DbError> {
     result
         .rows

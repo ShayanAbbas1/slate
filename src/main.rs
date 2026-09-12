@@ -6104,6 +6104,27 @@ fn filter_predicate(engine: Engine, column: &str, value: &str) -> String {
     )
 }
 
+/// The filter that following a foreign key writes: the referenced column
+/// against the value the cell held (spec §6.2).
+///
+/// A SQL-generating call site, which is why it is on the list in `AGENTS.md`:
+/// it quotes an identifier and a literal, and getting either wrong is silent on
+/// MySQL rather than an error.
+///
+/// `None` for a NULL, which references nothing. `<column> = NULL` is a filter
+/// that parses, runs, matches no row, and looks like a bug in the data rather
+/// than in the gesture.
+// The cell's navigate affordance is the pending caller; it is what the next
+// task wires to this.
+#[allow(dead_code)]
+fn foreign_key_filter(engine: Engine, key: &db::ForeignKey, value: Option<&str>) -> Option<String> {
+    Some(format!(
+        "{} = {}",
+        engine.quote_identifier(&key.referenced_column),
+        engine.quote_literal(value?)
+    ))
+}
+
 /// `predicate` joined onto whatever the filter box already holds.
 ///
 /// Conjoined rather than replacing, and verbatim rather than reformatted: the
@@ -7123,6 +7144,96 @@ mod tests {
             filter_predicate(Engine::MySql, "path", r"a\b"),
             r"`path` = 'a\\b'"
         );
+    }
+
+    fn account_key() -> db::ForeignKey {
+        db::ForeignKey {
+            column: "account_id".to_string(),
+            referenced_schema: "public".to_string(),
+            referenced_table: "accounts".to_string(),
+            referenced_column: "id".to_string(),
+        }
+    }
+
+    #[test]
+    fn a_followed_key_filters_on_the_column_it_references() {
+        // Per engine, because the identifier quote differs.
+        let key = account_key();
+        assert_eq!(
+            foreign_key_filter(Engine::Postgres, &key, Some("42")).as_deref(),
+            Some(r#""id" = '42'"#)
+        );
+        assert_eq!(
+            foreign_key_filter(Engine::MySql, &key, Some("42")).as_deref(),
+            Some("`id` = '42'")
+        );
+        assert_eq!(
+            foreign_key_filter(Engine::Sqlite, &key, Some("42")).as_deref(),
+            Some(r#""id" = '42'"#)
+        );
+    }
+
+    #[test]
+    fn a_followed_key_quotes_the_value_it_carries() {
+        // A quote in the referenced column name and an apostrophe in the value
+        // are the two ways a cell's contents become SQL of its own.
+        let key = db::ForeignKey {
+            referenced_column: r#"od"d"#.to_string(),
+            ..account_key()
+        };
+        assert_eq!(
+            foreign_key_filter(Engine::Postgres, &key, Some("it's")).as_deref(),
+            Some(r#""od""d" = 'it''s'"#)
+        );
+        // And a backslash is the third, on the one engine that reads it as an
+        // escape: `Engine::MySql::quote_literal` writes it back as two.
+        assert_eq!(
+            foreign_key_filter(Engine::MySql, &account_key(), Some(r"a\b")).as_deref(),
+            Some(r"`id` = 'a\\b'")
+        );
+    }
+
+    #[test]
+    fn a_null_has_no_key_to_follow() {
+        let key = account_key();
+        assert_eq!(foreign_key_filter(Engine::Postgres, &key, None), None);
+        assert_eq!(foreign_key_filter(Engine::MySql, &key, None), None);
+        assert_eq!(foreign_key_filter(Engine::Sqlite, &key, None), None);
+    }
+
+    #[test]
+    fn the_filter_a_followed_key_writes_passes_the_generated_select_gate() {
+        // §6.2: the filter Slate writes for itself goes out through the same
+        // check as one the user typed, and this is that check run on it.
+        let key = account_key();
+        for engine in [Engine::Postgres, Engine::MySql, Engine::Sqlite] {
+            let filter = foreign_key_filter(engine, &key, Some("it's 42")).expect("a value");
+            let sql = explorer::preview_sql(
+                engine,
+                &key.referenced_schema,
+                &key.referenced_table,
+                &filter,
+                100,
+                0,
+            );
+            assert!(sql::is_generated_select(&sql), "{sql} was refused");
+        }
+    }
+
+    #[test]
+    fn a_value_that_looks_like_a_statement_is_still_one_literal() {
+        // A cell holding `1'; DROP TABLE accounts --` must still produce one
+        // readable SELECT, with the payload inert inside a literal.
+        let key = account_key();
+        let filter = foreign_key_filter(Engine::Postgres, &key, Some("1'; DROP TABLE accounts --"))
+            .expect("a value");
+        assert_eq!(filter, r#""id" = '1''; DROP TABLE accounts --'"#);
+
+        let sql = explorer::preview_sql(Engine::Postgres, "public", "accounts", &filter, 100, 0);
+        assert!(sql::is_generated_select(&sql), "{sql} was refused");
+        // The statement runs on past the payload: neither the `;` ended it nor
+        // the `--` commented out its tail, because both sit inside the literal.
+        assert!(sql.ends_with(" LIMIT 100"), "{sql} was cut short");
     }
 
     #[test]
