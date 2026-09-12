@@ -100,6 +100,7 @@ actions!(
         EditCell,
         CopyCell,
         SetNull,
+        FollowForeignKey,
         DeleteRow,
         ApplyEdits,
         DiscardEdits,
@@ -2611,10 +2612,117 @@ impl Workspace {
                         };
                         cx.notify();
                     }
+                    // The rows and the structure are two requests and either can
+                    // land last, so both sides mark.
+                    workspace.mark_foreign_keys(id, cx);
                 })
                 .ok();
         })
         .detach();
+    }
+
+    /// Tell a relation tab's grid which of its columns carry a foreign key.
+    ///
+    /// Called from both the structure's arrival and the rows', because they are
+    /// two requests and either can land last. A completed run replaces the whole
+    /// delegate, so the marks are not meant to survive a re-query.
+    fn mark_foreign_keys(&mut self, id: u64, cx: &mut Context<Self>) {
+        let Some(profile) = self.profile() else {
+            return;
+        };
+        let Some(tab) = profile.session.objects.iter().find(|tab| tab.id == id) else {
+            return;
+        };
+        let ObjectBody::Relation {
+            structure: StructureState::Loaded(structure),
+            results,
+            ..
+        } = &tab.body
+        else {
+            return;
+        };
+        let columns: Vec<String> = structure
+            .foreign_keys
+            .iter()
+            .map(|key| key.column.clone())
+            .collect();
+        if columns.is_empty() {
+            return;
+        }
+        let results = results.clone();
+        results.update(cx, |table, cx| {
+            table.delegate_mut().mark_foreign_keys(&columns);
+            cx.notify();
+        });
+    }
+
+    /// Open the row the active cell references (spec §6.2): a preview of the
+    /// referenced relation, filtered to the value the cell holds.
+    ///
+    /// Outbound only — from the row holding the key to the row it references.
+    /// Nothing runs for a NULL, which references nothing.
+    fn follow_foreign_key(
+        &mut self,
+        _: &FollowForeignKey,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let engine = self.engine();
+        let Some(profile) = self.profile() else {
+            return;
+        };
+        let Some(tab) = profile.session.active_object() else {
+            return;
+        };
+        let ObjectBody::Relation {
+            structure: StructureState::Loaded(structure),
+            results,
+            ..
+        } = &tab.body
+        else {
+            return;
+        };
+        let grid = results.read(cx);
+        let grid = grid.delegate();
+        let Some((_, col)) = grid.active() else {
+            return;
+        };
+        // The column's own name: the preview is Slate's `SELECT *`, so the
+        // header is the server's word for the column rather than an alias.
+        let Some(name) = grid.columns().get(col).map(|column| column.name.clone()) else {
+            return;
+        };
+        let Some(key) = structure
+            .foreign_keys
+            .iter()
+            .find(|key| key.column == name)
+            .cloned()
+        else {
+            return;
+        };
+        let Some(filter) = foreign_key_filter(engine, &key, grid.active_value()) else {
+            return;
+        };
+        // The catalog is the only authority on what the referenced relation is;
+        // a default is what a tab opened before it loaded would have worn too.
+        let kind = match &profile.catalog {
+            CatalogState::Loaded(catalog) => {
+                relation_kind(catalog, &key.referenced_schema, &key.referenced_table)
+                    .unwrap_or_default()
+            }
+            _ => RelationKind::default(),
+        };
+        let opened = OpenedObject::Relation {
+            schema: key.referenced_schema,
+            name: key.referenced_table,
+            kind,
+            filter,
+        };
+
+        if let Some(id) = self.open_object(opened, window, cx) {
+            self.activate_tab(Tab::Object(id), window, cx);
+            self.remember_profiles(cx);
+        }
     }
 
     fn show_structure(&mut self, showing_structure: bool, cx: &mut Context<Self>) {
@@ -4737,6 +4845,12 @@ impl Workspace {
                             profile.session.apply_review = None;
                         }
                     }
+                    // The other side of the pair in `load_structure`: a run
+                    // replaces the whole delegate, so a fresh grid has to be
+                    // marked again from the structure the tab already holds.
+                    if succeeded && let Tab::Object(object) = tab {
+                        workspace.mark_foreign_keys(object, cx);
+                    }
                     cx.notify();
 
                     if succeeded && let Some(refresh) = refresh {
@@ -6169,9 +6283,6 @@ fn filter_predicate(engine: Engine, column: &str, value: &str) -> String {
 /// `None` for a NULL, which references nothing. `<column> = NULL` is a filter
 /// that parses, runs, matches no row, and looks like a bug in the data rather
 /// than in the gesture.
-// The cell's navigate affordance is the pending caller; it is what the next
-// task wires to this.
-#[allow(dead_code)]
 fn foreign_key_filter(engine: Engine, key: &db::ForeignKey, value: Option<&str>) -> Option<String> {
     Some(format!(
         "{} = {}",

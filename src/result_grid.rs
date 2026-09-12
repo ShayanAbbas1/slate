@@ -104,6 +104,11 @@ pub struct ResultGrid {
     /// was written. Held beside `captured` and for the same reason: a run
     /// replaces the whole delegate, so a live result cannot keep a stale count.
     restored_total: Option<usize>,
+    /// Which result columns carry a foreign key, as indices into `columns`.
+    /// Empty until a relation's structure says otherwise, and empty forever on
+    /// a query result: a statement can join as many relations as it likes, so
+    /// there is no one relation whose keys these columns could be.
+    foreign_keys: Vec<usize>,
 }
 
 /// One changed cell, held beside the fetched value rather than over it.
@@ -192,6 +197,7 @@ impl ResultGrid {
             filtering: None,
             captured: None,
             restored_total: None,
+            foreign_keys: Vec::new(),
         }
     }
 
@@ -321,6 +327,30 @@ impl ResultGrid {
 
     pub fn columns(&self) -> &[crate::db::Column] {
         &self.result.columns
+    }
+
+    /// Record which of this result's columns carry a foreign key, given the
+    /// column names the relation's structure says do.
+    ///
+    /// ponytail: matched by name, not by position. A preview is `SELECT *` of
+    /// one relation, so its column names are the relation's; an aliased or
+    /// computed projection therefore matches nothing and offers no arrow. That
+    /// is the right failure — an arrow placed by position would filter the
+    /// referenced relation by a value from some other column.
+    pub fn mark_foreign_keys(&mut self, columns: &[String]) {
+        self.foreign_keys = self
+            .result
+            .columns
+            .iter()
+            .enumerate()
+            .filter(|(_, column)| columns.contains(&column.name))
+            .map(|(index, _)| index)
+            .collect();
+    }
+
+    /// Whether this column's cells can be followed to the row they reference.
+    pub fn follows_a_key(&self, col: usize) -> bool {
+        self.foreign_keys.contains(&col)
     }
 
     /// The whole value behind a cell, not the clipped one the grid paints: a
@@ -1021,6 +1051,16 @@ impl TableDelegate for ResultGrid {
                 .cloned(),
         };
 
+        // ponytail: the active cell only, not every cell of a key's column.
+        // `render_td` runs for every visible cell every frame under a
+        // no-allocation rule, and a per-cell hover group is a `format!` per cell
+        // per frame. The upgrade path is one group id per column, built once per
+        // result rather than once per frame.
+        let follows_a_key = self.active == Some((row_ix, col_ix))
+            && self.follows_a_key(col_ix)
+            // A NULL references nothing, so there is nothing to follow it to.
+            && self.cell(row_ix, col_ix).is_some();
+
         base.overflow_hidden()
             .whitespace_nowrap()
             .text_ellipsis()
@@ -1029,6 +1069,24 @@ impl TableDelegate for ResultGrid {
             .when(cell.is_none(), |cell| cell.italic())
             .when(pending.is_some(), |cell| cell.bg(edited_bg))
             .child(cell.unwrap_or(NULL_LABEL))
+            // The workspace owns the statement and the tabs and the grid owns
+            // neither, so this leaves exactly as a header's sort click does.
+            .children(follows_a_key.then(|| {
+                div()
+                    .id(("follow-key", row_ix * self.columns.len() + col_ix))
+                    .ml_auto()
+                    .flex_shrink_0()
+                    .flex()
+                    .items_center()
+                    .text_color(faint)
+                    .child(icon(icon::FOLLOW_KEY).size(px(12.)))
+                    .on_click(cx.listener(move |_, _, window, cx| {
+                        // Or the cell underneath takes the click as a move of
+                        // the ring it is already on.
+                        cx.stop_propagation();
+                        window.dispatch_action(Box::new(crate::FollowForeignKey), cx);
+                    }))
+            }))
             // No fallback: `begin_edit` already refuses silently on a cell
             // that cannot be written, which is the right outcome here too --
             // a double click on a read-only cell does nothing rather than
@@ -1762,6 +1820,48 @@ mod tests {
         assert!(replaced.active().is_none());
         // And an index that did outlive its rows opens nothing.
         assert!(!grid.begin_edit(9, 1));
+    }
+
+    /// A grid over `id, account_id, sku` — one key column between two that are
+    /// not, so a mark by position would be visible as a mark on the wrong one.
+    fn keyed_grid() -> ResultGrid {
+        ResultGrid::new(QueryResult {
+            columns: vec![column("id"), column("account_id"), column("sku")],
+            rows: vec![vec![Some("7".into()), Some("42".into()), Some("x".into())]],
+            ..QueryResult::default()
+        })
+    }
+
+    #[test]
+    fn only_the_columns_a_key_names_offer_to_follow_it() {
+        let mut grid = keyed_grid();
+        grid.mark_foreign_keys(&["account_id".to_string()]);
+
+        assert!(!grid.follows_a_key(0));
+        assert!(grid.follows_a_key(1));
+        assert!(!grid.follows_a_key(2));
+    }
+
+    #[test]
+    fn a_key_naming_a_column_this_result_does_not_have_marks_nothing() {
+        // The aliased-projection case: the structure names `account_id` and the
+        // projection called it something else, so nothing is marked -- rather
+        // than the column that happens to sit where `account_id` sat.
+        let mut grid = keyed_grid();
+        grid.mark_foreign_keys(&["owner_id".to_string()]);
+
+        assert!((0..3).all(|col| !grid.follows_a_key(col)));
+    }
+
+    #[test]
+    fn a_fresh_result_follows_nothing_until_the_structure_says_so() {
+        // Every run replaces the delegate whole, so the marks are reapplied
+        // from the structure rather than assumed to have survived.
+        let mut grid = keyed_grid();
+        grid.mark_foreign_keys(&["account_id".to_string()]);
+        assert!(grid.follows_a_key(1));
+
+        assert!(!keyed_grid().follows_a_key(1));
     }
 
     #[test]

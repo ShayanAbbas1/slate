@@ -567,6 +567,7 @@ fn render_results(
                             .on_action(cx.listener(Workspace::copy_cell))
                             .on_action(cx.listener(Workspace::set_null))
                             .on_action(cx.listener(Workspace::delete_row))
+                            .on_action(cx.listener(Workspace::follow_foreign_key))
                             .child(Table::new(results).bordered(false).stripe(false)),
                     )
                     .children(render_row_inspector(results, cx)),
@@ -1083,6 +1084,22 @@ fn render_tab_strip(
             .pr(px(layout::SPACE_XS))
             .child(row_icon(t, object_icon(object.kind)))
             .child(name_label(object.name.clone()))
+            // One relation can have as many tabs as it has filters (spec §6.3),
+            // so a strip that labelled them all `customers` would cost a click
+            // each to tell apart. Bounded and ellipsized: a filter can be long.
+            .children((!object.filter().is_empty()).then(|| {
+                div()
+                    .max_w(px(120.))
+                    .px(px(layout::SPACE_XS))
+                    .rounded(px(layout::RADIUS_CONTROL))
+                    .bg(t.element_active)
+                    .text_size(px(layout::TEXT_XS))
+                    .text_color(t.text_muted)
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .whitespace_nowrap()
+                    .child(object.filter().to_string())
+            }))
             .child(
                 div()
                     .opacity(0.)

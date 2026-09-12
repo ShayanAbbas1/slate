@@ -136,8 +136,7 @@ around.
 
 ## Planned
 
-The browsing half is still growing: foreign-key navigation.
-Beyond that, SSH tunneling, notarized builds, and a Homebrew tap.
+SSH tunneling, notarized builds, and a Homebrew tap.
 
 ## Not planned
 

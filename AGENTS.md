@@ -10,8 +10,7 @@ browsing surfaces are first-class, not an editor accessory. The split that
 survives the change is between *whose SQL it is*. An editor buffer is the
 user's and is never touched uninvited; a browsing surface (an object tab's
 preview) runs SQL Slate generates, regenerated from visible controls and
-inspectable, never spliced into anyone's buffer. Planned under the new framing:
-foreign-key navigation.
+inspectable, never spliced into anyone's buffer.
 
 **Read this file before doing anything.** It is the source of truth for how
 Slate is built and why.

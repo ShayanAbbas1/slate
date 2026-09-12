@@ -22,7 +22,7 @@ use icondata_core::IconData;
 /// The gpui-component widgets ask for their own paths — those are Lucide names
 /// too, so they resolve here as well. Add a row when something asks for one;
 /// an unlisted path simply draws nothing.
-const ICONS: [(&str, &IconData); 34] = [
+const ICONS: [(&str, &IconData); 35] = [
     ("icons/chevron-down.svg", icondata_lu::LuChevronDown),
     ("icons/chevron-right.svg", icondata_lu::LuChevronRight),
     ("icons/chevron-left.svg", icondata_lu::LuChevronLeft),
@@ -60,6 +60,7 @@ const ICONS: [(&str, &IconData); 34] = [
     ("icons/history.svg", icondata_lu::LuHistory),
     ("icons/panel-left.svg", icondata_lu::LuPanelLeft),
     ("icons/type.svg", icondata_lu::LuType),
+    ("icons/arrow-up-right.svg", icondata_lu::LuArrowUpRight),
 ];
 
 /// Slate's own names for the icons it draws, so a call site names a thing
@@ -101,6 +102,9 @@ pub mod icon {
     /// flows down into the fields below it.
     pub const FILL_DOWN: &str = "icons/arrow-down.svg";
     pub const FONT: &str = "icons/type.svg";
+    /// A cell whose column carries a foreign key: the arrow leaves this row for
+    /// the one it references.
+    pub const FOLLOW_KEY: &str = "icons/arrow-up-right.svg";
 }
 
 pub fn icon(path: &'static str) -> Icon {
@@ -180,6 +184,7 @@ mod tests {
             icon::SCRATCH_QUERY,
             icon::FILL_DOWN,
             icon::FONT,
+            icon::FOLLOW_KEY,
         ] {
             assert_draws(path);
         }
