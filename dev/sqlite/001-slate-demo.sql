@@ -165,6 +165,43 @@ INSERT INTO locations (id, name) VALUES
     (1, 'San Francisco'),
     (2, 'Null Island');
 
+-- Keys worth following. `orders` is both ends of the problem at once: a
+-- composite primary key, and a single-column foreign key into `accounts`, so
+-- the simple case and the parent of the hard case are one table.
+CREATE TABLE orders (
+    account_id INTEGER NOT NULL REFERENCES accounts (id),
+    number INTEGER NOT NULL,
+    placed_at TEXT NOT NULL,
+    total NUMERIC NOT NULL,
+    PRIMARY KEY (account_id, number)
+);
+
+INSERT INTO orders VALUES
+    (1, 1001, '2024-06-01 10:00:00', 4500.00),
+    (1, 1002, '2024-06-08 11:30:00', 125.75),
+    (2, 2001, '2024-06-12 16:15:00', 890.10);
+
+-- The composite foreign key, which the catalog has to report as one key over
+-- two columns rather than two keys of one column each.
+CREATE TABLE order_items (
+    id INTEGER PRIMARY KEY,
+    order_account_id INTEGER NOT NULL,
+    order_number INTEGER NOT NULL,
+    description TEXT NOT NULL,
+    quantity INTEGER NOT NULL,
+    FOREIGN KEY (order_account_id, order_number) REFERENCES orders (account_id, number)
+);
+
+INSERT INTO order_items VALUES
+    (1, 1, 1001, 'Analytical engine time', 3),
+    (2, 1, 1002, 'Punch card stock', 500),
+    (3, 2, 2001, 'Compiler seat', 1);
+
+-- There is deliberately no cross-schema fixture here. A SQLite foreign key may
+-- not reference an attached database, so the parent of every key is always in
+-- the database the key itself lives in -- the case Postgres and MySQL cover
+-- cannot be written at all against SQLite, rather than merely being omitted.
+
 CREATE VIEW account_overview AS
 SELECT
     plan,

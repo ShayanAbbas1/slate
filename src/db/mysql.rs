@@ -1348,4 +1348,23 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    #[ignore = "requires the repository development database configured through SLATE_MYSQL_URL"]
+    fn live_the_foreign_key_fixtures_are_seeded() {
+        // The foreign-key tests have nothing to read unless the reseed that
+        // added `orders`, `order_items` and the `slate_archive` database has
+        // actually been applied.
+        let connection = live();
+
+        let items = connection
+            .query("SELECT count(*) AS rows_seeded FROM order_items")
+            .expect("query should succeed");
+        assert_eq!(items.rows[0][0].as_deref(), Some("3"));
+
+        let closed = connection
+            .query("SELECT count(*) AS rows_seeded FROM slate_archive.closed_accounts")
+            .expect("query should succeed");
+        assert_eq!(closed.rows[0][0].as_deref(), Some("2"));
+    }
 }

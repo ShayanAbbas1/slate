@@ -169,6 +169,61 @@ INSERT INTO locations (id, name) VALUES
     (1, 'San Francisco'),
     (2, 'Null Island');
 
+-- Keys worth following. `orders` is both ends of the problem at once: a
+-- composite primary key, and a single-column foreign key into `accounts`, so
+-- the simple case and the parent of the hard case are one table.
+CREATE TABLE orders (
+    account_id BIGINT NOT NULL,
+    number INT NOT NULL,
+    placed_at DATETIME(6) NOT NULL,
+    total DECIMAL(14, 2) NOT NULL,
+    PRIMARY KEY (account_id, number),
+    FOREIGN KEY (account_id) REFERENCES accounts (id)
+);
+
+INSERT INTO orders VALUES
+    (1, 1001, '2024-06-01 10:00:00', 4500.00),
+    (1, 1002, '2024-06-08 11:30:00', 125.75),
+    (2, 2001, '2024-06-12 16:15:00', 890.10);
+
+-- The composite foreign key, which the catalog has to report as one key over
+-- two columns rather than two keys of one column each.
+CREATE TABLE order_items (
+    id INT PRIMARY KEY,
+    order_account_id BIGINT NOT NULL,
+    order_number INT NOT NULL,
+    description TEXT NOT NULL,
+    quantity INT NOT NULL,
+    FOREIGN KEY (order_account_id, order_number) REFERENCES orders (account_id, number)
+);
+
+INSERT INTO order_items VALUES
+    (1, 1, 1001, 'Analytical engine time', 3),
+    (2, 1, 1002, 'Punch card stock', 500),
+    (3, 2, 2001, 'Compiler seat', 1);
+
+-- MySQL has no schemas inside a database, so the cross-schema case is a second
+-- database. InnoDB takes a foreign key across databases, and
+-- `information_schema` names the referenced schema either way -- which is the
+-- thing the catalog query has to get right.
+--
+-- The entrypoint grants the app user `slate` rights on MYSQL_DATABASE only, so
+-- the second database needs its own grant or the app cannot read what it seeds.
+CREATE DATABASE slate_archive;
+
+GRANT ALL PRIVILEGES ON slate_archive.* TO 'slate'@'%';
+
+CREATE TABLE slate_archive.closed_accounts (
+    id INT PRIMARY KEY,
+    account_id BIGINT NOT NULL,
+    closed_at DATETIME(6) NOT NULL,
+    FOREIGN KEY (account_id) REFERENCES slate_dev.accounts (id)
+);
+
+INSERT INTO slate_archive.closed_accounts VALUES
+    (1, 3, '2024-07-01 00:00:00'),
+    (2, 5, '2024-07-04 12:00:00');
+
 CREATE VIEW account_overview AS
 SELECT
     plan,

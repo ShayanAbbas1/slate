@@ -1715,4 +1715,23 @@ mod tests {
             "extension-owned routines must not be listed"
         );
     }
+
+    #[test]
+    #[ignore = "requires the repository development database configured through PG*"]
+    fn live_the_foreign_key_fixtures_are_seeded() {
+        // The foreign-key tests have nothing to read unless the reseed that
+        // added `orders`, `order_items` and the `archive` schema has actually
+        // been applied.
+        let connection = Connection::open(&live_config()).expect("connection should open");
+
+        let items = connection
+            .query("SELECT count(*) AS rows_seeded FROM order_items")
+            .expect("query should succeed");
+        assert_eq!(items.rows[0][0].as_deref(), Some("3"));
+
+        let closed = connection
+            .query("SELECT count(*) AS rows_seeded FROM archive.closed_accounts")
+            .expect("query should succeed");
+        assert_eq!(closed.rows[0][0].as_deref(), Some("2"));
+    }
 }

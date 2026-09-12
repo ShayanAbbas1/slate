@@ -163,6 +163,52 @@ INSERT INTO locations VALUES
         NULL
     );
 
+-- Keys worth following. `orders` is both ends of the problem at once: a
+-- composite primary key, and a single-column foreign key into `accounts`, so
+-- the simple case and the parent of the hard case are one table.
+CREATE TABLE orders (
+    account_id bigint NOT NULL REFERENCES accounts (id),
+    number integer NOT NULL,
+    placed_at timestamptz NOT NULL,
+    total numeric(14, 2) NOT NULL,
+    PRIMARY KEY (account_id, number)
+);
+
+INSERT INTO orders VALUES
+    (1, 1001, '2024-06-01 10:00:00+00', 4500.00),
+    (1, 1002, '2024-06-08 11:30:00+00', 125.75),
+    (2, 2001, '2024-06-12 16:15:00+00', 890.10);
+
+-- The composite foreign key, which the catalog has to report as one key over
+-- two columns rather than two keys of one column each.
+CREATE TABLE order_items (
+    id integer PRIMARY KEY,
+    order_account_id bigint NOT NULL,
+    order_number integer NOT NULL,
+    description text NOT NULL,
+    quantity integer NOT NULL,
+    FOREIGN KEY (order_account_id, order_number) REFERENCES orders (account_id, number)
+);
+
+INSERT INTO order_items VALUES
+    (1, 1, 1001, 'Analytical engine time', 3),
+    (2, 1, 1002, 'Punch card stock', 500),
+    (3, 2, 2001, 'Compiler seat', 1);
+
+-- A reference that crosses a schema boundary, so the catalog is forced to
+-- report the schema of the referenced table and not just its name.
+CREATE SCHEMA archive;
+
+CREATE TABLE archive.closed_accounts (
+    id integer PRIMARY KEY,
+    account_id bigint NOT NULL REFERENCES public.accounts (id),
+    closed_at timestamptz NOT NULL
+);
+
+INSERT INTO archive.closed_accounts VALUES
+    (1, 3, '2024-07-01 00:00:00+00'),
+    (2, 5, '2024-07-04 12:00:00+00');
+
 CREATE VIEW account_overview AS
 SELECT
     plan,

@@ -1372,4 +1372,18 @@ SELECT count(*) FROM forever
         assert_eq!(edit.table, "accounts");
         assert_eq!(edit.keys, vec![1]);
     }
+
+    #[test]
+    #[ignore = "requires the repository development database configured through SLATE_SQLITE_PATH"]
+    fn live_the_foreign_key_fixtures_are_seeded() {
+        // The foreign-key tests have nothing to read unless the reseed that
+        // added `orders` and `order_items` has actually been applied. There is
+        // no cross-schema count to check here: a SQLite foreign key cannot
+        // reference an attached database.
+        let result = live()
+            .query("SELECT count(*) AS rows_seeded FROM order_items")
+            .expect("query should succeed");
+
+        assert_eq!(result.rows[0][0].as_deref(), Some("3"));
+    }
 }
