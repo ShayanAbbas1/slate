@@ -128,6 +128,14 @@ pub struct StoredObject {
     /// had open. Meaningless for a routine.
     #[serde(default)]
     pub filter: String,
+    /// The filter bars [`Self::filter`] was derived from, as column and value.
+    /// The bars are the editable state and the expression is what runs, so both
+    /// are kept: nothing here parses a `WHERE` back into controls. Absent is a
+    /// profile written before the bars existed, and comes back as a tab whose
+    /// expression still applies and whose bar row is empty. Meaningless for a
+    /// routine.
+    #[serde(default)]
+    pub filters: Vec<(String, String)>,
     /// Which tab was in front. A flag on the object rather than a pointer to
     /// it: a name can contain anything, including whatever would separate a
     /// schema from a relation in a key.
@@ -787,6 +795,7 @@ mod tests {
                     routine: false,
                     kind: RelationKind::MaterializedView,
                     filter: String::new(),
+                    filters: Vec::new(),
                     active: true,
                 },
                 StoredObject {
@@ -795,6 +804,7 @@ mod tests {
                     routine: true,
                     kind: RelationKind::default(),
                     filter: String::new(),
+                    filters: Vec::new(),
                     active: false,
                 },
             ],
@@ -873,6 +883,7 @@ open_objects = []
                 routine: false,
                 kind: RelationKind::Table,
                 filter: String::new(),
+                filters: Vec::new(),
                 active: true,
             }],
         };
@@ -930,6 +941,7 @@ open_objects = []
                 routine: false,
                 kind: RelationKind::Table,
                 filter: String::new(),
+                filters: Vec::new(),
                 active: true,
             }],
         };
@@ -1032,6 +1044,7 @@ open_objects = []
                 routine: false,
                 kind: RelationKind::Table,
                 filter: String::new(),
+                filters: Vec::new(),
                 active: true,
             }],
         };
@@ -1362,6 +1375,7 @@ open_objects = []
                 routine: false,
                 kind: RelationKind::Table,
                 filter: String::new(),
+                filters: Vec::new(),
                 active: true,
             }],
         };
@@ -1573,6 +1587,7 @@ name = \"accounts\"
             panic!("expected exactly one open object");
         };
         assert_eq!(object.filter, "");
+        assert!(object.filters.is_empty());
     }
 
     #[test]
@@ -1603,6 +1618,7 @@ name = \"accounts\"
                     routine: false,
                     kind: RelationKind::Table,
                     filter: String::new(),
+                    filters: Vec::new(),
                     active: false,
                 },
                 StoredObject {
@@ -1611,6 +1627,7 @@ name = \"accounts\"
                     routine: false,
                     kind: RelationKind::Table,
                     filter: r#""id" = '42'"#.into(),
+                    filters: vec![("id".into(), "42".into())],
                     active: true,
                 },
             ],
@@ -1623,6 +1640,54 @@ name = \"accounts\"
         };
 
         let text = toml::to_string_pretty(&file).expect("profiles must encode");
+        let decoded: ProfileFile = toml::from_str(&text).expect("profiles must decode");
+
+        assert_eq!(decoded.profiles, vec![profile]);
+    }
+
+    #[test]
+    fn the_filter_bars_come_back_as_bars_rather_than_as_an_expression() {
+        // Nothing parses a `WHERE` back into controls, so the bars themselves
+        // have to survive the file -- values with a quote and a separator in
+        // them included.
+        let object = StoredObject {
+            schema: "public".into(),
+            name: "customers".into(),
+            routine: false,
+            kind: RelationKind::Table,
+            filter: r#""state" = 'it''s ok' AND "tier" = '2'"#.into(),
+            filters: vec![
+                ("state".into(), "it's ok".into()),
+                ("tier".into(), "2".into()),
+            ],
+            active: true,
+        };
+        let profile = StoredProfile {
+            id: "dev".into(),
+            name: "Dev".into(),
+            host: "127.0.0.1".into(),
+            port: Some(5432),
+            database: "slate_dev".into(),
+            user: "slate".into(),
+            sslmode: None,
+            root_certificate: None,
+            engine: Some("postgres".into()),
+            path: None,
+            editor_font_size: None,
+            statement_timeout: None,
+            next_query_id: Some(0),
+            color: None,
+            open_query: None,
+            open_queries: Vec::new(),
+            open_objects: vec![object],
+        };
+        let text = toml::to_string_pretty(&ProfileFile {
+            fonts: None,
+            active: None,
+            settings: None,
+            profiles: vec![profile.clone()],
+        })
+        .expect("profiles must encode");
         let decoded: ProfileFile = toml::from_str(&text).expect("profiles must decode");
 
         assert_eq!(decoded.profiles, vec![profile]);

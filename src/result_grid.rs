@@ -85,15 +85,6 @@ pub struct ResultGrid {
     /// The one cell showing an input, if any. At most one: every other cell
     /// stays on the fast path that `display`'s no-allocation rule is about.
     editing: Option<Editing>,
-    /// Whether a header input has a filter box to write into. True only for a
-    /// relation's preview: a query buffer's statement is the user's, and Slate
-    /// does not write into it uninvited.
-    filterable: bool,
-    /// The one header showing an input, if any. At most one, and moved rather
-    /// than duplicated when another opens: the input holds no state of its own
-    /// -- it writes into the filter box and closes -- so there is nothing to
-    /// lose by moving it.
-    filtering: Option<Filtering>,
     /// When these rows were snapshotted, for a grid that came off disk.
     ///
     /// Held here rather than on the tab because a completed run replaces the
@@ -123,13 +114,6 @@ struct PendingEdit {
     /// already paints an absence in italics, and a second spelling of `NULL`
     /// on screen is one too many.
     shown: Option<SharedString>,
-}
-
-struct Filtering {
-    col: usize,
-    /// Built on the first render of the header, for the same reason an
-    /// [`Editing`]'s is: an input needs a window and opening one does not.
-    input: Option<Entity<InputState>>,
 }
 
 struct Editing {
@@ -193,8 +177,6 @@ impl ResultGrid {
             active: None,
             pending: Vec::new(),
             editing: None,
-            filterable: false,
-            filtering: None,
             captured: None,
             restored_total: None,
             foreign_keys: Vec::new(),
@@ -207,13 +189,6 @@ impl ResultGrid {
     pub fn with_sort(mut self, sort: Vec<(usize, bool)>, sortable: bool) -> Self {
         self.sort = sort;
         self.sortable = sortable;
-        self
-    }
-
-    /// Whether the headers offer an input that writes a predicate into the
-    /// tab's filter box. Only a relation's preview has such a box.
-    pub fn filterable(mut self, yes: bool) -> Self {
-        self.filterable = yes;
         self
     }
 
@@ -511,26 +486,6 @@ impl ResultGrid {
         self.editing = None;
     }
 
-    /// Open a header input on a column. `false` where there is no filter box to
-    /// write into, or no such column, and then nothing happens at all.
-    pub fn begin_filter(&mut self, col: usize) -> bool {
-        if !self.filterable || col >= self.columns.len() {
-            return false;
-        }
-        self.filtering = Some(Filtering { col, input: None });
-        true
-    }
-
-    /// Close the header input. What it wrote lives in the filter box now.
-    pub fn end_filter(&mut self) {
-        self.filtering = None;
-    }
-
-    #[cfg(test)]
-    fn filtering_column(&self) -> Option<usize> {
-        self.filtering.as_ref().map(|filtering| filtering.col)
-    }
-
     /// Record a new value for a cell, where `None` is a `NULL`. `false` when
     /// the cell is not editable, in which case nothing is recorded.
     pub fn set_pending(&mut self, row: usize, col: usize, value: Option<String>) -> bool {
@@ -709,28 +664,6 @@ impl ResultGrid {
         Some(input)
     }
 
-    /// The input for the header being filtered, created on its first render.
-    /// Empty rather than seeded: it writes a predicate rather than editing one.
-    fn filter_input(
-        &mut self,
-        col: usize,
-        window: &mut Window,
-        cx: &mut App,
-    ) -> Option<Entity<InputState>> {
-        let filtering = self.filtering.as_ref()?;
-        if filtering.col != col {
-            return None;
-        }
-        if let Some(input) = &filtering.input {
-            return Some(input.clone());
-        }
-
-        let input = cx.new(|cx| InputState::new(window, cx));
-        input.focus_handle(cx).focus(window);
-        self.filtering.as_mut()?.input = Some(input.clone());
-        Some(input)
-    }
-
     /// Take the open input's value into the pending set.
     fn commit_edit(&mut self, cx: &App) {
         let Some(editing) = self.editing.take() else {
@@ -808,7 +741,7 @@ impl TableDelegate for ResultGrid {
     fn render_th(
         &mut self,
         col_ix: usize,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<TableState<Self>>,
     ) -> impl IntoElement {
         let (muted, faint, text) = {
@@ -840,51 +773,6 @@ impl TableDelegate for ResultGrid {
                 true => text,
                 false => muted,
             });
-
-        // In place of the name: the header is where the column is identified,
-        // and a row of its own would be a second place to look for one control.
-        if let Some(input) = self.filter_input(col_ix, window, cx) {
-            return base
-                .child(
-                    Input::new(&input)
-                        // The header is the frame, exactly as the cell is for an
-                        // open cell editor.
-                        .appearance(false)
-                        .px_0()
-                        .h_full()
-                        .text_size(px(layout::TEXT_SM)),
-                )
-                // Both consumed rather than propagated, for the reason the cell
-                // editor's are: `escape` otherwise reaches the workspace and
-                // moves focus off the surface entirely.
-                .on_action(cx.listener({
-                    let input = input.clone();
-                    move |table, _: &gpui_component::input::Enter, window, cx| {
-                        // The value travels as text. Quoting it into a predicate
-                        // is the workspace's, which is where the engine is.
-                        let value = input.read(cx).value().to_string();
-                        window.dispatch_action(
-                            Box::new(crate::FilterColumn {
-                                column: col_ix,
-                                value,
-                            }),
-                            cx,
-                        );
-                        table.delegate_mut().end_filter();
-                        table.focus_handle(cx).focus(window);
-                        cx.stop_propagation();
-                        cx.notify();
-                    }
-                }))
-                .on_action(cx.listener(
-                    move |table, _: &gpui_component::input::Escape, window, cx| {
-                        table.delegate_mut().end_filter();
-                        table.focus_handle(cx).focus(window);
-                        cx.stop_propagation();
-                        cx.notify();
-                    },
-                ));
-        }
 
         base.child(
             div()
@@ -918,23 +806,6 @@ impl TableDelegate for ResultGrid {
                             .then(|| icon(icon::SORTABLE).size(px(12.)).text_color(faint)),
                     ),
                 })
-                // Absent where there is no box to write into, by the same
-                // rule the sort control follows.
-                .children(self.filterable.then(|| {
-                    div()
-                        .id(("filter-column", col_ix))
-                        .flex()
-                        .items_center()
-                        .text_color(faint)
-                        .child(icon(icon::SEARCH).size(px(12.)))
-                        // The header's own click sorts, and opening an
-                        // input is not asking for that.
-                        .on_click(cx.listener(move |table, _, _, cx| {
-                            table.delegate_mut().begin_filter(col_ix);
-                            cx.stop_propagation();
-                            cx.notify();
-                        }))
-                }))
                 // Only worth saying which key this is when there is more
                 // than one of them.
                 .children(key.filter(|_| self.sort.len() > 1).map(|(position, _)| {
@@ -1629,30 +1500,6 @@ mod tests {
         let (row, col) = grid.active().unwrap();
         assert!(!grid.begin_edit(row, col));
         assert!(grid.editing.is_none());
-    }
-
-    #[test]
-    fn one_header_input_is_open_at_a_time_and_closes_when_it_has_written() {
-        let mut grid = editable_grid().filterable(true);
-
-        assert!(grid.begin_filter(1));
-        assert_eq!(grid.filtering_column(), Some(1));
-        // Opening another moves it rather than adding a second: the input holds
-        // no state, so there is nothing to lose by moving it.
-        assert!(grid.begin_filter(0));
-        assert_eq!(grid.filtering_column(), Some(0));
-        // Written and gone. The filter box is where the expression now lives.
-        grid.end_filter();
-        assert_eq!(grid.filtering_column(), None);
-    }
-
-    #[test]
-    fn a_grid_that_cannot_be_filtered_offers_no_header_input() {
-        // A query tab's grid has no filter box to write into, and a control
-        // that does nothing is worse than no control.
-        let mut grid = grid_of(&[Some("a")]);
-        assert!(!grid.begin_filter(0));
-        assert_eq!(grid.filtering_column(), None);
     }
 
     #[test]

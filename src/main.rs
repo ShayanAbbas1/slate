@@ -58,14 +58,17 @@ struct SortColumn {
     column: usize,
 }
 
-/// A value typed under a column header. The value travels as *text*: the filter
-/// box is what ends up holding SQL, and quoting it into some belongs where the
-/// engine is.
+/// Which filter bar a gesture is aimed at, by position in the stack.
 #[derive(Clone, PartialEq, Eq, Deserialize, Action)]
 #[action(namespace = slate, no_json)]
-struct FilterColumn {
-    column: usize,
-    value: String,
+struct PickFilterColumn {
+    row: usize,
+}
+
+#[derive(Clone, PartialEq, Eq, Deserialize, Action)]
+#[action(namespace = slate, no_json)]
+struct RemoveFilter {
+    row: usize,
 }
 
 /// How many rows a relation's preview asks for. Slate's own statement carries
@@ -96,6 +99,7 @@ actions!(
         NextPage,
         PreviousPage,
         ClearFilter,
+        AddFilter,
         NewRow,
         EditCell,
         CopyCell,
@@ -149,7 +153,7 @@ impl Profile {
         }
     }
 
-    fn stored(&self) -> store::StoredProfile {
+    fn stored(&self, cx: &App) -> store::StoredProfile {
         // Tabs read back from disk that the catalog has not named yet are still
         // the truth about this profile: writing the live list instead would
         // drop every restored object the first time anything else is saved.
@@ -160,7 +164,7 @@ impl Profile {
             .iter()
             .map(|tab| store::StoredObject {
                 active: active == Tab::Object(tab.id),
-                ..tab.stored()
+                ..tab.stored(cx)
             })
             .collect::<Vec<_>>();
         // Both lists, because a restore now opens the relations first and
@@ -713,11 +717,20 @@ impl ObjectTab {
         }
     }
 
-    fn stored(&self) -> store::StoredObject {
+    /// The bars this tab's `WHERE` was derived from, complete ones only.
+    fn filters(&self, cx: &App) -> Vec<(String, String)> {
+        match &self.body {
+            ObjectBody::Relation { filters, .. } => applied_filters(&filter_pairs(filters, cx)),
+            ObjectBody::Routine(_) => Vec::new(),
+        }
+    }
+
+    fn stored(&self, cx: &App) -> store::StoredObject {
         store::StoredObject {
             schema: self.schema.clone(),
             name: self.name.clone(),
             filter: self.filter().to_string(),
+            filters: self.filters(cx),
             routine: matches!(self.kind, ObjectKind::Routine(_)),
             kind: match self.kind {
                 ObjectKind::Relation(kind) => kind,
@@ -739,6 +752,11 @@ enum OpenedObject {
         /// of the tab's identity (spec §6.3), so following a key opens a tab
         /// beside the relation's own rather than taking it over.
         filter: String,
+        /// The bars `filter` was derived from, so the tab opens with the
+        /// controls that produced it rather than with an expression nothing can
+        /// edit. Derived and expression travel together for the length of the
+        /// open: nothing parses one back into the other.
+        filters: Vec<(String, String)>,
     },
     Routine {
         schema: String,
@@ -798,6 +816,7 @@ impl OpenedObject {
                 name: relation.name.clone(),
                 kind: relation.kind,
                 filter: stored.filter.clone(),
+                filters: stored.filters.clone(),
             })
         }
     }
@@ -861,11 +880,13 @@ enum ObjectBody {
         /// statement rather than patching it. Unlike `offset`, it persists in
         /// the tab's snapshot — a tab that forgot its filter would come back as
         /// a different tab.
+        ///
+        /// Derived from `filters` on every apply, never edited directly: it is
+        /// what runs, what keys the snapshot and what the tab strip shows.
         filter: String,
-        /// The box the filter is typed into. Per tab, because the filter is,
-        /// and the only place the text being edited lives: `apply_filter`
-        /// reads it rather than keeping a second copy beside it.
-        filter_input: Entity<InputState>,
+        /// The filter bars, stacked above the grid, which are the editable
+        /// state (spec §2.4). Per tab, because the filter is.
+        filters: Vec<FilterRow>,
         /// How many rows this preview asks for. Every result set is capped
         /// (spec §4.3); this is the tab's own copy of the cap, so raising it
         /// for one wide table does not raise it everywhere.
@@ -926,18 +947,71 @@ fn restored_state(grid: &store::StoredGrid) -> QueryState {
     }
 }
 
-/// A preview's filter box, wired to the tab it belongs to. Enter is the apply:
-/// a filter that ran on every keystroke would put a half-typed predicate on the
-/// wire.
-fn filter_input(id: u64, window: &mut Window, cx: &mut Context<Workspace>) -> Entity<InputState> {
-    let input = cx.new(|cx| InputState::new(window, cx).placeholder("Filter rows…"));
+/// One filter bar: a column, equality, and a value. Equality is the only
+/// operator (spec §2.4) — anything else is a query tab's job.
+struct FilterRow {
+    /// `None` until the dropdown has been used, which is a bar that narrows
+    /// nothing.
+    column: Option<String>,
+    value: Entity<InputState>,
+}
+
+/// A filter bar, wired to the tab it belongs to. Enter is the apply: a filter
+/// that ran on every keystroke would put a half-typed predicate on the wire.
+fn filter_row(
+    id: u64,
+    column: Option<String>,
+    value: String,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) -> FilterRow {
+    let input = cx.new(|cx| {
+        let mut state = InputState::new(window, cx).placeholder("Value…");
+        state.set_value(value, window, cx);
+        state
+    });
     cx.subscribe(&input, move |workspace, _, event: &InputEvent, cx| {
         if matches!(event, InputEvent::PressEnter { .. }) {
             workspace.apply_filter(id, cx);
         }
     })
     .detach();
-    input
+    FilterRow {
+        column,
+        value: input,
+    }
+}
+
+/// Every bar as it stands, unfinished ones included.
+fn filter_pairs(filters: &[FilterRow], cx: &App) -> Vec<(Option<String>, String)> {
+    filters
+        .iter()
+        .map(|row| (row.column.clone(), row.value.read(cx).value().to_string()))
+        .collect()
+}
+
+/// The bars that narrow anything. A bar with no column picked or an empty value
+/// is one the user is still filling in, so it reaches neither the statement nor
+/// the file.
+fn applied_filters(rows: &[(Option<String>, String)]) -> Vec<(String, String)> {
+    rows.iter()
+        .filter_map(|(column, value)| {
+            let column = column.clone()?;
+            (!value.is_empty()).then(|| (column, value.clone()))
+        })
+        .collect()
+}
+
+/// The `WHERE` the bars add up to, without the keyword and empty for no bars.
+///
+/// Conjoined, because a stack of bars reads as "all of these" and because an
+/// `OR` between two of them is a question a query tab answers.
+fn derived_filter(engine: Engine, applied: &[(String, String)]) -> String {
+    applied
+        .iter()
+        .map(|(column, value)| filter_predicate(engine, column, value))
+        .collect::<Vec<_>>()
+        .join(" AND ")
 }
 
 fn result_grid(window: &mut Window, cx: &mut Context<Workspace>) -> Entity<TableState<ResultGrid>> {
@@ -1555,7 +1629,7 @@ impl Workspace {
         let profiles = self
             .profiles
             .iter()
-            .map(Profile::stored)
+            .map(|profile| profile.stored(cx))
             .collect::<Vec<_>>();
         let active = self.profile().map(|profile| profile.id.clone());
         let picked = fonts(cx);
@@ -2266,7 +2340,7 @@ impl Workspace {
         self.cycle_profile(-1, cx);
     }
 
-    fn cycle_tab(&mut self, step: isize, window: &mut Window, cx: &mut Context<Self>) {
+    fn cycle_tab(&mut self, step: isize, cx: &mut Context<Self>) {
         let Some(session) = self.profile().map(|profile| &profile.session) else {
             return;
         };
@@ -2285,15 +2359,15 @@ impl Workspace {
             return;
         };
         let next = tabs[(index as isize + step).rem_euclid(tabs.len() as isize) as usize];
-        self.activate_tab(next, window, cx);
+        self.activate_tab(next, cx);
     }
 
-    fn next_tab(&mut self, _: &NextTab, window: &mut Window, cx: &mut Context<Self>) {
-        self.cycle_tab(1, window, cx);
+    fn next_tab(&mut self, _: &NextTab, _: &mut Window, cx: &mut Context<Self>) {
+        self.cycle_tab(1, cx);
     }
 
-    fn previous_tab(&mut self, _: &PreviousTab, window: &mut Window, cx: &mut Context<Self>) {
-        self.cycle_tab(-1, window, cx);
+    fn previous_tab(&mut self, _: &PreviousTab, _: &mut Window, cx: &mut Context<Self>) {
+        self.cycle_tab(-1, cx);
     }
 
     fn remove_profile(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -2356,6 +2430,7 @@ impl Workspace {
                     kind: relation.kind,
                     // A click in the explorer opens the whole relation.
                     filter: String::new(),
+                    filters: Vec::new(),
                 })
             }),
             ExplorerTarget::Routine {
@@ -2373,7 +2448,7 @@ impl Workspace {
         if let Some(opened) = opened
             && let Some(id) = self.open_object(opened, window, cx)
         {
-            self.activate_tab(Tab::Object(id), window, cx);
+            self.activate_tab(Tab::Object(id), cx);
             self.remember_profiles(cx);
         }
     }
@@ -2409,14 +2484,13 @@ impl Workspace {
         profile.session.next_object_id += 1;
         let body = match opened {
             OpenedObject::Routine { routine, .. } => ObjectBody::Routine(routine),
-            OpenedObject::Relation { filter, .. } => {
-                let input = filter_input(id, window, cx);
-                if !filter.is_empty() {
-                    // Into the box as well as into the tab, or the bar would
-                    // claim the whole relation is on screen.
-                    let value = filter.clone();
-                    input.update(cx, |input, cx| input.set_value(value, window, cx));
-                }
+            OpenedObject::Relation {
+                filter, filters, ..
+            } => {
+                let filters = filters
+                    .into_iter()
+                    .map(|(column, value)| filter_row(id, Some(column), value, window, cx))
+                    .collect();
                 ObjectBody::Relation {
                     showing_structure: false,
                     structure: StructureState::Loading,
@@ -2424,7 +2498,7 @@ impl Workspace {
                     query: QueryState::Idle,
                     sort: Vec::new(),
                     filter,
-                    filter_input: input,
+                    filters,
                     limit: preview_rows,
                     offset: 0,
                     stale: false,
@@ -2510,7 +2584,7 @@ impl Workspace {
         let sql = relation_sql(engine, &schema, &relation, filter, sort, *limit, *offset);
         // Checked before anything leaves the machine, and before the tab's
         // staleness is spent: a refused filter leaves the rows on screen and
-        // the text in the box, so it can be corrected rather than retyped.
+        // the bars as they stand, so it can be corrected rather than retyped.
         if !sql::is_generated_select(&sql) {
             self.note(
                 "Slate will not run a filter it cannot read as one SELECT.".into(),
@@ -2700,9 +2774,11 @@ impl Workspace {
         else {
             return;
         };
-        let Some(filter) = foreign_key_filter(engine, &key, grid.active_value()) else {
+        let Some(pair) = foreign_key_filter(&key, grid.active_value()) else {
             return;
         };
+        let filters = vec![pair];
+        let filter = derived_filter(engine, &filters);
         // The catalog is the only authority on what the referenced relation is;
         // a default is what a tab opened before it loaded would have worn too.
         let kind = match &profile.catalog {
@@ -2717,10 +2793,11 @@ impl Workspace {
             name: key.referenced_table,
             kind,
             filter,
+            filters,
         };
 
         if let Some(id) = self.open_object(opened, window, cx) {
-            self.activate_tab(Tab::Object(id), window, cx);
+            self.activate_tab(Tab::Object(id), cx);
             self.remember_profiles(cx);
         }
     }
@@ -2755,7 +2832,7 @@ impl Workspace {
     /// once per tab; and a tab whose state is anything but `Idle` has a run of
     /// its own -- in flight, finished or failed -- so it is left alone even on
     /// that one attempt.
-    fn hydrate_tab(&mut self, tab: Tab, window: &mut Window, cx: &mut Context<Self>) {
+    fn hydrate_tab(&mut self, tab: Tab, cx: &mut Context<Self>) {
         let Some(profile) = self.profile_mut() else {
             return;
         };
@@ -2817,14 +2894,12 @@ impl Workspace {
                 }
             }
             Tab::Object(id) => {
-                let mut restored_box = None;
                 if let Some(object) = profile.session.objects.iter_mut().find(|tab| tab.id == id)
                     && let ObjectBody::Relation {
                         showing_structure,
                         query,
                         sort,
                         filter,
-                        filter_input,
                         limit,
                         stale,
                         ..
@@ -2842,22 +2917,18 @@ impl Workspace {
                         .collect();
                     // The filter the snapshot's rows were read under, so the
                     // refresh asks the same question rather than the whole
-                    // table's.
+                    // table's. The bars behind it came back with the tab, which
+                    // is where they are stored: the snapshot is keyed by this
+                    // expression, so the two cannot disagree.
                     *filter = snapshot.filter.clone();
-                    // And into the box, or the bar would claim the whole
-                    // relation is on screen while a filter is applied.
-                    restored_box = Some((filter_input.clone(), snapshot.filter.clone()));
                     *limit = snapshot.limit.unwrap_or(preview_rows);
                     *stale = true;
-                }
-                if let Some((input, filter)) = restored_box {
-                    input.update(cx, |input, cx| input.set_value(filter, window, cx));
                 }
             }
         }
     }
 
-    fn activate_tab(&mut self, tab: Tab, window: &mut Window, cx: &mut Context<Self>) {
+    fn activate_tab(&mut self, tab: Tab, cx: &mut Context<Self>) {
         if let Some(profile) = self.profile_mut() {
             profile.session.active = tab;
             profile.session.clear_prompts();
@@ -2866,7 +2937,7 @@ impl Workspace {
         // Before `load_relation`, which decides whether to re-query from the
         // state the snapshot leaves the tab in: hydrating afterwards would
         // arrive over a run already in flight and be refused.
-        self.hydrate_tab(tab, window, cx);
+        self.hydrate_tab(tab, cx);
         if let Tab::Object(id) = tab {
             self.load_relation(id, cx);
         }
@@ -2946,6 +3017,7 @@ impl Workspace {
                             })
                             .unwrap_or(stored.kind),
                         filter: stored.filter.clone(),
+                        filters: stored.filters.clone(),
                     },
                     stored.active,
                 ));
@@ -2970,7 +3042,7 @@ impl Workspace {
             }
         }
         match restored_active {
-            Some(id) => self.activate_tab(Tab::Object(id), window, cx),
+            Some(id) => self.activate_tab(Tab::Object(id), cx),
             // Nothing to activate, but the pending list was drained, so what is
             // on disk has to be rewritten from the tabs that actually resolved.
             None => self.remember_profiles(cx),
@@ -3315,6 +3387,7 @@ impl Workspace {
             Command::CycleTheme => self.cycle_theme(&CycleTheme, window, cx),
             Command::PickFont(slot) => self.open_palette(PaletteMode::Font(slot), window, cx),
             Command::SetFont(slot, family) => self.set_font(slot, family, cx),
+            Command::SetFilterColumn(row, column) => self.set_filter_column(row, column, cx),
             Command::ToggleSidebar => self.toggle_sidebar(&ToggleSidebar, window, cx),
             Command::ResetEditorZoom => self.reset_editor_zoom(&ResetEditorZoom, window, cx),
             Command::OpenSettings => self.open_settings(&OpenSettings, window, cx),
@@ -3502,101 +3575,138 @@ impl Workspace {
         );
     }
 
-    /// Run what is in a preview's filter box. The box is the only state there
-    /// is: it is read here rather than copied anywhere, so the text on screen
-    /// and the text that ran cannot disagree.
+    /// Run the filter the bars add up to (spec §2.4). The bars are the only
+    /// state there is: the expression is derived here rather than kept beside
+    /// them, so the controls on screen and the statement that ran cannot
+    /// disagree.
     fn apply_filter(&mut self, id: u64, cx: &mut Context<Self>) {
         self.clear_notice();
-        let Some(typed) = self.profile().and_then(|profile| {
+        let engine = self.engine();
+        let Some(applied) = self.profile().and_then(|profile| {
             let tab = profile.session.objects.iter().find(|tab| tab.id == id)?;
             match &tab.body {
-                ObjectBody::Relation { filter_input, .. } => Some(filter_input.read(cx).value()),
+                ObjectBody::Relation { filters, .. } => {
+                    Some(applied_filters(&filter_pairs(filters, cx)))
+                }
                 ObjectBody::Routine(_) => None,
             }
         }) else {
             return;
         };
+        let derived = derived_filter(engine, &applied);
         self.requery_relation(
             id,
-            move |filter, _, _, offset| changed_filter(filter, offset, &typed),
+            move |filter, _, _, offset| changed_filter(filter, offset, &derived),
             cx,
         );
     }
 
-    /// A header input's value, quoted into a predicate and appended to the box.
-    ///
-    /// The box is written first and read back by `apply_filter`, so what runs is
-    /// what is on screen, and what the header wrote is now text the user can
-    /// edit by hand.
-    fn filter_column(
-        &mut self,
-        action: &FilterColumn,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let engine = self.engine();
-        let Some(profile) = self.profile() else {
-            return;
-        };
-        let Tab::Object(id) = profile.session.active else {
-            return;
-        };
-        let Some(results) = profile.session.active_results().cloned() else {
-            return;
-        };
-        // The column's own name, because the preview is Slate's `SELECT *` and
-        // the header is the server's word for the column, not an alias.
-        let Some(name) = results
-            .read(cx)
-            .delegate()
-            .columns()
-            .get(action.column)
-            .map(|column| column.name.to_string())
-        else {
-            return;
-        };
-        let Some(input) = self.filter_box(id) else {
-            return;
-        };
-        let filter = appended_filter(
-            &input.read(cx).value(),
-            &filter_predicate(engine, &name, &action.value),
-        );
-        input.update(cx, |input, cx| input.set_value(filter, window, cx));
-        self.apply_filter(id, cx);
-    }
-
-    /// Empty the active preview's box and ask for the whole relation again.
-    fn clear_filter(&mut self, _: &ClearFilter, window: &mut Window, cx: &mut Context<Self>) {
+    /// Add a bar to the active preview, ready to be filled in. Nothing runs
+    /// yet: a bar with no column and no value narrows nothing.
+    fn add_filter(&mut self, _: &AddFilter, window: &mut Window, cx: &mut Context<Self>) {
         let Some(Tab::Object(id)) = self.profile().map(|profile| profile.session.active) else {
             return;
         };
-        let Some(input) = self.filter_box(id) else {
-            return;
-        };
-        input.update(cx, |input, cx| input.set_value("", window, cx));
-        self.apply_filter(id, cx);
+        self.push_filter_row(id, window, cx);
+        cx.notify();
     }
 
-    /// Put the cursor in the active preview's filter box.
+    /// Take a bar away and ask again without it.
+    fn remove_filter(&mut self, action: &RemoveFilter, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(Tab::Object(id)) = self.profile().map(|profile| profile.session.active) else {
+            return;
+        };
+        let row = action.row;
+        match self.filter_rows_mut(id) {
+            Some(filters) if row < filters.len() => {
+                filters.remove(row);
+            }
+            _ => return,
+        }
+        self.apply_filter(id, cx);
+        cx.notify();
+    }
+
+    /// The column list for one bar. The palette is the list Slate already picks
+    /// a name out of, so the dropdown is that list in another mode rather than
+    /// a popup of its own to keep alive across a frame.
+    fn pick_filter_column(
+        &mut self,
+        action: &PickFilterColumn,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_palette(PaletteMode::FilterColumn(action.row), window, cx);
+    }
+
+    /// Point a bar at a column and ask again.
+    fn set_filter_column(&mut self, row: usize, column: String, cx: &mut Context<Self>) {
+        let Some(Tab::Object(id)) = self.profile().map(|profile| profile.session.active) else {
+            return;
+        };
+        match self
+            .filter_rows_mut(id)
+            .and_then(|filters| filters.get_mut(row))
+        {
+            Some(filter) => filter.column = Some(column),
+            None => return,
+        }
+        self.apply_filter(id, cx);
+        cx.notify();
+    }
+
+    /// Take every bar off the active preview and ask for the whole relation.
+    fn clear_filter(&mut self, _: &ClearFilter, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(Tab::Object(id)) = self.profile().map(|profile| profile.session.active) else {
+            return;
+        };
+        let Some(filters) = self.filter_rows_mut(id) else {
+            return;
+        };
+        filters.clear();
+        self.apply_filter(id, cx);
+        cx.notify();
+    }
+
+    /// Put the cursor in the active preview's filter, adding the bar to type
+    /// into when the stack is empty: the ask is to filter, and an empty stack
+    /// has nowhere to do it.
     fn focus_filter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(Tab::Object(id)) = self.profile().map(|profile| profile.session.active) else {
             return;
         };
-        if let Some(input) = self.filter_box(id) {
+        if self
+            .filter_rows_mut(id)
+            .is_some_and(|filters| filters.is_empty())
+        {
+            self.push_filter_row(id, window, cx);
+        }
+        if let Some(input) = self
+            .filter_rows_mut(id)
+            .and_then(|filters| filters.last())
+            .map(|filter| filter.value.clone())
+        {
             input.focus_handle(cx).focus(window);
+        }
+        cx.notify();
+    }
+
+    fn push_filter_row(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
+        let row = filter_row(id, None, String::new(), window, cx);
+        if let Some(filters) = self.filter_rows_mut(id) {
+            filters.push(row);
         }
     }
 
-    fn filter_box(&self, id: u64) -> Option<Entity<InputState>> {
+    fn filter_rows_mut(&mut self, id: u64) -> Option<&mut Vec<FilterRow>> {
         let tab = self
-            .profile()?
+            .profile_mut()?
             .session
             .objects
-            .iter()
+            .iter_mut()
             .find(|tab| tab.id == id)?;
-        match &tab.body {
-            ObjectBody::Relation { filter_input, .. } => Some(filter_input.clone()),
+        match &mut tab.body {
+            ObjectBody::Relation { filters, .. } => Some(filters),
             ObjectBody::Routine(_) => None,
         }
     }
@@ -4488,7 +4598,7 @@ impl Workspace {
         let profile_id = profile.id.clone();
         profile.session.queries.push(tab);
         self.install_completions(&profile_id, cx);
-        self.activate_tab(Tab::Query(id), window, cx);
+        self.activate_tab(Tab::Query(id), cx);
     }
 
     /// Close an unsaved buffer. Its scratch file goes with it: an unnamed
@@ -4535,7 +4645,7 @@ impl Workspace {
             .profile()
             .and_then(|profile| profile.session.tab_holding(&name))
         {
-            self.activate_tab(Tab::Query(id), window, cx);
+            self.activate_tab(Tab::Query(id), cx);
             return;
         }
         if let Err(message) = self.persist_buffer(cx) {
@@ -4583,7 +4693,7 @@ impl Workspace {
         profile.session.queries.push(tab);
         profile.session.notice = notice;
         self.install_completions(&profile_id, cx);
-        self.activate_tab(Tab::Query(id), window, cx);
+        self.activate_tab(Tab::Query(id), cx);
     }
 
     /// A statement out of the history, back in the buffer.
@@ -4608,7 +4718,7 @@ impl Workspace {
             editor.set_value(appended, window, cx);
             editor.set_cursor_position(Position::new(line, 0), window, cx);
         });
-        self.activate_tab(Tab::Query(id), window, cx);
+        self.activate_tab(Tab::Query(id), cx);
     }
 
     /// The first unsaved buffer, or a new one when every open tab has a name.
@@ -4625,7 +4735,7 @@ impl Workspace {
                 .map(|tab| tab.id)
         });
         match unsaved {
-            Some(id) => self.activate_tab(Tab::Query(id), window, cx),
+            Some(id) => self.activate_tab(Tab::Query(id), cx),
             None => self.new_query(&NewQuery, window, cx),
         }
     }
@@ -4810,12 +4920,8 @@ impl Workspace {
                                 let produced_grid = !result.columns.is_empty();
                                 results.update(cx, |table, cx| {
                                     let sort = sort_columns(engine, &keys, &result.columns);
-                                    *table.delegate_mut() = ResultGrid::new(result)
-                                        .with_sort(sort, sortable)
-                                        // A query buffer's statement is the
-                                        // user's, and there is no box over
-                                        // it for a header to write into.
-                                        .filterable(matches!(tab, Tab::Object(_)));
+                                    *table.delegate_mut() =
+                                        ResultGrid::new(result).with_sort(sort, sortable);
                                     table.refresh(cx);
                                 });
                                 (true, produced_grid)
@@ -5902,7 +6008,7 @@ impl Render for Workspace {
         // Gated on a flag rather than on the disk, so every later frame is a
         // bool test.
         if let Some(active @ Tab::Query(_)) = self.profile().map(|profile| profile.session.active) {
-            self.hydrate_tab(active, window, cx);
+            self.hydrate_tab(active, cx);
         }
 
         // Deferred for the same reason plus one: an element has to be mounted
@@ -6087,7 +6193,9 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::next_page))
             .on_action(cx.listener(Self::previous_page))
             .on_action(cx.listener(Self::clear_filter))
-            .on_action(cx.listener(Self::filter_column))
+            .on_action(cx.listener(Self::add_filter))
+            .on_action(cx.listener(Self::remove_filter))
+            .on_action(cx.listener(Self::pick_filter_column))
             .on_action(cx.listener(Self::new_row))
             .on_action(cx.listener(Self::show_editor))
             .on_action(cx.listener(Self::cycle_theme))
@@ -6262,9 +6370,10 @@ fn changed_filter(filter: &mut String, offset: &mut usize, typed: &str) -> bool 
 
 /// One column equal to one value, quoted the way the server will read it.
 ///
-/// A SQL-generating call site (`AGENTS.md`, engine divergences). Equality is
-/// the only operator offered: anything else is faster to type into the box than
-/// to build out of a dropdown, and the box is right there.
+/// A SQL-generating call site (`AGENTS.md`, engine divergences), and the only
+/// place a filter bar's column and value become SQL. Equality is the only
+/// operator offered: anything else is a statement, and a query tab is where a
+/// statement belongs.
 fn filter_predicate(engine: Engine, column: &str, value: &str) -> String {
     format!(
         "{} = {}",
@@ -6273,35 +6382,19 @@ fn filter_predicate(engine: Engine, column: &str, value: &str) -> String {
     )
 }
 
-/// The filter that following a foreign key writes: the referenced column
-/// against the value the cell held (spec §6.2).
+/// The filter bar following a foreign key writes: the referenced column against
+/// the value the cell held (spec §6.2).
 ///
-/// A SQL-generating call site, which is why it is on the list in `AGENTS.md`:
-/// it quotes an identifier and a literal, and getting either wrong is silent on
-/// MySQL rather than an error.
+/// A bar rather than an expression, because the bars are the editable state --
+/// so the tab a key opens arrives with a control the user can change, and no
+/// `WHERE` anywhere has to be parsed back into one. `derived_filter` does the
+/// quoting, which is why this is no longer a SQL-generating call site.
 ///
 /// `None` for a NULL, which references nothing. `<column> = NULL` is a filter
 /// that parses, runs, matches no row, and looks like a bug in the data rather
 /// than in the gesture.
-fn foreign_key_filter(engine: Engine, key: &db::ForeignKey, value: Option<&str>) -> Option<String> {
-    Some(format!(
-        "{} = {}",
-        engine.quote_identifier(&key.referenced_column),
-        engine.quote_literal(value?)
-    ))
-}
-
-/// `predicate` joined onto whatever the filter box already holds.
-///
-/// Conjoined rather than replacing, and verbatim rather than reformatted: the
-/// box is the only filter state, so what a header input wrote is now text the
-/// user can edit by hand.
-fn appended_filter(filter: &str, predicate: &str) -> String {
-    let filter = filter.trim();
-    match filter.is_empty() {
-        true => predicate.to_string(),
-        false => format!("{filter} AND {predicate}"),
-    }
+fn foreign_key_filter(key: &db::ForeignKey, value: Option<&str>) -> Option<(String, String)> {
+    Some((key.referenced_column.clone(), value?.to_string()))
 }
 
 /// Slate's statement for a relation's tab, carrying the filter and the sort the
@@ -7321,20 +7414,26 @@ mod tests {
         }
     }
 
+    /// What following a key ends up asking for: the bar it writes, composed the
+    /// way the tab composes its bars.
+    fn followed(engine: Engine, key: &db::ForeignKey, value: Option<&str>) -> Option<String> {
+        Some(derived_filter(engine, &[foreign_key_filter(key, value)?]))
+    }
+
     #[test]
     fn a_followed_key_filters_on_the_column_it_references() {
         // Per engine, because the identifier quote differs.
         let key = account_key();
         assert_eq!(
-            foreign_key_filter(Engine::Postgres, &key, Some("42")).as_deref(),
+            followed(Engine::Postgres, &key, Some("42")).as_deref(),
             Some(r#""id" = '42'"#)
         );
         assert_eq!(
-            foreign_key_filter(Engine::MySql, &key, Some("42")).as_deref(),
+            followed(Engine::MySql, &key, Some("42")).as_deref(),
             Some("`id` = '42'")
         );
         assert_eq!(
-            foreign_key_filter(Engine::Sqlite, &key, Some("42")).as_deref(),
+            followed(Engine::Sqlite, &key, Some("42")).as_deref(),
             Some(r#""id" = '42'"#)
         );
     }
@@ -7348,13 +7447,13 @@ mod tests {
             ..account_key()
         };
         assert_eq!(
-            foreign_key_filter(Engine::Postgres, &key, Some("it's")).as_deref(),
+            followed(Engine::Postgres, &key, Some("it's")).as_deref(),
             Some(r#""od""d" = 'it''s'"#)
         );
         // And a backslash is the third, on the one engine that reads it as an
         // escape: `Engine::MySql::quote_literal` writes it back as two.
         assert_eq!(
-            foreign_key_filter(Engine::MySql, &account_key(), Some(r"a\b")).as_deref(),
+            followed(Engine::MySql, &account_key(), Some(r"a\b")).as_deref(),
             Some(r"`id` = 'a\\b'")
         );
     }
@@ -7413,9 +7512,7 @@ mod tests {
     #[test]
     fn a_null_has_no_key_to_follow() {
         let key = account_key();
-        assert_eq!(foreign_key_filter(Engine::Postgres, &key, None), None);
-        assert_eq!(foreign_key_filter(Engine::MySql, &key, None), None);
-        assert_eq!(foreign_key_filter(Engine::Sqlite, &key, None), None);
+        assert_eq!(foreign_key_filter(&key, None), None);
     }
 
     #[test]
@@ -7424,7 +7521,7 @@ mod tests {
         // check as one the user typed, and this is that check run on it.
         let key = account_key();
         for engine in [Engine::Postgres, Engine::MySql, Engine::Sqlite] {
-            let filter = foreign_key_filter(engine, &key, Some("it's 42")).expect("a value");
+            let filter = followed(engine, &key, Some("it's 42")).expect("a value");
             let sql = explorer::preview_sql(
                 engine,
                 &key.referenced_schema,
@@ -7442,8 +7539,8 @@ mod tests {
         // A cell holding `1'; DROP TABLE accounts --` must still produce one
         // readable SELECT, with the payload inert inside a literal.
         let key = account_key();
-        let filter = foreign_key_filter(Engine::Postgres, &key, Some("1'; DROP TABLE accounts --"))
-            .expect("a value");
+        let filter =
+            followed(Engine::Postgres, &key, Some("1'; DROP TABLE accounts --")).expect("a value");
         assert_eq!(filter, r#""id" = '1''; DROP TABLE accounts --'"#);
 
         let sql = explorer::preview_sql(Engine::Postgres, "public", "accounts", &filter, 100, 0);
@@ -7501,22 +7598,71 @@ mod tests {
         );
     }
 
+    /// The bars as the UI holds them, straight through to the `WHERE`.
+    fn filter_of(engine: Engine, bars: &[(Option<&str>, &str)]) -> String {
+        let rows: Vec<_> = bars
+            .iter()
+            .map(|(column, value)| (column.map(str::to_string), (*value).to_string()))
+            .collect();
+        derived_filter(engine, &applied_filters(&rows))
+    }
+
     #[test]
-    fn a_second_column_joins_the_filter_already_in_the_box() {
-        // An `AND` in front of an empty box is not a statement at all.
+    fn no_bars_is_no_filter_at_all() {
+        // Not `WHERE` with nothing after it: an empty filter is what makes
+        // `preview_sql` emit the statement it always has.
+        assert_eq!(filter_of(Engine::Postgres, &[]), "");
+    }
+
+    #[test]
+    fn a_bar_narrows_nothing_until_it_is_filled_in() {
+        // Added and not yet used, either half at a time. A half-filled bar that
+        // reached the statement would re-query on every keystroke of a column
+        // name nobody has picked.
+        assert_eq!(filter_of(Engine::Postgres, &[(None, "")]), "");
+        assert_eq!(filter_of(Engine::Postgres, &[(None, "ok")]), "");
+        assert_eq!(filter_of(Engine::Postgres, &[(Some("state"), "")]), "");
+    }
+
+    #[test]
+    fn the_bars_are_conjoined_in_the_order_they_are_stacked() {
         assert_eq!(
-            appended_filter("", r#""state" = 'ok'"#),
-            r#""state" = 'ok'"#
-        );
-        assert_eq!(
-            appended_filter(r#""state" = 'ok'"#, r#""tier" = '2'"#),
+            filter_of(
+                Engine::Postgres,
+                &[(Some("state"), "ok"), (Some("tier"), "2")]
+            ),
             r#""state" = 'ok' AND "tier" = '2'"#
         );
-        // Whatever the user typed by hand is kept verbatim: the box is the only
-        // state, and this appends to it rather than rewriting it.
+        // An unfinished bar between two finished ones drops out rather than
+        // breaking the conjunction.
         assert_eq!(
-            appended_filter("id > 5 OR name IS NULL", r#""tier" = '2'"#),
-            r#"id > 5 OR name IS NULL AND "tier" = '2'"#
+            filter_of(
+                Engine::Postgres,
+                &[(Some("state"), "ok"), (None, ""), (Some("tier"), "2")]
+            ),
+            r#""state" = 'ok' AND "tier" = '2'"#
+        );
+    }
+
+    #[test]
+    fn every_bar_is_quoted_the_way_its_engine_reads_it() {
+        // The same hazard `filter_predicate` carries, now that a stack of them
+        // is what a preview runs: a double-quoted name is a string literal on
+        // MySQL, so this fails silently rather than loudly when it is wrong.
+        let bars = [(Some("state"), "it's"), (Some(r#"od"d"#), r"a\b")];
+        assert_eq!(
+            filter_of(Engine::Postgres, &bars),
+            r#""state" = 'it''s' AND "od""d" = 'a\b'"#
+        );
+        // The backslash doubles on the one engine that reads it as an escape,
+        // and the double quote is an ordinary character inside backticks.
+        assert_eq!(
+            filter_of(Engine::MySql, &bars),
+            r#"`state` = 'it''s' AND `od"d` = 'a\\b'"#
+        );
+        assert_eq!(
+            filter_of(Engine::Sqlite, &bars),
+            r#""state" = 'it''s' AND "od""d" = 'a\b'"#
         );
     }
 

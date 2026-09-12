@@ -20,10 +20,11 @@ use gpui_component::{
 };
 
 use crate::{
-    CancelQuery, ClearFilter, CloseTarget, Control, EDITOR_FONT_SIZE_MAX, EDITOR_FONT_SIZE_MIN,
-    NewQuery, NewRow, NextPage, ObjectBody, ObjectTab, PreviousPage, Profile, QueryState,
-    ResetEditorZoom, RunQuery, SaveQuery, SetRowLimit, Settings, StructureState, Tab, Tone,
-    Workspace, ZoomEditorIn, ZoomEditorOut, button, button_label, compact_count, db,
+    AddFilter, CancelQuery, CloseTarget, Control, EDITOR_FONT_SIZE_MAX, EDITOR_FONT_SIZE_MIN,
+    FilterRow, NewQuery, NewRow, NextPage, ObjectBody, ObjectTab, PickFilterColumn, PreviousPage,
+    Profile, QueryState, RemoveFilter, ResetEditorZoom, RunQuery, SaveQuery, SetRowLimit, Settings,
+    StructureState, Tab, Tone, Workspace, ZoomEditorIn, ZoomEditorOut, button, button_label,
+    compact_count, db,
     db::RoutineKind,
     dialog, editor_zoom_percent,
     explorer::ROW_LIMITS,
@@ -151,8 +152,7 @@ fn render_object(tab: &ObjectTab, cx: &mut Context<Workspace>) -> AnyElement {
         structure,
         results,
         query,
-        filter,
-        filter_input,
+        filters,
         ..
     } = &tab.body
     else {
@@ -172,7 +172,7 @@ fn render_object(tab: &ObjectTab, cx: &mut Context<Workspace>) -> AnyElement {
         .size_full()
         .flex()
         .flex_col()
-        .child(render_filter_bar(filter, filter_input, t))
+        .child(render_filter_bar(filters, t))
         .child(
             div()
                 .flex_1()
@@ -182,10 +182,72 @@ fn render_object(tab: &ObjectTab, cx: &mut Context<Workspace>) -> AnyElement {
         .into_any_element()
 }
 
-/// The filter over a preview's rows, above the grid the pager sits over —
-/// gated on the same one state, because a structure listing has no rows to
-/// narrow.
-fn render_filter_bar(filter: &str, input: &Entity<InputState>, t: Theme) -> AnyElement {
+/// The filters over a preview's rows: one bar per filter, stacked above the
+/// grid the pager sits over — gated on the same one state, because a structure
+/// listing has no rows to narrow.
+///
+/// A bar is a column, an equals and a value, and the stack is conjoined
+/// (spec §2.4). There is no expression field: a preview runs SQL Slate
+/// generates from visible controls, and arbitrary SQL belongs in a query tab.
+fn render_filter_bar(filters: &[FilterRow], t: Theme) -> AnyElement {
+    div()
+        .w_full()
+        .flex_shrink_0()
+        .flex()
+        .flex_col()
+        .children(filters.iter().enumerate().map(|(row, filter)| {
+            filter_bar_row()
+                .child(
+                    button(
+                        ("filter-column", row),
+                        filter
+                            .column
+                            .clone()
+                            .unwrap_or_else(|| "Column…".to_string()),
+                        Tone::Quiet,
+                        Control::Compact,
+                        t,
+                    )
+                    .on_click(move |_, window, cx| {
+                        window.dispatch_action(Box::new(PickFilterColumn { row }), cx);
+                    }),
+                )
+                // Equality is the only operator, so this says what the bar
+                // means rather than offering a choice that does not exist.
+                .child(
+                    div()
+                        .flex_shrink_0()
+                        .text_size(px(layout::TEXT_SM))
+                        .text_color(t.text_faint)
+                        .child("="),
+                )
+                .child(Input::new(&filter.value).small().min_w_0().flex_1())
+                .child(
+                    icon_button(
+                        ("remove-filter", row),
+                        icon::CLOSE,
+                        Tone::Quiet,
+                        Control::Compact,
+                        t,
+                    )
+                    .tooltip("Remove filter")
+                    .on_click(move |_, window, cx| {
+                        window.dispatch_action(Box::new(RemoveFilter { row }), cx);
+                    }),
+                )
+        }))
+        .child(filter_bar_row().child(
+            button("add-filter", "Add filter", Tone::Quiet, Control::Compact, t).on_click(
+                |_, window, cx| {
+                    window.dispatch_action(Box::new(AddFilter), cx);
+                },
+            ),
+        ))
+        .into_any_element()
+}
+
+/// One line of the filter stack, at the height every other control strip is.
+fn filter_bar_row() -> gpui::Div {
     div()
         .w_full()
         .h(px(layout::TAB_HEIGHT))
@@ -195,24 +257,6 @@ fn render_filter_bar(filter: &str, input: &Entity<InputState>, t: Theme) -> AnyE
         .gap(px(layout::SPACE_XS))
         .pl(px(layout::SPACE_MD))
         .pr(px(layout::SPACE_SM))
-        .child(row_icon(t, icon::SEARCH))
-        .child(Input::new(input).small().min_w_0().flex_1())
-        // Only once there is something to clear: a button that does nothing is
-        // a control to read past.
-        .children((!filter.is_empty()).then(|| {
-            icon_button(
-                "clear-filter",
-                icon::CLOSE,
-                Tone::Quiet,
-                Control::Compact,
-                t,
-            )
-            .tooltip("Clear filter")
-            .on_click(move |_, window, cx| {
-                window.dispatch_action(Box::new(ClearFilter), cx);
-            })
-        }))
-        .into_any_element()
 }
 
 /// The "New row" form, over the preview it was opened on (spec §4).
@@ -989,9 +1033,9 @@ fn render_tab_strip(
                             ),
                     )
                 })
-                .on_click(move |_, window, cx| {
+                .on_click(move |_, _, cx| {
                     _ = open_workspace.update(cx, |workspace, cx| {
-                        workspace.activate_tab(Tab::Query(id), window, cx);
+                        workspace.activate_tab(Tab::Query(id), cx);
                     });
                 })
                 .into_any_element()
@@ -1123,9 +1167,9 @@ fn render_tab_strip(
                         }),
                     ),
             )
-            .on_click(move |_, window, cx| {
+            .on_click(move |_, _, cx| {
                 _ = open_workspace.update(cx, |workspace, cx| {
-                    workspace.activate_tab(Tab::Object(id), window, cx);
+                    workspace.activate_tab(Tab::Object(id), cx);
                 });
             })
             .into_any_element()
