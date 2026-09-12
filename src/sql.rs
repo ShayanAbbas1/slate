@@ -258,13 +258,56 @@ pub fn insert_row(
     ))
 }
 
+/// One row's `DELETE`: every column in `keys` matched, and nothing else.
+///
+/// One row per statement. Multi-row deletion is cut, and the upgrade path when
+/// it is wanted is the `BEGIN`/`COMMIT` bracketing multi-row edits already use
+/// on the engines that commit each statement alone — one `DELETE` per row, each
+/// naming its own key, never one statement with a predicate covering several.
+///
+/// `None` on an empty key list. A `DELETE` with no `WHERE` empties the table, so
+/// it must not be possible to produce one: a caller that has lost the row's key
+/// gets nothing to run rather than something that runs.
+// The grid's deletion flow is the pending caller; until it lands the tests are
+// the only ones.
+#[allow(dead_code)]
+pub fn delete_row(
+    engine: Engine,
+    schema: &str,
+    table: &str,
+    keys: &[(&str, &str)],
+) -> Option<String> {
+    if keys.is_empty() {
+        return None;
+    }
+
+    let keys: Vec<(&str, Option<&str>)> = keys
+        .iter()
+        .map(|&(column, value)| (column, Some(value)))
+        .collect();
+    Some(format!(
+        "DELETE FROM {} WHERE {}",
+        engine.qualified(schema, table),
+        assignments(engine, &keys, " AND ")
+    ))
+}
+
 /// Whether `sql` is a statement Slate could have written: one or more `UPDATE`s,
-/// or a single `INSERT`, and nothing else at all.
+/// a single `INSERT`, or a single `DELETE` naming one row, and nothing else at
+/// all.
 ///
 /// The one gate every Slate-generated statement passes before anything runs,
-/// and the code half of hard rule 1 — Slate never writes a `DROP`, `TRUNCATE`
-/// or `DELETE`, whatever the user asked for. A whitelist, because a blocklist
-/// of keywords is only a list of the spellings someone thought of.
+/// and the code half of hard rule 1 — Slate never writes a `DROP` or a
+/// `TRUNCATE`, whatever the user asked for, and writes a `DELETE` only as a
+/// conjunction of equalities over distinct, unqualified columns. A whitelist,
+/// because a blocklist of keywords is only a list of the spellings someone
+/// thought of.
+///
+/// The delete's shape is read out of the parse tree rather than trusted because
+/// `delete_row` produced it. A gate that trusts its caller is a comment, and the
+/// day the generator and the check disagree is the day this earns its keep.
+/// Whether the columns it names are the row's *key* is `delete_matches_key`'s
+/// answer, which this cannot give: no key reaches here to compare against.
 ///
 /// Named for what it admits rather than for one of the shapes, because it
 /// admits more than one now: a rule that lets an `INSERT` through under a name
@@ -275,6 +318,10 @@ pub fn is_generated_write(sql: &str) -> bool {
         return false;
     };
     let root = tree.root_node();
+    // Before any shape is considered, because no shape redeems either.
+    if forbidden(root) {
+        return false;
+    }
     let Some(statements) = generated_statements(&root) else {
         return false;
     };
@@ -289,10 +336,35 @@ pub fn is_generated_write(sql: &str) -> bool {
         })
         .collect();
 
+    // The one place a `delete` node is tolerated, and only for the shape read
+    // back out of the tree rather than trusted because Slate wrote it.
+    if kinds == ["delete"] {
+        return delete_key_columns(sql).is_some();
+    }
+
     // One insert alone, or a batch of updates. A batch of inserts is a shape
     // nothing generates, so admitting it would widen the gate for nobody.
     (kinds == ["insert"] || (!kinds.is_empty() && kinds.iter().all(|kind| *kind == "update")))
-        && !destructive(root)
+        && !deletes_anything(root)
+}
+
+/// Whether `sql` is a `DELETE` whose `WHERE` names exactly `keys` — nothing
+/// absent from the key, and nothing in the key absent from the predicate.
+///
+/// The half of the delete admission `is_generated_write` cannot make alone: it
+/// has no key to compare a predicate against. This is not a second gate and
+/// admits nothing — it is a readout — and a caller runs both.
+///
+/// Set equality, order-independent. A composite key matched on half of itself
+/// reaches every row sharing that half.
+// The grid's deletion flow is the pending caller; until it lands the tests are
+// the only ones.
+#[allow(dead_code)]
+pub fn delete_matches_key(sql: &str, keys: &[&str]) -> bool {
+    let Some(columns) = delete_key_columns(sql) else {
+        return false;
+    };
+    columns.len() == keys.len() && keys.iter().all(|key| columns.iter().any(|c| c == key))
 }
 
 /// Whether `sql` is a `SELECT` Slate could have written: exactly one root
@@ -335,7 +407,8 @@ pub fn is_generated_select(sql: &str) -> bool {
         && statement
             .named_children(&mut cursor)
             .any(|node| node.kind() == "select")
-        && !destructive(root)
+        && !forbidden(root)
+        && !deletes_anything(root)
 }
 
 /// The statements to check, seeing through the transaction that brackets a
@@ -391,23 +464,166 @@ fn literal(engine: Engine, value: Option<&str>) -> String {
     }
 }
 
+/// `DROP` and `TRUNCATE`, anywhere in the tree and under every spelling. Never
+/// admitted, by any shape, for any reason.
+///
 /// The grammar offers no `drop` or `truncate` node to look for. `DROP TABLE` is
 /// `drop_table`, one of thirteen `drop_*` siblings, and `TRUNCATE t` is a bare
 /// `statement` holding a `keyword_truncate` with no wrapper node at all. The
 /// keyword is the one part every spelling of either has.
-const DESTRUCTIVE_KINDS: [&str; 4] = [
-    "delete",
-    "keyword_delete",
-    "keyword_drop",
-    "keyword_truncate",
-];
-
-/// Anywhere in the tree, not only at the root. `WITH x AS (DELETE FROM t
-/// RETURNING *) UPDATE …` is a real statement shape whose root child is an
-/// `update` node, so the whitelist alone would let it through.
-fn destructive(node: tree_sitter::Node) -> bool {
+fn forbidden(node: tree_sitter::Node) -> bool {
     let mut cursor = node.walk();
-    DESTRUCTIVE_KINDS.contains(&node.kind()) || node.children(&mut cursor).any(destructive)
+    matches!(node.kind(), "keyword_drop" | "keyword_truncate")
+        || node.children(&mut cursor).any(forbidden)
+}
+
+/// Any `delete` at all, anywhere in the tree, not only at the root.
+/// `WITH x AS (DELETE FROM t RETURNING *) UPDATE …` is a real statement shape
+/// whose root child is an `update` node, so the whitelist alone would let it
+/// through.
+fn deletes_anything(node: tree_sitter::Node) -> bool {
+    let mut cursor = node.walk();
+    matches!(node.kind(), "delete" | "keyword_delete")
+        || node.children(&mut cursor).any(deletes_anything)
+}
+
+/// The columns a single-row `DELETE`'s `WHERE` names, read out of the parse
+/// tree, or `None` for anything that is not exactly that shape.
+///
+/// Exactly one root statement whose named children are `["delete", "from"]` —
+/// which is where the grammar puts them, with the `where` under the `from` —
+/// and whose `WHERE` is a conjunction of equality predicates over distinct,
+/// unqualified columns against single-quoted literals. A CTE beside the delete,
+/// a `RETURNING`, a `LIMIT`, an `OR`, a subquery, a function call, a qualified
+/// column or a second statement all change that child list or that expression
+/// tree, and so all arrive here as `None`.
+fn delete_key_columns(sql: &str) -> Option<Vec<String>> {
+    let tree = parse(sql)?;
+    let root = tree.root_node();
+    if forbidden(root) {
+        return None;
+    }
+
+    let mut cursor = root.walk();
+    let children: Vec<_> = root.named_children(&mut cursor).collect();
+    let [statement] = children.as_slice() else {
+        return None;
+    };
+    if statement.kind() != "statement" {
+        return None;
+    }
+
+    let mut cursor = statement.walk();
+    let parts: Vec<_> = statement.named_children(&mut cursor).collect();
+    let [delete, from] = parts.as_slice() else {
+        return None;
+    };
+    if delete.kind() != "delete" || from.kind() != "from" {
+        return None;
+    }
+
+    let mut cursor = from.walk();
+    let inside: Vec<_> = from.named_children(&mut cursor).collect();
+    let [keyword, relation, filter] = inside.as_slice() else {
+        return None;
+    };
+    if keyword.kind() != "keyword_from"
+        || relation.kind() != "object_reference"
+        || filter.kind() != "where"
+    {
+        return None;
+    }
+
+    let mut cursor = filter.walk();
+    let clause: Vec<_> = filter.named_children(&mut cursor).collect();
+    let [keyword_where, predicate] = clause.as_slice() else {
+        return None;
+    };
+    if keyword_where.kind() != "keyword_where" {
+        return None;
+    }
+
+    let mut columns = Vec::new();
+    if !equality_columns(*predicate, sql, &mut columns) {
+        return None;
+    }
+
+    // A column named twice is a predicate Slate never writes, and reading it as
+    // a one-column key would call a half-matched composite key a whole one.
+    let distinct = columns.iter().collect::<std::collections::HashSet<_>>();
+    (distinct.len() == columns.len()).then_some(columns)
+}
+
+/// Walks a conjunction, pushing the column each `=` predicate names. False the
+/// moment anything else appears — an `OR`, another operator, a parenthesized
+/// group, a subquery, a function call.
+fn equality_columns(node: tree_sitter::Node, sql: &str, columns: &mut Vec<String>) -> bool {
+    if node.kind() != "binary_expression" {
+        return false;
+    }
+    let mut cursor = node.walk();
+    let children: Vec<_> = node.children(&mut cursor).collect();
+    let [left, operator, right] = children.as_slice() else {
+        return false;
+    };
+
+    match operator.kind() {
+        "keyword_and" => {
+            equality_columns(*left, sql, columns) && equality_columns(*right, sql, columns)
+        }
+        "=" => {
+            let Some(value) = sql.get(right.byte_range()) else {
+                return false;
+            };
+            // A value is a single-quoted literal and nothing else. `"other"` is
+            // a `literal` to this grammar too, and matching a column against a
+            // column is not naming a row.
+            if right.kind() != "literal" || !value.starts_with('\'') {
+                return false;
+            }
+            match column_name(*left, sql) {
+                Some(column) => {
+                    columns.push(column);
+                    true
+                }
+                None => false,
+            }
+        }
+        _ => false,
+    }
+}
+
+/// The unqualified column a predicate's left side names, unquoted.
+///
+/// To this grammar a double quote opens a **string**: a bare or backticked name
+/// arrives as a `field`, but `"id"` arrives as a `literal` indistinguishable by
+/// kind from `'id'`, so the quote character is what tells them apart. That
+/// matters because Postgres and SQLite quote identifiers with `"`, which is
+/// what `delete_row` writes on both.
+fn column_name(node: tree_sitter::Node, sql: &str) -> Option<String> {
+    let text = sql.get(node.byte_range())?;
+    match node.kind() {
+        // `t.id` puts an `object_reference` under the field beside the
+        // identifier. A qualified column is not one this reads.
+        "field" => {
+            let mut cursor = node.walk();
+            let named: Vec<_> = node.named_children(&mut cursor).collect();
+            let [identifier] = named.as_slice() else {
+                return None;
+            };
+            (identifier.kind() == "identifier").then(|| unquote(text, '`'))
+        }
+        "literal" if text.starts_with('"') => Some(unquote(text, '"')),
+        _ => None,
+    }
+}
+
+fn unquote(text: &str, quote: char) -> String {
+    let doubled = [quote, quote].iter().collect::<String>();
+    match text.strip_prefix(quote).and_then(|t| t.strip_suffix(quote)) {
+        Some(inner) => inner.replace(&doubled, &quote.to_string()),
+        None => text.to_string(),
+    }
 }
 
 fn parse(sql: &str) -> Option<Tree> {
@@ -1126,17 +1342,18 @@ mod tests {
 
     #[test]
     fn the_gate_refuses_everything_that_is_not_a_write_slate_writes() {
-        // Hard rule 1 in code: DROP, TRUNCATE and DELETE never leave Slate,
-        // whatever the user asked for. SELECT is here because the gate is a
-        // whitelist -- being harmless is not the test, being one of the two
-        // shapes Slate generates is.
+        // Hard rule 1 in code: DROP and TRUNCATE never leave Slate, whatever
+        // the user asked for. SELECT is here because the gate is a whitelist --
+        // being harmless is not the test, being one of the three shapes Slate
+        // generates is. A keyed DELETE is no longer in this list because it is
+        // one of those shapes; `delete_matches_key` is what asks whether the key
+        // it names is the row's.
         for sql in [
             "DROP TABLE t",
             "DROP VIEW v",
             "DROP DATABASE d",
             "TRUNCATE t",
             "TRUNCATE TABLE t",
-            "DELETE FROM t WHERE a = '1'",
             "SELECT 1",
         ] {
             assert!(!is_generated_write(sql), "{sql} passed the gate");
@@ -1277,5 +1494,118 @@ mod tests {
         ] {
             assert!(!is_generated_select(sql), "{sql} passed the gate");
         }
+    }
+
+    #[test]
+    fn a_generated_delete_names_the_row_and_only_the_row() {
+        assert_eq!(
+            delete_row(Engine::Postgres, "public", "measurements", &[("id", "7")]).unwrap(),
+            r#"DELETE FROM "public"."measurements" WHERE "id" = '7'"#
+        );
+        // Joined by OR, or with a column dropped, this deletes rows the user
+        // never pointed at.
+        assert_eq!(
+            delete_row(
+                Engine::Postgres,
+                "app",
+                "memberships",
+                &[("org_id", "1"), ("user_id", "2")]
+            )
+            .unwrap(),
+            r#"DELETE FROM "app"."memberships" WHERE "org_id" = '1' AND "user_id" = '2'"#
+        );
+        assert_eq!(
+            delete_row(Engine::MySql, "slate_dev", "measurements", &[("id", "7")]).unwrap(),
+            "DELETE FROM `slate_dev`.`measurements` WHERE `id` = '7'"
+        );
+        assert_eq!(
+            delete_row(Engine::Sqlite, "main", "t", &[("id", "o'hara")]).unwrap(),
+            r#"DELETE FROM "main"."t" WHERE "id" = 'o''hara'"#
+        );
+        // No WHERE empties the table, so it must not be possible to produce.
+        assert!(delete_row(Engine::Postgres, "s", "t", &[]).is_none());
+    }
+
+    #[test]
+    fn the_gate_admits_the_delete_slate_writes_and_reads_its_key_back() {
+        for engine in [Engine::Postgres, Engine::MySql, Engine::Sqlite] {
+            let statement = delete_row(engine, "s", "t", &[("id", "7")]).unwrap();
+            assert!(is_generated_write(&statement), "{statement} was refused");
+            assert!(delete_matches_key(&statement, &["id"]), "{statement}");
+
+            let composite =
+                delete_row(engine, "s", "t", &[("org_id", "1"), ("user_id", "2")]).unwrap();
+            assert!(is_generated_write(&composite), "{composite} was refused");
+            assert!(delete_matches_key(&composite, &["org_id", "user_id"]));
+            // Set equality: the key is a set of columns, not a sequence.
+            assert!(delete_matches_key(&composite, &["user_id", "org_id"]));
+        }
+        // A value carrying the quote character still reads back.
+        let statement = delete_row(Engine::Postgres, "s", "t", &[("id", "o'hara")]).unwrap();
+        assert!(is_generated_write(&statement), "{statement} was refused");
+        assert!(delete_matches_key(&statement, &["id"]));
+
+        // A column name carrying one does not: `"we""ird"` is two adjacent
+        // strings to this grammar and the whole statement fails to parse, so
+        // the gate refuses Slate's own output. That is the safe direction --
+        // the row stays -- and a gate that guessed past an unreadable tree is
+        // the unsafe one.
+        let odd = delete_row(Engine::Postgres, "s", "t", &[(r#"we"ird"#, "x")]).unwrap();
+        assert!(!is_generated_write(&odd), "{odd} passed the gate");
+    }
+
+    #[test]
+    fn the_gate_refuses_every_delete_that_is_not_one_named_row() {
+        for sql in [
+            "DELETE FROM t",
+            r#"DELETE FROM "public"."t""#,
+            r#"DELETE FROM t WHERE "id" = '1' OR "id" = '2'"#,
+            r#"DELETE FROM t WHERE "id" = '1' AND ("a" = '2' OR "b" = '3')"#,
+            r#"DELETE FROM t WHERE "id" > '1'"#,
+            r#"DELETE FROM t WHERE "id" <> '1'"#,
+            r#"DELETE FROM t WHERE "id" LIKE '1%'"#,
+            r#"DELETE FROM t WHERE "id" IS NULL"#,
+            "DELETE FROM t WHERE id IN (SELECT id FROM u)",
+            "DELETE FROM t WHERE id = lower('a')",
+            "WITH x AS (SELECT 1) DELETE FROM t WHERE id = '1'",
+            "DELETE FROM t WHERE id = '1' LIMIT 1",
+            "DELETE FROM t WHERE id = '1' RETURNING *",
+            "DELETE FROM t WHERE id = '1'; DELETE FROM t WHERE id = '2'",
+            "DELETE FROM t WHERE id = '1'; DROP TABLE t",
+            "UPDATE t SET a = '1' WHERE id = '2'; DELETE FROM t WHERE id = '3'",
+            r#"DELETE FROM t WHERE "id" = "other""#,
+            "DELETE FROM t WHERE t.id = '1'",
+            "WITH x AS (DROP TABLE u) DELETE FROM t WHERE id = '1'",
+            "WITH x AS (DROP TABLE u) UPDATE t SET a = '1' WHERE id = '2'",
+        ] {
+            assert!(!is_generated_write(sql), "{sql:?} passed the gate");
+        }
+    }
+
+    #[test]
+    fn a_delete_keyed_on_the_wrong_columns_is_refused_by_the_key_check() {
+        // These are the right SHAPE -- is_generated_write admits the first two,
+        // and must, since it has no key to compare against. delete_matches_key
+        // is what refuses them, and a caller runs both.
+        let wrong_column = r#"DELETE FROM "s"."t" WHERE "note" = 'x'"#;
+        assert!(is_generated_write(wrong_column));
+        assert!(!delete_matches_key(wrong_column, &["id"]));
+
+        let half = r#"DELETE FROM "s"."t" WHERE "org_id" = '1'"#;
+        assert!(is_generated_write(half));
+        assert!(!delete_matches_key(half, &["org_id", "user_id"]));
+
+        // A column named twice would read as a one-column key. This one the
+        // shape check itself refuses, and the readout agrees.
+        let twice = r#"DELETE FROM "s"."t" WHERE "id" = '1' AND "id" = '2'"#;
+        assert!(!is_generated_write(twice));
+        assert!(!delete_matches_key(twice, &["id"]));
+
+        // And a statement that is not a delete at all answers no here too.
+        assert!(!delete_matches_key(
+            r#"UPDATE "s"."t" SET "a" = '1' WHERE "id" = '2'"#,
+            &["id"]
+        ));
+        assert!(!delete_matches_key("DROP TABLE t", &["id"]));
     }
 }

@@ -11,7 +11,7 @@ survives the change is between *whose SQL it is*. An editor buffer is the
 user's and is never touched uninvited; a browsing surface (an object tab's
 preview) runs SQL Slate generates, regenerated from visible controls and
 inspectable, never spliced into anyone's buffer. Planned under the new framing:
-row deletion by primary key, foreign-key navigation.
+foreign-key navigation.
 
 **Read this file before doing anything.** It is the source of truth for how
 Slate is built and why.
@@ -47,9 +47,10 @@ require it, stop and raise it instead.
    Two limits on what Slate may write. It never writes `DROP` or `TRUNCATE`,
    whatever the user asked for; and `DELETE` only as the explicit deletion of
    named rows — by primary key, from a direct ask on a browsing surface, with
-   the statement shown before it runs. (That deletion flow is planned, not
-   shipped: today the gate admits an `UPDATE` and a single-row `INSERT`, and
-   this sentence is the permission to widen it — once, by that one shape.) And it never
+   the statement shown before it runs. (That deletion flow is `sql::delete_row`:
+   one row per statement, its `WHERE` the row's whole primary key, with the gate
+   reading that shape back out of the parse tree rather than trusting the
+   generator.) And it never
    writes into a statement it cannot parse whole:
    `sql::with_order_by` refuses rather than guessing at a clause boundary,
    because a corrupted statement is worse than an unsorted grid.
@@ -60,19 +61,40 @@ require it, stop and raise it instead.
    why "silently" is still the word that carries the rule.
 
 2. **One gate stands between the grid and the server.** The grid can write an
-   `UPDATE` and an `INSERT` of one row, and `sql::is_generated_write` is the
-   single gate every generated statement passes first. Both admitted shapes are
-   named here rather than left to be read into a rule about something else:
+   `UPDATE`, an `INSERT` of one row, and a `DELETE` of one row, and
+   `sql::is_generated_write` is the single gate every generated statement passes
+   first. All three admitted shapes are named here rather than left to be read
+   into a rule about something else:
 
    - a batch of `UPDATE`s, optionally bracketed by a `BEGIN`/`COMMIT` the gate
      can see closed;
-   - one `INSERT`, naming the columns it fills.
+   - one `INSERT`, naming the columns it fills;
+   - one `DELETE` whose `WHERE` is a conjunction of equality predicates over
+     distinct, unqualified columns against single-quoted literals — no `OR`, no
+     other operator, no subquery, no function call, no CTE beside it, no
+     `RETURNING`, no `LIMIT`, and nothing else in the submission.
 
-   It is a whitelist, so `DROP`, `TRUNCATE` and `DELETE` are refused
-   structurally rather than by name, anywhere in the tree, CTEs included. Do
-   not add a second path that bypasses it. When row deletion ships (rule 1), it
-   widens this gate to admit a primary-key `DELETE` — it does not get a gate of
-   its own, which is why the gate was renamed rather than given a sibling.
+   It is a whitelist, so `DROP` and `TRUNCATE` are refused structurally rather
+   than by name, anywhere in the tree, CTEs included — `sql::forbidden` — and so
+   is every `delete` outside that one shape: `sql::deletes_anything` refuses one
+   on the `INSERT` and `UPDATE` arms and in `sql::is_generated_select`, the
+   filter bar's gate, which admits none at all. Do not add a second path that
+   bypasses either.
+
+   **The `DELETE`'s shape is verified from the parse tree, not trusted because
+   `sql::delete_row` produced it.** A gate that trusts its caller is a comment,
+   and the check lives in the gate rather than in the generator precisely so the
+   two can disagree — the day they do is the day the gate earns its keep.
+
+   `sql::delete_matches_key` answers the other half, the half the gate cannot:
+   whether the columns the `WHERE` names are exactly the row's key, as a set.
+   It is a readout and not the second gate this rule forbids — it admits
+   nothing, has no say over what runs, and a caller runs both.
+
+   **Multi-row deletion is not admitted**: one row per statement. The upgrade
+   path, when it is wanted, is the `BEGIN`/`COMMIT` bracketing multi-row edits
+   already use — one `DELETE` per row, each naming its own key, never one
+   statement with a predicate covering several.
 
    A cell is editable only when Slate can name its row by primary key. An
    `INSERT` is the one write that needs no key — it has no existing row to name
@@ -273,10 +295,10 @@ Decided, recorded in the multi-engine spec, and not to be re-litigated:
 - **`Engine` is the only engine-shaped thing above `src/db/`**, and only because
   Slate writes SQL. It answers three questions — quote an identifier, quote a
   literal, qualify a name — plus the inverse used to read a sort key back.
-  There are **six** call sites that generate SQL:
+  There are **seven** call sites that generate SQL:
   `explorer::preview_sql`, `sql::with_order_by`, `sql::update_row`,
-  `sql::insert_row`, `main::sort_expression`, and `main::filter_predicate` —
-  the last quotes both
+  `sql::insert_row`, `sql::delete_row`, `main::sort_expression`, and
+  `main::filter_predicate` — the last quotes both
   the column and the value a header input writes. `main::sort_expression` is the
   one that gets forgotten, and forgetting it is silent: a double-quoted name is a
   *string literal* in MySQL, so `ORDER BY "name"` sorts every row by the same

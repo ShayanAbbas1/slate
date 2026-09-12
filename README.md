@@ -136,8 +136,7 @@ around.
 
 ## Planned
 
-The browsing half is still growing: row deletion (by primary key, with the
-statement shown before it runs), and foreign-key navigation.
+The browsing half is still growing: foreign-key navigation.
 Beyond that, SSH tunneling, notarized builds, and a Homebrew tap.
 
 ## Not planned
@@ -146,12 +145,14 @@ Visual query builders, ER diagrams, migrations. Slate assumes you can write
 SQL; it just does not make you write all of it.
 
 **Slate never writes a `DROP` or `TRUNCATE`** — not on request, not by
-accident. Generated statements pass a whitelist gate that admits an `UPDATE`
-and a single-row `INSERT` and nothing else today, so the guarantee is structural
-rather than a list of names someone remembered to check. Row deletion, when it ships, will widen that gate
-by exactly one shape — a `DELETE` of rows named by primary key, generated only
-from an explicit ask and shown before it runs, never from a predicate Slate
-guessed at. On MySQL and SQLite, where each statement commits on its own, a
+accident. Generated statements pass a whitelist gate that admits three shapes
+and nothing else — an `UPDATE`, a single-row `INSERT`, and a `DELETE` of one row
+named by its primary key — so the guarantee is structural rather than a list of
+names someone remembered to check. The `DELETE` is generated only from an
+explicit ask and shown before it runs, never from a predicate Slate guessed at
+and never more than one row per statement; and its shape is read back out of the
+parse tree rather than trusted because Slate wrote it, since a gate that trusts
+its caller is a comment. On MySQL and SQLite, where each statement commits on its own, a
 multi-row edit is bracketed with `BEGIN`/`COMMIT` — written into the buffer
 where you can read it, never opened behind your back. A batch that fails part
 way is rolled back, and the error says which state the data is in.
