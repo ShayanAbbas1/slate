@@ -23,23 +23,24 @@ use gpui_component::{
 };
 
 use crate::{
-    AddFilter, CancelQuery, CloseTarget, Conjunction, Control, EDITOR_FONT_SIZE_MAX,
-    EDITOR_FONT_SIZE_MIN, FilterRow, NewQuery, NewRow, NextPage, ObjectBody, ObjectTab, Operator,
-    PreviousPage, Profile, QueryState, RemoveFilter, ResetEditorZoom, RunQuery, SaveQuery,
-    SetFilterColumn, SetFilterOperator, SetFilterRaw, SetRowLimit, Settings, StructureState, Tab,
-    ToggleFilterJoin, ToggleNextJoin, Tone, Workspace, ZoomEditorIn, ZoomEditorOut, button,
-    button_label, compact_count, db,
+    AddFilter, CancelQuery, CloseTarget, Conjunction, EDITOR_FONT_SIZE_MAX, EDITOR_FONT_SIZE_MIN,
+    FilterRow, NewQuery, NewRow, NextPage, ObjectBody, ObjectTab, Operator, PreviousPage, Profile,
+    QueryState, RemoveFilter, ResetEditorZoom, RunQuery, SaveQuery, SetFilterColumn,
+    SetFilterOperator, SetFilterRaw, SetRowLimit, Settings, StructureState, Tab, ToggleFilterJoin,
+    ToggleNextJoin, Workspace, ZoomEditorIn, ZoomEditorOut, db,
     db::{Engine, RoutineKind},
-    dialog, editor_zoom_percent,
+    editor_zoom_percent,
     explorer::ROW_LIMITS,
-    group_thousands, icon_button,
     icons::icon,
-    key_hint, object_icon,
     palette::Mode as PaletteMode,
     result_grid,
     result_grid::ResultGrid,
-    result_pane_is_expanded, row_icon, section_label,
+    result_pane_is_expanded,
     theme::{FontSlot, Theme, fonts, layout, theme},
+    ui::{
+        Control, Tone, button, button_label, compact_count, dialog, group_thousands, icon_button,
+        key_hint, object_icon, row_icon, section_label,
+    },
 };
 
 pub fn render_main_content(
