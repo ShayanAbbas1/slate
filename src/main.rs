@@ -702,10 +702,21 @@ struct ObjectTab {
 }
 
 impl ObjectTab {
+    /// The `WHERE` this tab reads the relation under, and `""` for a routine
+    /// and for an unfiltered relation -- which is what makes an unfiltered tab
+    /// dedupe exactly as it did before the filter joined the key.
+    fn filter(&self) -> &str {
+        match &self.body {
+            ObjectBody::Relation { filter, .. } => filter,
+            ObjectBody::Routine(_) => "",
+        }
+    }
+
     fn stored(&self) -> store::StoredObject {
         store::StoredObject {
             schema: self.schema.clone(),
             name: self.name.clone(),
+            filter: self.filter().to_string(),
             routine: matches!(self.kind, ObjectKind::Routine(_)),
             kind: match self.kind {
                 ObjectKind::Relation(kind) => kind,
@@ -723,6 +734,10 @@ enum OpenedObject {
         schema: String,
         name: String,
         kind: RelationKind,
+        /// The `WHERE` the tab opens under, empty for the whole relation. Part
+        /// of the tab's identity (spec §6.3), so following a key opens a tab
+        /// beside the relation's own rather than taking it over.
+        filter: String,
     },
     Routine {
         schema: String,
@@ -751,6 +766,13 @@ impl OpenedObject {
         }
     }
 
+    fn filter(&self) -> &str {
+        match self {
+            Self::Relation { filter, .. } => filter,
+            Self::Routine { .. } => "",
+        }
+    }
+
     fn resolve(catalog: &Catalog, stored: &store::StoredObject) -> Option<Self> {
         let schema = catalog
             .schemas
@@ -774,9 +796,27 @@ impl OpenedObject {
                 schema: schema.name.clone(),
                 name: relation.name.clone(),
                 kind: relation.kind,
+                filter: stored.filter.clone(),
             })
         }
     }
+}
+
+/// The tab an object would reuse, if it has one. Dedup is on
+/// `(schema, name, filter)` rather than `(schema, name)` (spec §6.3), so
+/// `customers` and `customers WHERE id = 42` are two tabs. Fed an iterator
+/// rather than a session, so the invariant has a test that needs no window.
+fn matching_tab<'a>(
+    open: impl Iterator<Item = (u64, &'a str, &'a str, &'a str)>,
+    schema: &str,
+    name: &str,
+    filter: &str,
+) -> Option<u64> {
+    open.filter(|(_, candidate_schema, candidate_name, candidate_filter)| {
+        *candidate_schema == schema && *candidate_name == name && *candidate_filter == filter
+    })
+    .map(|(id, ..)| id)
+    .next()
 }
 
 /// What the catalog says a relation is. The only authority on it: a stored
@@ -1599,16 +1639,14 @@ impl Workspace {
         };
         // Snapshots whose tab is gone -- a renamed table strands its file
         // under the old name, and nothing else will ever remove it.
-        let live_grids = stored_queries
-            .iter()
-            .map(|tab| store::query_grid_key(tab.id))
-            .chain(
-                stored
-                    .open_objects
-                    .iter()
-                    .map(|object| store::object_grid_key(&object.schema, &object.name)),
-            )
-            .collect();
+        let live_grids =
+            stored_queries
+                .iter()
+                .map(|tab| store::query_grid_key(tab.id))
+                .chain(stored.open_objects.iter().map(|object| {
+                    store::object_grid_key(&object.schema, &object.name, &object.filter)
+                }))
+                .collect();
         store::prune_grids(&stored.id, &live_grids);
         let mut session = Session::new(
             stored.id.clone(),
@@ -2315,6 +2353,8 @@ impl Workspace {
                     schema: schema.name.clone(),
                     name: relation.name.clone(),
                     kind: relation.kind,
+                    // A click in the explorer opens the whole relation.
+                    filter: String::new(),
                 })
             }),
             ExplorerTarget::Routine {
@@ -2349,12 +2389,16 @@ impl Workspace {
         let (schema, name, kind) = (opened.schema().to_string(), opened.name(), opened.kind());
         let preview_rows = self.settings.preview_rows;
         let profile = self.profile_mut()?;
-        let existing = profile
-            .session
-            .objects
-            .iter()
-            .find(|tab| tab.schema == schema && tab.name == name)
-            .map(|tab| tab.id);
+        let existing = matching_tab(
+            profile
+                .session
+                .objects
+                .iter()
+                .map(|tab| (tab.id, tab.schema.as_str(), tab.name.as_str(), tab.filter())),
+            &schema,
+            &name,
+            opened.filter(),
+        );
 
         if let Some(id) = existing {
             return Some(id);
@@ -2364,19 +2408,28 @@ impl Workspace {
         profile.session.next_object_id += 1;
         let body = match opened {
             OpenedObject::Routine { routine, .. } => ObjectBody::Routine(routine),
-            OpenedObject::Relation { .. } => ObjectBody::Relation {
-                showing_structure: false,
-                structure: StructureState::Loading,
-                results: result_grid(window, cx),
-                query: QueryState::Idle,
-                sort: Vec::new(),
-                filter: String::new(),
-                filter_input: filter_input(id, window, cx),
-                limit: preview_rows,
-                offset: 0,
-                stale: false,
-                hydrated: false,
-            },
+            OpenedObject::Relation { filter, .. } => {
+                let input = filter_input(id, window, cx);
+                if !filter.is_empty() {
+                    // Into the box as well as into the tab, or the bar would
+                    // claim the whole relation is on screen.
+                    let value = filter.clone();
+                    input.update(cx, |input, cx| input.set_value(value, window, cx));
+                }
+                ObjectBody::Relation {
+                    showing_structure: false,
+                    structure: StructureState::Loading,
+                    results: result_grid(window, cx),
+                    query: QueryState::Idle,
+                    sort: Vec::new(),
+                    filter,
+                    filter_input: input,
+                    limit: preview_rows,
+                    offset: 0,
+                    stale: false,
+                    hydrated: false,
+                }
+            }
         };
         self.profile_mut()?.session.objects.push(ObjectTab {
             id,
@@ -2616,7 +2669,7 @@ impl Workspace {
                 else {
                     return;
                 };
-                let key = store::object_grid_key(&object.schema, &object.name);
+                let key = store::object_grid_key(&object.schema, &object.name, object.filter());
                 let ObjectBody::Relation {
                     query, hydrated, ..
                 } = &mut object.body
@@ -2715,14 +2768,15 @@ impl Workspace {
 
     fn close_object(&mut self, id: u64, cx: &mut Context<Self>) {
         if let Some(profile) = self.profile_mut() {
-            // Read before the tab goes, because the key is made of its schema
-            // and name and there is nothing left to make it from afterwards.
+            // Read before the tab goes, because the key is made of its schema,
+            // name and filter, and there is nothing left to make it from
+            // afterwards.
             let snapshot = profile
                 .session
                 .objects
                 .iter()
                 .find(|tab| tab.id == id)
-                .map(|tab| store::object_grid_key(&tab.schema, &tab.name));
+                .map(|tab| store::object_grid_key(&tab.schema, &tab.name, tab.filter()));
             let profile_id = profile.id.clone();
             profile.session.objects.retain(|tab| tab.id != id);
             if let Some(key) = snapshot {
@@ -2783,6 +2837,7 @@ impl Workspace {
                                 relation_kind(catalog, &stored.schema, &stored.name)
                             })
                             .unwrap_or(stored.kind),
+                        filter: stored.filter.clone(),
                     },
                     stored.active,
                 ));
@@ -6373,7 +6428,7 @@ fn write_grids(profile: &Profile, cx: &App) {
         }
         let _ = store::write_grid(
             &profile.id,
-            &store::object_grid_key(&tab.schema, &tab.name),
+            &store::object_grid_key(&tab.schema, &tab.name, filter),
             &store::StoredGrid {
                 limit: Some(*limit),
                 filter: filter.clone(),
@@ -7190,6 +7245,57 @@ mod tests {
         assert_eq!(
             foreign_key_filter(Engine::MySql, &account_key(), Some(r"a\b")).as_deref(),
             Some(r"`id` = 'a\\b'")
+        );
+    }
+
+    #[test]
+    fn one_relation_and_one_filter_is_one_tab() {
+        let open = [
+            (7u64, "public", "customers", ""),
+            (9u64, "public", "customers", r#""id" = '42'"#),
+        ];
+        assert_eq!(
+            matching_tab(open.iter().copied(), "public", "customers", ""),
+            Some(7)
+        );
+        assert_eq!(
+            matching_tab(
+                open.iter().copied(),
+                "public",
+                "customers",
+                r#""id" = '42'"#
+            ),
+            Some(9)
+        );
+    }
+
+    #[test]
+    fn a_filtered_relation_does_not_take_over_the_unfiltered_tab() {
+        // The invariant this tier changes: following a key cannot clobber what
+        // the relation's own tab was showing.
+        let open = [(7u64, "public", "customers", "")];
+        assert_eq!(
+            matching_tab(
+                open.iter().copied(),
+                "public",
+                "customers",
+                r#""id" = '42'"#
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn two_schemas_can_hold_a_relation_of_the_same_name_and_filter() {
+        let open = [(7u64, "public", "customers", r#""id" = '42'"#)];
+        assert_eq!(
+            matching_tab(
+                open.iter().copied(),
+                "archive",
+                "customers",
+                r#""id" = '42'"#
+            ),
+            None
         );
     }
 

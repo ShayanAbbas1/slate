@@ -120,6 +120,14 @@ pub struct StoredObject {
     /// strip. Meaningless for a routine.
     #[serde(default)]
     pub kind: RelationKind,
+    /// The `WHERE` expression this tab narrows the relation by, without the
+    /// keyword. Part of the tab's identity, not a setting on it: a tab that
+    /// forgot its filter would come back from a restart as a different tab and
+    /// collide with its sibling. Absent is a profile written before filters
+    /// existed, and reads back as the whole relation -- which is what that tab
+    /// had open. Meaningless for a routine.
+    #[serde(default)]
+    pub filter: String,
     /// Which tab was in front. A flag on the object rather than a pointer to
     /// it: a name can contain anything, including whatever would separate a
     /// schema from a relation in a key.
@@ -594,9 +602,19 @@ pub fn query_grid_key(id: u64) -> String {
 /// percent-encoded, `.` included: it is this function's own separator, and a
 /// name that happened to contain one would otherwise let two different tables
 /// collide on one key (`"a.b"` + `"c"` and `"a"` + `"b.c"` would both read
-/// `"a.b.c"` if `.` were left unescaped).
-pub fn object_grid_key(schema: &str, name: &str) -> String {
-    format!("o-{}.{}", escape_grid_key(schema), escape_grid_key(name))
+/// `"a.b.c"` if `.` were left unescaped). The filter is a third component
+/// under the same escaping, because it is part of the tab's identity.
+///
+/// An empty filter emits the two-component key it always has: a third
+/// component on every key would orphan every snapshot already on disk, and
+/// every restored relation tab would open empty and re-query.
+pub fn object_grid_key(schema: &str, name: &str, filter: &str) -> String {
+    let key = format!("o-{}.{}", escape_grid_key(schema), escape_grid_key(name));
+    if filter.is_empty() {
+        key
+    } else {
+        format!("{key}.{}", escape_grid_key(filter))
+    }
 }
 
 fn escape_grid_key(value: &str) -> String {
@@ -768,6 +786,7 @@ mod tests {
                     name: "accounts".into(),
                     routine: false,
                     kind: RelationKind::MaterializedView,
+                    filter: String::new(),
                     active: true,
                 },
                 StoredObject {
@@ -775,6 +794,7 @@ mod tests {
                     name: "total(integer)".into(),
                     routine: true,
                     kind: RelationKind::default(),
+                    filter: String::new(),
                     active: false,
                 },
             ],
@@ -852,6 +872,7 @@ open_objects = []
                 name: "accounts".into(),
                 routine: false,
                 kind: RelationKind::Table,
+                filter: String::new(),
                 active: true,
             }],
         };
@@ -908,6 +929,7 @@ open_objects = []
                 name: "accounts".into(),
                 routine: false,
                 kind: RelationKind::Table,
+                filter: String::new(),
                 active: true,
             }],
         };
@@ -1009,6 +1031,7 @@ open_objects = []
                 name: "accounts".into(),
                 routine: false,
                 kind: RelationKind::Table,
+                filter: String::new(),
                 active: true,
             }],
         };
@@ -1338,6 +1361,7 @@ open_objects = []
                 name: "accounts".into(),
                 routine: false,
                 kind: RelationKind::Table,
+                filter: String::new(),
                 active: true,
             }],
         };
@@ -1382,10 +1406,10 @@ open_objects = []
                 captured: 0,
             };
             let live_query = query_grid_key(0);
-            let live_object = object_grid_key("public", "accounts");
+            let live_object = object_grid_key("public", "accounts", "");
             // The one a rename stranded: nothing names it any more, and its
             // key cannot be rebuilt from anything that does.
-            let orphan = object_grid_key("public", "accounts_old");
+            let orphan = object_grid_key("public", "accounts_old", "");
             for key in [&live_query, &live_object, &orphan] {
                 write_grid("dev", key, &grid).expect("a grid must write");
             }
@@ -1464,7 +1488,10 @@ open_objects = []
 
             // A dot inside a schema or table name must not read as the
             // separator between them.
-            assert_ne!(object_grid_key("a.b", "c"), object_grid_key("a", "b.c"));
+            assert_ne!(
+                object_grid_key("a.b", "c", ""),
+                object_grid_key("a", "b.c", "")
+            );
 
             // A profile id derives from its name, so a recreated profile can
             // be handed a dead one's id -- and a leftover snapshot would read
@@ -1492,7 +1519,7 @@ open_objects = []
                 showing_structure: false,
                 captured: 1_700_000_000,
             };
-            let key = object_grid_key("public", "accounts");
+            let key = object_grid_key("public", "accounts", "");
             write_grid("dev", &key, &filtered).expect("a filtered grid must write");
 
             // Whole-struct equality: the filter is part of what the tab was
@@ -1516,5 +1543,116 @@ open_objects = []
 
         assert_eq!(grid.filter, "");
         assert_eq!(grid.limit, None);
+    }
+
+    #[test]
+    fn a_stored_object_written_before_filters_reads_back_unfiltered() {
+        // The tab this profile had open was showing the whole relation, and
+        // absent has to mean that rather than fail the decode.
+        let (profiles, ..) = decode_profiles(
+            "\
+[[profiles]]
+id = \"slate-dev\"
+name = \"slate_dev\"
+host = \"127.0.0.1\"
+port = 55432
+database = \"slate_dev\"
+user = \"slate\"
+
+[[profiles.open_objects]]
+schema = \"public\"
+name = \"accounts\"
+",
+        )
+        .expect("a profile predating the filter must load");
+
+        let [profile] = &profiles[..] else {
+            panic!("expected exactly one profile, got {}", profiles.len());
+        };
+        let [object] = &profile.open_objects[..] else {
+            panic!("expected exactly one open object");
+        };
+        assert_eq!(object.filter, "");
+    }
+
+    #[test]
+    fn two_tabs_on_one_relation_survive_the_round_trip_as_two() {
+        // The whole point of the filter being stored: a restart that collapsed
+        // these two into one would lose whichever tab it dropped.
+        let profile = StoredProfile {
+            id: "dev".into(),
+            name: "Dev".into(),
+            host: "127.0.0.1".into(),
+            port: Some(5432),
+            database: "slate_dev".into(),
+            user: "slate".into(),
+            sslmode: None,
+            root_certificate: None,
+            engine: Some("postgres".into()),
+            path: None,
+            editor_font_size: None,
+            statement_timeout: None,
+            next_query_id: Some(0),
+            color: None,
+            open_query: None,
+            open_queries: Vec::new(),
+            open_objects: vec![
+                StoredObject {
+                    schema: "public".into(),
+                    name: "customers".into(),
+                    routine: false,
+                    kind: RelationKind::Table,
+                    filter: String::new(),
+                    active: false,
+                },
+                StoredObject {
+                    schema: "public".into(),
+                    name: "customers".into(),
+                    routine: false,
+                    kind: RelationKind::Table,
+                    filter: r#""id" = '42'"#.into(),
+                    active: true,
+                },
+            ],
+        };
+        let file = ProfileFile {
+            fonts: None,
+            active: None,
+            settings: None,
+            profiles: vec![profile.clone()],
+        };
+
+        let text = toml::to_string_pretty(&file).expect("profiles must encode");
+        let decoded: ProfileFile = toml::from_str(&text).expect("profiles must decode");
+
+        assert_eq!(decoded.profiles, vec![profile]);
+    }
+
+    #[test]
+    fn an_unfiltered_grid_key_is_the_key_it_has_always_been() {
+        // A key that grew a third component unconditionally would orphan every
+        // snapshot on disk, and every restored tab would open empty and
+        // re-query.
+        assert_eq!(
+            object_grid_key("public", "accounts", ""),
+            "o-public.accounts"
+        );
+        assert_ne!(
+            object_grid_key("public", "accounts", r#""id" = '42'"#),
+            object_grid_key("public", "accounts", "")
+        );
+    }
+
+    #[test]
+    fn a_filter_cannot_collide_a_grid_key_with_another_tab() {
+        // The separator-escaping property above, extended to the new component.
+        assert_ne!(
+            object_grid_key("a", "b", "c"),
+            object_grid_key("a", "b.c", "")
+        );
+        assert_ne!(
+            object_grid_key("a", "b", "c"),
+            object_grid_key("a.b", "c", "")
+        );
     }
 }
