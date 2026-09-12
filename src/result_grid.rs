@@ -5,10 +5,12 @@ use gpui::{
 use gpui_component::{
     InteractiveElementExt,
     input::{Input, InputState},
+    table::TableEvent,
     table::{Column, TableDelegate, TableState},
 };
 
 use crate::{
+    Workspace,
     db::{self, EditTarget, QueryResult},
     icons::icon,
     store::{GRID_ROW_CAP, StoredGrid, captured_at},
@@ -1010,6 +1012,59 @@ impl TableDelegate for ResultGrid {
                 cx.notify();
             }))
     }
+}
+
+pub(crate) fn new_grid(
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) -> Entity<TableState<ResultGrid>> {
+    let grid = cx.new(|cx| {
+        TableState::new(ResultGrid::empty(), window, cx)
+            // Sorting is the grid's own, over the rows it already holds. It
+            // never re-runs the statement, so the rows on screen stay the one
+            // snapshot the server sent.
+            .sortable(true)
+            .col_movable(false)
+            .col_resizable(true)
+            .row_selectable(true)
+            .col_selectable(true)
+    });
+
+    // The library's arrow keys move its own selection, which is a row or a
+    // column and never a cell. Folded into the active cell here, they move the
+    // ring instead -- so every grid is navigable by keyboard, and Slate needs
+    // no arrow binding competing with the library's own actions.
+    //
+    // Hooked in the constructor because every relation tab builds its grid
+    // through it: a subscription set up at one call site would leave the other
+    // grid navigating an invisible selection.
+    cx.subscribe(&grid, |_, table, event: &TableEvent, cx| match event {
+        TableEvent::SelectRow(row) => {
+            let row = *row;
+            table.update(cx, |table, cx| {
+                table.delegate_mut().select_row(row);
+                cx.notify();
+            });
+        }
+        TableEvent::SelectColumn(col) => {
+            let col = *col;
+            table.update(cx, |table, cx| {
+                table.delegate_mut().select_col(col);
+                cx.notify();
+            });
+        }
+        // The library resizes its own copy of the columns, so a drag is only
+        // in the delegate -- the thing a snapshot is taken from -- if it is
+        // written back here.
+        TableEvent::ColumnWidthsChanged(widths) => {
+            let widths = widths.clone();
+            table.update(cx, |table, _| table.delegate_mut().set_widths(&widths));
+        }
+        _ => {}
+    })
+    .detach();
+
+    grid
 }
 
 #[cfg(test)]

@@ -773,3 +773,60 @@ impl Workspace {
         cx.notify();
     }
 }
+
+/// Removing an entry below the active one shifts the vector under the index,
+/// so clamping to the new length alone silently activates the wrong profile.
+pub(crate) fn active_after_removal(active: usize, removed: usize, remaining: usize) -> usize {
+    let shifted = if removed < active { active - 1 } else { active };
+    shifted.min(remaining.saturating_sub(1))
+}
+
+/// What a removal took with it. The count is named because saved queries are
+/// the one thing a person could still want back, and a directory that outlived
+/// its profile is reported rather than passed over -- the id is derived from the
+/// name, so whatever is left there attaches itself to the next profile called
+/// the same thing.
+pub(crate) fn removal_note(name: &str, queries: usize, problem: Option<String>) -> String {
+    if let Some(problem) = problem {
+        return format!("Removed {name}, but its saved queries are still on disk: {problem}");
+    }
+
+    match queries {
+        0 => format!("Removed {name}."),
+        1 => format!("Removed {name} and its saved query."),
+        _ => format!("Removed {name} and its {queries} saved queries."),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn removing_a_profile_keeps_the_same_one_active() {
+        assert_eq!(active_after_removal(2, 0, 3), 1);
+        assert_eq!(active_after_removal(2, 2, 3), 2);
+        assert_eq!(active_after_removal(2, 3, 3), 2);
+        // The active profile was last, so there is nothing at its index now.
+        assert_eq!(active_after_removal(2, 2, 2), 1);
+        assert_eq!(active_after_removal(0, 0, 0), 0);
+    }
+
+    #[test]
+    fn a_removal_says_what_went_with_the_profile() {
+        assert_eq!(removal_note("Prod", 0, None), "Removed Prod.");
+        assert_eq!(
+            removal_note("Prod", 1, None),
+            "Removed Prod and its saved query."
+        );
+        assert_eq!(
+            removal_note("Prod", 7, None),
+            "Removed Prod and its 7 saved queries."
+        );
+        // The count is not mentioned when the files are still there to count.
+        assert_eq!(
+            removal_note("Prod", 7, Some("permission denied".into())),
+            "Removed Prod, but its saved queries are still on disk: permission denied"
+        );
+    }
+}

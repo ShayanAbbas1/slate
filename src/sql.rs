@@ -18,6 +18,7 @@ use std::ops::Range;
 use tree_sitter::{Node, Parser, Tree};
 
 use crate::db::Engine;
+use crate::result_grid::PendingRow;
 
 /// The runnable statements of a query buffer, as byte ranges into it.
 pub struct Buffer {
@@ -763,6 +764,89 @@ fn trim_range(sql: &str, range: Range<usize>) -> Option<Range<usize>> {
     let trailing = slice.len() - slice.trim_end().len();
     let trimmed = (range.start + leading)..(range.end - trailing);
     (!trimmed.is_empty()).then_some(trimmed)
+}
+
+/// Every pending row as one `UPDATE`, joined into a single string.
+///
+/// All-or-nothing, which each engine reaches differently, and
+/// `Engine::transaction_start` is where that per-engine answer lives. Postgres
+/// runs one submission as a single implicit transaction and needs nothing;
+/// MySQL and SQLite commit every statement on its own, so a batch of more than
+/// one is bracketed — in the statement text itself, where the user can read,
+/// edit and undo it, because Slate does not open a transaction behind anyone's
+/// back.
+///
+/// `None` when there is nothing to apply, and `None` — rather than a shorter
+/// batch — when any one row cannot be written: a partial apply is not the change
+/// the user made, and Slate would have no way to say which part of it ran.
+pub(crate) fn update_batch(engine: Engine, rows: &[PendingRow]) -> Option<String> {
+    if rows.is_empty() {
+        return None;
+    }
+
+    fn borrowed(pairs: &[(String, String)]) -> Vec<(&str, &str)> {
+        pairs
+            .iter()
+            .map(|(column, value)| (column.as_str(), value.as_str()))
+            .collect()
+    }
+    fn borrowed_sets(pairs: &[(String, Option<String>)]) -> Vec<(&str, Option<&str>)> {
+        pairs
+            .iter()
+            .map(|(column, value)| (column.as_str(), value.as_deref()))
+            .collect()
+    }
+    let statements: Option<Vec<String>> = rows
+        .iter()
+        .map(|row| {
+            update_row(
+                engine,
+                &row.schema,
+                &row.table,
+                &borrowed_sets(&row.sets),
+                &borrowed(&row.keys),
+            )
+            // Terminated, not separated: the last statement carries its
+            // semicolon too, so appending to a buffer cannot fuse it onto
+            // whatever the user writes next.
+            .map(|statement| format!("{statement};"))
+        })
+        .collect();
+
+    let batch = statements?.join("\n");
+    let bracket = engine.transaction_start().filter(|_| rows.len() > 1);
+    Some(match bracket {
+        Some(start) => format!("{start};\n{batch}\nCOMMIT;"),
+        None => batch,
+    })
+}
+
+/// A statement at the front of the history, and there only once however many
+/// times it has been run: a query run five times is one row to recall, not five
+/// rows to read past.
+pub(crate) fn remember_statement(history: &mut Vec<String>, sql: &str) {
+    history.retain(|past| past != sql);
+    history.insert(0, sql.to_string());
+    history.truncate(crate::store::HISTORY_DEPTH);
+}
+
+/// Slate's statement appended to the buffer the user is writing in.
+///
+/// The terminator is the whole subtlety: an unterminated statement with an
+/// `UPDATE` appended to it becomes one statement, and the next `cmd+enter`
+/// would send both as one. Slate is writing here because the user asked it to,
+/// so the boundary of what they wrote has to survive the ask.
+pub(crate) fn appended_statement(buffer: &str, statement: &str) -> String {
+    let text = buffer.trim_end();
+    if text.is_empty() {
+        return statement.to_string();
+    }
+
+    let terminator = match text.ends_with(';') {
+        true => "",
+        false => ";",
+    };
+    format!("{text}{terminator}\n\n{statement}")
 }
 
 #[cfg(test)]
@@ -1601,5 +1685,167 @@ mod tests {
             &["id"]
         ));
         assert!(!delete_matches_key("DROP TABLE t", &["id"]));
+    }
+
+    fn pending_row(sets: &[(&str, Option<&str>)], keys: &[(&str, &str)]) -> PendingRow {
+        fn owned(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+            pairs
+                .iter()
+                .map(|(column, value)| (column.to_string(), value.to_string()))
+                .collect()
+        }
+        PendingRow {
+            schema: "public".to_string(),
+            table: "accounts".to_string(),
+            sets: sets
+                .iter()
+                .map(|(column, value)| (column.to_string(), value.map(str::to_string)))
+                .collect(),
+            keys: owned(keys),
+        }
+    }
+
+    #[test]
+    fn a_nulled_cell_reaches_the_batch_as_the_keyword() {
+        let rows = vec![pending_row(&[("name", None)], &[("id", "1")])];
+        assert_eq!(
+            update_batch(Engine::Postgres, &rows).unwrap(),
+            "UPDATE \"public\".\"accounts\" SET \"name\" = NULL WHERE \"id\" = '1';"
+        );
+    }
+
+    #[test]
+    fn several_pending_rows_become_one_semicolon_joined_batch() {
+        let rows = vec![
+            pending_row(&[("name", Some("Ada"))], &[("id", "1")]),
+            pending_row(&[("name", Some("Bo"))], &[("id", "2")]),
+        ];
+
+        let batch = update_batch(Engine::Postgres, &rows).unwrap();
+        assert_eq!(
+            batch,
+            "UPDATE \"public\".\"accounts\" SET \"name\" = 'Ada' WHERE \"id\" = '1';\n\
+             UPDATE \"public\".\"accounts\" SET \"name\" = 'Bo' WHERE \"id\" = '2';"
+        );
+        // The batch Slate builds has to pass the same gate Slate checks every
+        // generated statement against, or the generator and the gate have
+        // drifted apart.
+        assert!(is_generated_write(&batch));
+    }
+
+    #[test]
+    fn an_engine_without_an_implicit_transaction_gets_explicit_brackets() {
+        // MySQL and SQLite commit each statement on its own, so an unbracketed
+        // batch could apply half the user's edits and report the failure of the
+        // rest.
+        let rows = vec![
+            pending_row(&[("name", Some("Ada"))], &[("id", "1")]),
+            pending_row(&[("name", Some("Bo"))], &[("id", "2")]),
+        ];
+
+        for engine in [Engine::MySql, Engine::Sqlite] {
+            let batch = update_batch(engine, &rows).unwrap();
+            assert!(batch.starts_with("BEGIN;\n"), "{engine:?} {batch}");
+            assert!(batch.ends_with("\nCOMMIT;"), "{engine:?} {batch}");
+            assert!(is_generated_write(&batch), "{engine:?} {batch}");
+
+            // One statement is already atomic, so brackets round it would be
+            // ceremony the user has to read past.
+            let single = update_batch(engine, &rows[..1]).unwrap();
+            assert!(!single.contains("BEGIN"), "{engine:?} {single}");
+            assert!(is_generated_write(&single), "{engine:?} {single}");
+        }
+
+        let postgres = update_batch(Engine::Postgres, &rows).unwrap();
+        assert!(!postgres.contains("BEGIN"), "{postgres}");
+    }
+
+    #[test]
+    fn a_row_with_no_key_to_find_it_by_refuses_the_whole_batch() {
+        let rows = vec![
+            pending_row(&[("name", Some("Ada"))], &[("id", "1")]),
+            // No keys at all: update_row refuses this one, since there is
+            // nothing to identify the row it would touch.
+            pending_row(&[("name", Some("Bo"))], &[]),
+        ];
+
+        assert!(
+            update_row(
+                Engine::Postgres,
+                "public",
+                "accounts",
+                &[("name", Some("Bo"))],
+                &[]
+            )
+            .is_none()
+        );
+        assert_eq!(update_batch(Engine::Postgres, &rows), None);
+    }
+
+    #[test]
+    fn an_empty_batch_of_rows_has_nothing_to_send() {
+        assert_eq!(update_batch(Engine::Postgres, &[]), None);
+    }
+
+    #[test]
+    fn a_statement_run_again_moves_to_the_front_rather_than_doubling() {
+        let mut history = vec!["SELECT 2".to_string(), "SELECT 1".to_string()];
+        remember_statement(&mut history, "SELECT 1");
+
+        assert_eq!(history, ["SELECT 1", "SELECT 2"]);
+    }
+
+    #[test]
+    fn a_recalled_statement_starts_on_the_line_the_cursor_is_sent_to() {
+        // The line `recall_statement` computes, against the text it computes it
+        // from. A cursor on the wrong line runs the wrong statement.
+        for (buffer, recalled) in [
+            ("", "SELECT 1"),
+            ("SELECT 2", "SELECT 1"),
+            ("SELECT 2;\n", "SELECT\n  1"),
+        ] {
+            let appended = appended_statement(buffer, recalled);
+            let line = appended.lines().count() - recalled.lines().count();
+
+            assert_eq!(
+                appended.lines().nth(line),
+                recalled.lines().next(),
+                "{appended:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unterminated_buffer_is_terminated_before_the_appended_statement() {
+        // Without the semicolon, "SELECT 1" and "UPDATE ..." would read back
+        // as a single statement, and cmd+enter would send both at once.
+        assert_eq!(
+            appended_statement("SELECT 1", "UPDATE t SET a = 1"),
+            "SELECT 1;\n\nUPDATE t SET a = 1"
+        );
+    }
+
+    #[test]
+    fn an_already_terminated_buffer_keeps_a_single_semicolon() {
+        assert_eq!(
+            appended_statement("SELECT 1;", "UPDATE t SET a = 1"),
+            "SELECT 1;\n\nUPDATE t SET a = 1"
+        );
+    }
+
+    #[test]
+    fn an_empty_buffer_yields_just_the_statement() {
+        assert_eq!(
+            appended_statement("", "UPDATE t SET a = 1"),
+            "UPDATE t SET a = 1"
+        );
+    }
+
+    #[test]
+    fn trailing_whitespace_in_the_buffer_does_not_ragged_the_join() {
+        assert_eq!(
+            appended_statement("SELECT 1\n\n  ", "UPDATE t SET a = 1"),
+            "SELECT 1;\n\nUPDATE t SET a = 1"
+        );
     }
 }

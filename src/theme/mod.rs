@@ -21,6 +21,10 @@
 
 pub mod color;
 
+use gpui::{App, Window};
+
+use crate::store;
+
 use color::{Oklch, Rgba, Srgb};
 use gpui_component::{
     ThemeMode,
@@ -807,6 +811,50 @@ impl Theme {
     }
 }
 
+/// A theme read back from disk, by name. An absent or unknown name is the
+/// default: a palette dropped from `all` between launches must not strand the
+/// app on a name nothing answers to.
+pub(crate) fn restored_theme(name: Option<&str>) -> Theme {
+    name.and_then(|name| Theme::all().into_iter().find(|theme| theme.name == name))
+        .unwrap_or_default()
+}
+
+/// Push a theme everywhere it is read from. Only a glass theme wants the
+/// desktop behind it, and the platform tears the vibrant view out of the window
+/// the moment this says otherwise -- so it has to be said again on every
+/// switch, not once at startup.
+pub(crate) fn install_theme(theme: Theme, window: &mut Window, cx: &mut App) {
+    theme.apply_to_components(cx);
+    cx.set_global(theme);
+    window.set_background_appearance(theme.window_background());
+}
+
+/// Push a font choice everywhere it is read from: the global the views render
+/// against, and gpui-component's own theme, which carries the chrome family.
+pub(crate) fn install_fonts(picked: Fonts, cx: &mut App) {
+    cx.set_global(picked);
+    let theme = *theme(cx);
+    theme.apply_to_components(cx);
+}
+
+/// Fonts read back from disk. A family the text system cannot resolve falls
+/// back to the default rather than being trusted: gpui matches a family it does
+/// not know to nothing, so a font uninstalled between launches would otherwise
+/// render the surface it was picked for blank.
+pub(crate) fn restored_fonts(stored: Option<store::StoredFonts>, available: &[String]) -> Fonts {
+    let stored = stored.unwrap_or_default();
+    let pick = |family: Option<String>, default: &'static str| -> gpui::SharedString {
+        family
+            .filter(|family| available.iter().any(|name| name == family))
+            .map_or_else(|| default.into(), gpui::SharedString::from)
+    };
+    Fonts {
+        chrome: pick(stored.chrome, Fonts::DEFAULT_CHROME),
+        editor: pick(stored.editor, Fonts::DEFAULT_EDITOR),
+        grid: pick(stored.grid, Fonts::DEFAULT_GRID),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::color::contrast_ratio;
@@ -1067,5 +1115,26 @@ mod tests {
             seen.push(theme.name);
         }
         assert_eq!(theme.next().name, Theme::default().name);
+    }
+
+    #[test]
+    fn a_stored_font_family_survives_only_while_it_is_still_installed() {
+        // The file is the user's to edit and the font is theirs to uninstall,
+        // and gpui draws an unresolvable family as nothing at all -- so a name
+        // that is gone has to read back as the default, not as blank text.
+        let available = ["Lilex".to_string(), "SF Mono".to_string()];
+        let restored = restored_fonts(
+            Some(store::StoredFonts {
+                chrome: Some("Uninstalled Sans".into()),
+                editor: Some("SF Mono".into()),
+                grid: None,
+            }),
+            &available,
+        );
+
+        assert_eq!(restored.chrome, Fonts::DEFAULT_CHROME);
+        assert_eq!(restored.editor, "SF Mono");
+        assert_eq!(restored.grid, Fonts::DEFAULT_GRID);
+        assert_eq!(restored_fonts(None, &available), Fonts::default());
     }
 }

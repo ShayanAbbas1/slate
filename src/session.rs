@@ -28,7 +28,7 @@ use crate::{
         Conjunction, FilterBar, FilterRow, applied_filters, filter_bars, restored_filter,
         stored_filter,
     },
-    next_query_id, result_grid,
+    result_grid,
     result_grid::ResultGrid,
     sql::SortKey,
     store,
@@ -591,7 +591,7 @@ impl QueryTab {
                     .placeholder("Write SQL…")
                     .default_value(sql)
             }),
-            results: result_grid(window, cx),
+            results: result_grid::new_grid(window, cx),
             query: QueryState::Idle,
             open_query: stored.name.clone(),
             last_query: None,
@@ -901,6 +901,110 @@ pub(crate) enum QueryState {
     Failed(DbError),
 }
 
+/// Write every one of a profile's buffers back to whichever file it came from.
+///
+/// All of them rather than the one in front: a buffer that is not visible is
+/// still someone's unsaved work, and a tab switch is no longer the moment it
+/// gets written. The first failure is the one reported and the rest are still
+/// attempted — a full disk must not cost more buffers than it has to.
+pub(crate) fn write_buffer(profile: &Profile, cx: &App) -> Result<(), String> {
+    let mut failure = None;
+    for tab in &profile.session.queries {
+        let sql = tab.editor.read(cx).value().to_string();
+        let written = match &tab.open_query {
+            Some(name) => store::write_query(&profile.id, name, &sql),
+            None => store::write_scratch(&profile.id, tab.id, &sql),
+        };
+        if let Err(message) = written {
+            failure = failure.or(Some(message));
+        }
+    }
+    match failure {
+        Some(message) => Err(message),
+        None => Ok(()),
+    }
+}
+
+/// Snapshot every tab's grid, so reopening a profile shows the rows it was
+/// showing rather than an empty grid waiting on a re-run.
+///
+/// Only a `Complete` tab is written: an empty or failed grid is not a result,
+/// and writing one would replace a good snapshot with nothing. Failures are
+/// dropped rather than reported, unlike the buffers this runs beside -- a cache
+/// that did not land costs a re-run, not somebody's unsaved work.
+pub(crate) fn write_grids(profile: &Profile, cx: &App) {
+    for tab in &profile.session.queries {
+        if !matches!(tab.query, QueryState::Complete { .. }) {
+            continue;
+        }
+        let grid = tab.results.read(cx).delegate().stored();
+        // A statement that returned no columns produced no grid to keep --
+        // which is every `UPDATE` and `DELETE` the buffer has run.
+        if grid.columns.is_empty() {
+            continue;
+        }
+        let _ = store::write_grid(
+            &profile.id,
+            &store::query_grid_key(tab.id),
+            &store::StoredGrid {
+                last_query: tab.last_query.clone(),
+                ..grid
+            },
+        );
+    }
+
+    for tab in &profile.session.objects {
+        let ObjectBody::Relation {
+            results,
+            query,
+            sort,
+            filter,
+            limit,
+            showing_structure,
+            ..
+        } = &tab.body
+        else {
+            continue;
+        };
+        if !matches!(query, QueryState::Complete { .. }) {
+            continue;
+        }
+        let grid = results.read(cx).delegate().stored();
+        if grid.columns.is_empty() {
+            continue;
+        }
+        let _ = store::write_grid(
+            &profile.id,
+            &store::object_grid_key(&tab.schema, &tab.name, filter),
+            &store::StoredGrid {
+                limit: Some(*limit),
+                filter: filter.clone(),
+                showing_structure: *showing_structure,
+                order_by: sort
+                    .iter()
+                    .map(|key| (key.expression.clone(), key.ascending))
+                    .collect(),
+                ..grid
+            },
+        );
+    }
+}
+
+/// The id the next new buffer gets.
+///
+/// `stored` is what the profile last wrote, and the maximum over the open tabs
+/// is the floor: a profile written before the field was kept has none, and one
+/// written by a build that derived it could hand out an id a tab already holds.
+/// Never the derived value alone -- that decreases when the highest tab closes,
+/// and the reused id would hydrate the closed tab's snapshot.
+pub(crate) fn next_query_id(stored: u64, tabs: &[store::StoredQueryTab]) -> u64 {
+    stored.max(tabs.iter().map(|tab| tab.id + 1).max().unwrap_or(0))
+}
+
+pub(crate) fn result_pane_is_expanded(query: &QueryState) -> bool {
+    !matches!(query, QueryState::Idle)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1032,5 +1136,35 @@ mod tests {
             close_target(Tab::Object(3), Some("daily"), 2),
             Some(CloseTarget::Object(3))
         );
+    }
+
+    #[test]
+    fn result_pane_expands_as_soon_as_a_query_starts() {
+        assert!(!result_pane_is_expanded(&QueryState::Idle));
+        assert!(result_pane_is_expanded(&QueryState::Running));
+    }
+
+    #[test]
+    fn the_next_buffer_id_never_goes_backwards_over_a_closed_tab() {
+        let tabs = |ids: &[u64]| {
+            ids.iter()
+                .map(|id| store::StoredQueryTab {
+                    id: *id,
+                    name: None,
+                    active: false,
+                })
+                .collect::<Vec<_>>()
+        };
+
+        // Tab 1 closed, so the highest surviving id is 0 -- and deriving the
+        // next id from it would hand out 1 again, over tab 1's snapshot.
+        assert_eq!(next_query_id(2, &tabs(&[0])), 2);
+        // A profile written before the id was persisted has no stored value,
+        // and the derived one is all there is.
+        assert_eq!(next_query_id(0, &tabs(&[0, 1])), 2);
+        // A stored value behind the open tabs -- an older build's file beside
+        // a newer build's tabs -- must not hand out a live id.
+        assert_eq!(next_query_id(1, &tabs(&[0, 4])), 5);
+        assert_eq!(next_query_id(0, &tabs(&[])), 0);
     }
 }

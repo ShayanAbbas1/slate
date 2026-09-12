@@ -280,3 +280,68 @@ pub(crate) fn file_stem(path: &str) -> &str {
         .and_then(std::ffi::OsStr::to_str)
         .unwrap_or(path)
 }
+
+/// Where a profile's connection details came from, which is what decides
+/// whether its password is a saved credential.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Origin {
+    Environment,
+    Form,
+}
+
+/// The password that earns a Keychain entry, if any.
+///
+/// A file engine has none. A blank one is valid and never warned about, but an
+/// empty Keychain item records nothing and is not written. And a password read
+/// out of the environment is ephemeral by the convention that put it there --
+/// copying it into the login Keychain would outlive the shell that set it, and
+/// the session it belongs to already holds it in the config.
+pub(crate) fn password_to_persist(config: &ConnectionConfig, origin: Origin) -> Option<&str> {
+    if origin == Origin::Environment {
+        return None;
+    }
+    config
+        .server()
+        .map(|server| server.password.as_str())
+        .filter(|password| !password.is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::{ConnectionConfig, ServerConfig, SslMode};
+
+    #[test]
+    fn the_environment_password_is_never_copied_into_the_keychain() {
+        let server = |password: &str| ServerConfig {
+            host: "db.example".to_string(),
+            port: None,
+            database: "app".to_string(),
+            user: "slate".to_string(),
+            password: password.to_string(),
+            sslmode: SslMode::default(),
+            root_certificate: None,
+            statement_timeout: 0,
+        };
+        let typed = ConnectionConfig::Postgres(server("hunter2"));
+        assert_eq!(password_to_persist(&typed, Origin::Form), Some("hunter2"));
+        // `PGPASSWORD` belongs to the shell that set it.
+        assert_eq!(password_to_persist(&typed, Origin::Environment), None);
+        // Blank is a valid password; an empty keychain item is not how one is
+        // recorded.
+        assert_eq!(
+            password_to_persist(&ConnectionConfig::MySql(server("")), Origin::Form),
+            None
+        );
+        assert_eq!(
+            password_to_persist(
+                &ConnectionConfig::Sqlite {
+                    path: "/tmp/slate.db".to_string(),
+                    statement_timeout: 0
+                },
+                Origin::Form
+            ),
+            None
+        );
+    }
+}

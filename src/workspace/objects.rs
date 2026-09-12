@@ -92,7 +92,7 @@ impl Workspace {
                 ObjectBody::Relation {
                     showing_structure: false,
                     structure: StructureState::Loading,
-                    results: result_grid(window, cx),
+                    results: result_grid::new_grid(window, cx),
                     query: QueryState::Idle,
                     sort: Vec::new(),
                     filter,

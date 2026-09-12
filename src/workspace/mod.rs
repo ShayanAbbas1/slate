@@ -13,6 +13,10 @@ mod profiles;
 mod queries;
 mod tabs;
 
+use crate::connection_form::{Origin, password_to_persist};
+use crate::session::{write_buffer, write_grids};
+use crate::sql::{appended_statement, remember_statement, update_batch};
+use crate::theme::{install_fonts, install_theme, restored_fonts, restored_theme};
 use crate::*;
 
 /// What the app is set to, as opposed to what a connection is. The theme and
@@ -668,5 +672,80 @@ impl Render for Workspace {
                     .then(|| views::render_settings(&self.settings, cx)),
             )
             .children(self.render_palette(cx))
+    }
+}
+
+pub(crate) const EDITOR_FONT_SIZE_DEFAULT: f32 = 14.0;
+
+pub(crate) const EDITOR_FONT_SIZE_MIN: f32 = 11.0;
+
+pub(crate) const EDITOR_FONT_SIZE_MAX: f32 = 24.0;
+
+pub(crate) const EDITOR_FONT_SIZE_STEP: f32 = 1.0;
+
+pub(crate) fn adjusted_editor_font_size(current: f32, delta: f32) -> f32 {
+    (current + delta).clamp(EDITOR_FONT_SIZE_MIN, EDITOR_FONT_SIZE_MAX)
+}
+
+/// A zoom read back from disk. Clamped rather than trusted, because
+/// `profiles.toml` is a text file: a size outside the range the controls offer
+/// would otherwise be unreachable by the controls that set it. The finiteness
+/// check is not decoration -- `clamp` on a NaN returns the NaN.
+pub(crate) fn restored_editor_font_size(stored: Option<f32>) -> f32 {
+    stored
+        .filter(|size| size.is_finite())
+        .map(|size| size.clamp(EDITOR_FONT_SIZE_MIN, EDITOR_FONT_SIZE_MAX))
+        .unwrap_or(EDITOR_FONT_SIZE_DEFAULT)
+}
+
+pub(crate) fn editor_zoom_percent(font_size: f32) -> u32 {
+    (font_size / EDITOR_FONT_SIZE_DEFAULT * 100.0).round() as u32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn editor_zoom_stays_inside_its_readable_range() {
+        assert_eq!(
+            adjusted_editor_font_size(EDITOR_FONT_SIZE_MAX, EDITOR_FONT_SIZE_STEP),
+            EDITOR_FONT_SIZE_MAX
+        );
+        assert_eq!(
+            adjusted_editor_font_size(EDITOR_FONT_SIZE_MIN, -EDITOR_FONT_SIZE_STEP),
+            EDITOR_FONT_SIZE_MIN
+        );
+        assert_eq!(
+            adjusted_editor_font_size(EDITOR_FONT_SIZE_DEFAULT, EDITOR_FONT_SIZE_STEP),
+            EDITOR_FONT_SIZE_DEFAULT + EDITOR_FONT_SIZE_STEP
+        );
+    }
+
+    #[test]
+    fn a_restored_zoom_is_clamped_rather_than_trusted() {
+        // `profiles.toml` is a text file. A size outside the range the controls
+        // offer would be a zoom the zoom controls cannot undo, and a NaN would
+        // survive `clamp` and reach the text system.
+        assert_eq!(restored_editor_font_size(None), EDITOR_FONT_SIZE_DEFAULT);
+        assert_eq!(
+            restored_editor_font_size(Some(f32::NAN)),
+            EDITOR_FONT_SIZE_DEFAULT
+        );
+        assert_eq!(
+            restored_editor_font_size(Some(f32::INFINITY)),
+            EDITOR_FONT_SIZE_DEFAULT
+        );
+        assert_eq!(restored_editor_font_size(Some(900.0)), EDITOR_FONT_SIZE_MAX);
+        assert_eq!(restored_editor_font_size(Some(0.0)), EDITOR_FONT_SIZE_MIN);
+        assert_eq!(
+            restored_editor_font_size(Some(EDITOR_FONT_SIZE_DEFAULT + EDITOR_FONT_SIZE_STEP)),
+            EDITOR_FONT_SIZE_DEFAULT + EDITOR_FONT_SIZE_STEP
+        );
+    }
+
+    #[test]
+    fn default_editor_size_is_reported_as_one_hundred_percent() {
+        assert_eq!(editor_zoom_percent(EDITOR_FONT_SIZE_DEFAULT), 100);
     }
 }

@@ -23,7 +23,7 @@ use gpui_component::{
 };
 
 use crate::{
-    EDITOR_FONT_SIZE_MAX, EDITOR_FONT_SIZE_MIN, Settings, Workspace,
+    Settings, Workspace,
     actions::{
         AddFilter, CancelQuery, NewQuery, NewRow, NextPage, PreviousPage, RemoveFilter,
         ResetEditorZoom, RunQuery, SaveQuery, SetFilterColumn, SetFilterOperator, SetFilterRaw,
@@ -31,20 +31,22 @@ use crate::{
     },
     db,
     db::{Engine, RoutineKind},
-    editor_zoom_percent,
     explorer::ROW_LIMITS,
     filter::{Conjunction, FilterRow, Operator},
     icons::icon,
     palette::Mode as PaletteMode,
     result_grid,
     result_grid::ResultGrid,
-    result_pane_is_expanded,
-    session::{CloseTarget, ObjectBody, ObjectTab, Profile, QueryState, StructureState, Tab},
+    session::{
+        CloseTarget, ObjectBody, ObjectTab, Profile, QueryState, StructureState, Tab,
+        result_pane_is_expanded,
+    },
     theme::{FontSlot, Theme, fonts, layout, theme},
     ui::{
         Control, Tone, button, button_label, compact_count, dialog, group_thousands, icon_button,
         key_hint, object_icon, row_icon, section_label,
     },
+    workspace::{EDITOR_FONT_SIZE_MAX, EDITOR_FONT_SIZE_MIN, editor_zoom_percent},
 };
 
 pub fn render_main_content(
