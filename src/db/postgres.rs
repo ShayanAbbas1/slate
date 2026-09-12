@@ -9,7 +9,7 @@ use crate::tls;
 
 use super::{
     Catalog, Cell, Column, DbError, EditTarget, QueryResult, ServerConfig, Structure,
-    assemble_catalog, assemble_structure, non_utf8_error, required_cell,
+    assemble_catalog, assemble_foreign_keys, assemble_structure, non_utf8_error, required_cell,
 };
 
 const RELATIONS_SQL: &str = "
@@ -65,7 +65,7 @@ WHERE procedure.prokind IN ('f', 'p')
 ORDER BY namespace.nspname, procedure.proname, identity_arguments
 ";
 
-// The three structure queries name one relation, so they carry `{schema}` and
+// The four structure queries name one relation, so they carry `{schema}` and
 // `{relation}` placeholders substituted by `structure_sql`.
 const STRUCTURE_COLUMNS_SQL: &str = "
 SELECT
@@ -125,6 +125,44 @@ JOIN pg_catalog.pg_namespace AS namespace
 WHERE namespace.nspname = {schema}
     AND class.relname = {relation}
 ORDER BY table_constraint.conname
+";
+
+// The structured half of a foreign key, beside the rendered DDL
+// `STRUCTURE_CONSTRAINTS_SQL` keeps.
+//
+// `unnest(conkey, confkey) WITH ORDINALITY` pairs the two arrays here, in the
+// server, because they are parallel by definition and nothing outside this
+// query knows that. Carrying two `smallint[]` up and zipping them in Rust would
+// put an attribute number across the `src/db/` boundary, which is the
+// driver-shaped thing hard rule 4 forbids. The ordinality is what keeps a
+// composite key's columns in key order.
+const STRUCTURE_FOREIGN_KEYS_SQL: &str = "
+SELECT
+    source_attribute.attname AS column_name,
+    referenced_namespace.nspname AS referenced_schema,
+    referenced_class.relname AS referenced_table,
+    referenced_attribute.attname AS referenced_column
+FROM pg_catalog.pg_constraint AS table_constraint
+JOIN pg_catalog.pg_class AS class
+    ON class.oid = table_constraint.conrelid
+JOIN pg_catalog.pg_namespace AS namespace
+    ON namespace.oid = class.relnamespace
+JOIN pg_catalog.pg_class AS referenced_class
+    ON referenced_class.oid = table_constraint.confrelid
+JOIN pg_catalog.pg_namespace AS referenced_namespace
+    ON referenced_namespace.oid = referenced_class.relnamespace
+CROSS JOIN LATERAL unnest(table_constraint.conkey, table_constraint.confkey)
+    WITH ORDINALITY AS key(source_attnum, referenced_attnum, key_position)
+JOIN pg_catalog.pg_attribute AS source_attribute
+    ON source_attribute.attrelid = table_constraint.conrelid
+    AND source_attribute.attnum = key.source_attnum
+JOIN pg_catalog.pg_attribute AS referenced_attribute
+    ON referenced_attribute.attrelid = table_constraint.confrelid
+    AND referenced_attribute.attnum = key.referenced_attnum
+WHERE namespace.nspname = {schema}
+    AND class.relname = {relation}
+    AND table_constraint.contype = 'f'
+ORDER BY table_constraint.conname, key.key_position
 ";
 
 // Keyed by oid rather than by name: two schemas can hold a table of the same
@@ -442,7 +480,11 @@ impl Connection {
             self.internal_query(&structure_sql(STRUCTURE_INDEXES_SQL, schema, relation))?;
         let constraints =
             self.internal_query(&structure_sql(STRUCTURE_CONSTRAINTS_SQL, schema, relation))?;
-        assemble_structure(columns, indexes, constraints)
+        let keys =
+            self.internal_query(&structure_sql(STRUCTURE_FOREIGN_KEYS_SQL, schema, relation))?;
+        let mut structure = assemble_structure(columns, indexes, constraints)?;
+        structure.foreign_keys = assemble_foreign_keys(&keys)?;
+        Ok(structure)
     }
 }
 
@@ -830,7 +872,7 @@ fn io_source(error: &postgres::Error) -> Option<&std::io::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::{RelationKind, RoutineKind, SslMode, result};
+    use crate::db::{ForeignKey, RelationKind, RoutineKind, SslMode, result};
 
     fn config() -> ServerConfig {
         ServerConfig {
@@ -1733,5 +1775,80 @@ mod tests {
             .query("SELECT count(*) AS rows_seeded FROM archive.closed_accounts")
             .expect("query should succeed");
         assert_eq!(closed.rows[0][0].as_deref(), Some("2"));
+    }
+
+    #[test]
+    #[ignore = "requires the repository development database configured through PG*"]
+    fn live_a_composite_key_reports_one_column_per_key_position_in_order() {
+        let structure = Connection::open(&live_config())
+            .expect("connection should open")
+            .structure("public", "order_items")
+            .expect("structure should load");
+
+        assert_eq!(
+            structure.foreign_keys,
+            vec![
+                ForeignKey {
+                    column: "order_account_id".to_string(),
+                    referenced_schema: "public".to_string(),
+                    referenced_table: "orders".to_string(),
+                    referenced_column: "account_id".to_string(),
+                },
+                ForeignKey {
+                    column: "order_number".to_string(),
+                    referenced_schema: "public".to_string(),
+                    referenced_table: "orders".to_string(),
+                    referenced_column: "number".to_string(),
+                },
+            ],
+            "conkey and confkey are parallel, and the pairing survives only in order"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires the repository development database configured through PG*"]
+    fn live_a_key_across_schemas_reports_the_schema_it_points_at() {
+        let structure = Connection::open(&live_config())
+            .expect("connection should open")
+            .structure("archive", "closed_accounts")
+            .expect("structure should load");
+
+        assert_eq!(
+            structure.foreign_keys,
+            vec![ForeignKey {
+                column: "account_id".to_string(),
+                referenced_schema: "public".to_string(),
+                referenced_table: "accounts".to_string(),
+                referenced_column: "id".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    #[ignore = "requires the repository development database configured through PG*"]
+    fn live_a_relation_without_a_foreign_key_reports_none() {
+        let structure = Connection::open(&live_config())
+            .expect("connection should open")
+            .structure("public", "accounts")
+            .expect("structure should load");
+
+        assert!(structure.foreign_keys.is_empty());
+    }
+
+    #[test]
+    #[ignore = "requires the repository development database configured through PG*"]
+    fn live_the_structured_key_does_not_replace_the_rendered_ddl() {
+        let structure = Connection::open(&live_config())
+            .expect("connection should open")
+            .structure("public", "order_items")
+            .expect("structure should load");
+
+        assert!(
+            structure
+                .constraints
+                .iter()
+                .any(|constraint| constraint.definition.starts_with("FOREIGN KEY")),
+            "pg_get_constraintdef still renders the constraints tab"
+        );
     }
 }
