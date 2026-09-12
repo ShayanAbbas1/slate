@@ -23,14 +23,15 @@ use gpui_component::{
 };
 
 use crate::{
-    AddFilter, CancelQuery, CloseTarget, Conjunction, EDITOR_FONT_SIZE_MAX, EDITOR_FONT_SIZE_MIN,
-    FilterRow, NewQuery, NewRow, NextPage, ObjectBody, ObjectTab, Operator, PreviousPage, Profile,
-    QueryState, RemoveFilter, ResetEditorZoom, RunQuery, SaveQuery, SetFilterColumn,
-    SetFilterOperator, SetFilterRaw, SetRowLimit, Settings, StructureState, Tab, ToggleFilterJoin,
-    ToggleNextJoin, Workspace, ZoomEditorIn, ZoomEditorOut, db,
+    AddFilter, CancelQuery, CloseTarget, EDITOR_FONT_SIZE_MAX, EDITOR_FONT_SIZE_MIN, NewQuery,
+    NewRow, NextPage, ObjectBody, ObjectTab, PreviousPage, Profile, QueryState, RemoveFilter,
+    ResetEditorZoom, RunQuery, SaveQuery, SetFilterColumn, SetFilterOperator, SetFilterRaw,
+    SetRowLimit, Settings, StructureState, Tab, ToggleFilterJoin, ToggleNextJoin, Workspace,
+    ZoomEditorIn, ZoomEditorOut, db,
     db::{Engine, RoutineKind},
     editor_zoom_percent,
     explorer::ROW_LIMITS,
+    filter::{Conjunction, FilterRow, Operator},
     icons::icon,
     palette::Mode as PaletteMode,
     result_grid,

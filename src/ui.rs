@@ -23,6 +23,10 @@ use crate::{
     theme::{self, ConnectionColor, Theme, layout},
 };
 
+/// The icon a sidebar row carries: a grid for a table, layers for one split
+/// into partitions, an eye for the kinds that are a saved query over a table, a
+/// disk for the one that stores its answer, and a globe for the one that lives
+/// on another server entirely.
 pub(crate) fn object_icon(kind: ObjectKind) -> &'static str {
     match kind {
         ObjectKind::Relation(RelationKind::Table) => icon::TABLE,
