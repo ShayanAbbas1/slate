@@ -305,8 +305,24 @@ Decided, recorded in the multi-engine spec, and not to be re-litigated:
   user typed it or following a foreign key put it there — which is the other
   half of the same hazard. It was eight until the filter bars landed:
   `main::foreign_key_filter` now yields the bar's column and value rather than a
-  `WHERE`, and `main::derived_filter` conjoins the bars through
-  `filter_predicate` rather than quoting anything itself.
+  `WHERE`, and `main::derived_filter` folds the bars through
+  `filter_predicate` rather than quoting anything itself. Every filter operator
+  lives inside that one function, `main::substring` and `main::like_pattern`
+  included.
+- **Three filter operators are written differently per engine, and two of those
+  are decided by the grammar rather than by any server.**
+  `sql::is_generated_select` refuses whatever `tree_sitter_sequel` cannot parse
+  whole, and that pin does not move — so a predicate the grammar does not know
+  is one Slate cannot run, however valid the server would find it. It has **no
+  `ESCAPE` clause and no infix `REGEXP`**. So the pattern operators lean on the
+  engine's default `LIKE` escape, which is the backslash on Postgres and MySQL,
+  and `like_pattern` escapes `%`, `_` and the backslash itself with it;
+  **SQLite, which has no default escape at all**, gets `instr`/`substr`
+  substring arithmetic instead — case-sensitive where its own `LIKE` is not,
+  which is the price of not silently widening a match on a value containing
+  `%`. The regex match is Postgres `~`, MySQL `REGEXP_LIKE(col, pattern)`
+  (8.0.4 and later, so not MariaDB), and **omitted from the dropdown on
+  SQLite**, which ships no `REGEXP` at all.
 - **MySQL and SQLite both bracket a generated multi-row batch** in
   `BEGIN`/`COMMIT`, because each commits every statement on its own where a
   Postgres `simple_query` submission is one implicit transaction. The brackets

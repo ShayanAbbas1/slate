@@ -81,9 +81,12 @@ rm -f dev/slate_dev.db && sqlite3 dev/slate_dev.db < dev/sqlite/001-slate-demo.s
   per-tab row limit and page through the relation a window at a time; a query
   you wrote runs exactly as written, uncapped.
 - **Filter rows without writing SQL.** A table preview stacks one bar per
-  filter — pick a column, type a value — and the generated `SELECT` carries them
-  conjoined in its `WHERE`, quoted for the engine you are on. Equality only:
-  anything more is a statement, and a query buffer is where statements go.
+  filter — pick a column, pick an operator, type a value — and the generated
+  `SELECT` carries them in its `WHERE`, quoted for the engine you are on.
+  Eighteen operators, from `=` through contains, `IN`, `BETWEEN` and a regex
+  match; `AND` or `OR` between any two bars, folded the way the stack reads. A
+  bar can hold raw SQL instead, which goes in verbatim and is refused if the
+  statement it makes is not one readable `SELECT`.
 - **Sorting that edits your SQL in front of you.** A header click splices an
   `ORDER BY` into the statement in the buffer — the statement that runs is the
   statement on screen, and you can edit or undo it.
