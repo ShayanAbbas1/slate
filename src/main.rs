@@ -828,7 +828,7 @@ impl OpenedObject {
         }
     }
 
-    fn resolve(catalog: &Catalog, stored: &store::StoredObject) -> Option<Self> {
+    fn resolve(engine: Engine, catalog: &Catalog, stored: &store::StoredObject) -> Option<Self> {
         let schema = catalog
             .schemas
             .iter()
@@ -847,12 +847,13 @@ impl OpenedObject {
                 .relations
                 .iter()
                 .find(|relation| relation.name == stored.name)?;
+            let (filter, filters) = restored_filter(engine, stored);
             Some(Self::Relation {
                 schema: schema.name.clone(),
                 name: relation.name.clone(),
                 kind: relation.kind,
-                filter: stored.filter.clone(),
-                filters: stored_bars(stored),
+                filter,
+                filters,
             })
         }
     }
@@ -3280,6 +3281,7 @@ impl Workspace {
             return;
         }
         let connected = profile.connection().is_some();
+        let engine = profile.config.engine();
         let catalog = match &profile.catalog {
             CatalogState::Loaded(catalog) => Some(catalog),
             _ => None,
@@ -3291,12 +3293,13 @@ impl Workspace {
             if stored.routine {
                 match catalog {
                     Some(catalog) => opened.extend(
-                        OpenedObject::resolve(catalog, stored)
+                        OpenedObject::resolve(engine, catalog, stored)
                             .map(|object| (object, stored.active)),
                     ),
                     None => still_pending.push(stored.clone()),
                 }
             } else if connected {
+                let (filter, filters) = restored_filter(engine, stored);
                 opened.push((
                     OpenedObject::Relation {
                         schema: stored.schema.clone(),
@@ -3309,8 +3312,8 @@ impl Workspace {
                                 relation_kind(catalog, &stored.schema, &stored.name)
                             })
                             .unwrap_or(stored.kind),
-                        filter: stored.filter.clone(),
-                        filters: stored_bars(stored),
+                        filter,
+                        filters,
                     },
                     stored.active,
                 ));
@@ -6928,6 +6931,22 @@ fn stored_filter(bar: &FilterBar) -> store::StoredFilter {
     }
 }
 
+/// What a stored tab's `WHERE` is on the engine it is being reopened on.
+///
+/// Derived from the bars rather than trusted as written: the two agree for a
+/// profile that has not changed engine, and where it has, an operator the new
+/// engine cannot express drops out rather than being sent to a server that
+/// cannot parse it (spec §7). A tab stored before the bars existed has none,
+/// and keeps the expression it came with.
+fn restored_filter(engine: Engine, stored: &store::StoredObject) -> (String, Vec<FilterBar>) {
+    let bars = stored_bars(stored);
+    let filter = match bars.is_empty() {
+        true => stored.filter.clone(),
+        false => derived_filter(engine, &bars),
+    };
+    (filter, bars)
+}
+
 /// The bars a stored tab comes back with. `bars` is what this build writes;
 /// `filters` is the column-and-value pair an older one wrote, which restores as
 /// the equality joined by `AND` that it was.
@@ -8628,6 +8647,48 @@ mod tests {
     }
 
     #[test]
+    fn a_tab_restored_onto_another_engine_drops_what_that_engine_cannot_run() {
+        // A profile that changed engine, or a file carried between machines:
+        // the expression is re-derived from the bars rather than trusted as
+        // written, so a regex does not reach a SQLite that has none.
+        let stored = store::StoredObject {
+            schema: "public".into(),
+            name: "accounts".into(),
+            routine: false,
+            kind: RelationKind::default(),
+            filter: r#"("state" ~ '^a') AND ("tier" = '2')"#.into(),
+            filters: Vec::new(),
+            active: true,
+            bars: vec![
+                store::StoredFilter {
+                    column: "state".into(),
+                    value: "^a".into(),
+                    operator: "regex".into(),
+                    conjunction: "AND".into(),
+                    raw: false,
+                },
+                store::StoredFilter {
+                    column: "tier".into(),
+                    value: "2".into(),
+                    operator: "equals".into(),
+                    conjunction: "AND".into(),
+                    raw: false,
+                },
+            ],
+        };
+        // Unchanged where the engine can still express it, so the tab keeps the
+        // grid snapshot its key was written under.
+        assert_eq!(
+            restored_filter(Engine::Postgres, &stored).0,
+            r#"("state" ~ '^a') AND ("tier" = '2')"#
+        );
+        assert_eq!(
+            restored_filter(Engine::Sqlite, &stored).0,
+            r#""tier" = '2'"#
+        );
+    }
+
+    #[test]
     fn a_bar_written_before_operators_comes_back_as_the_equality_it_was() {
         // The one field an older profile has, read once on the way in. An
         // operator or joiner this build cannot read falls the same way.
@@ -8644,6 +8705,12 @@ mod tests {
         assert_eq!(
             stored_bars(&stored),
             vec![bar(Some("state"), Operator::Equals, "ok")]
+        );
+        // And its expression is the one it was written with, because there are
+        // no bars to derive a replacement from.
+        assert_eq!(
+            restored_filter(Engine::Postgres, &stored).0,
+            r#""state" = 'ok'"#
         );
         assert_eq!(Operator::from_slug("no-such-operator"), Operator::Equals);
         assert_eq!(Conjunction::from_str("XOR"), Conjunction::And);
