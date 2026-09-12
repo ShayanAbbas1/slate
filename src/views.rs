@@ -23,8 +23,7 @@ use gpui_component::{
 };
 
 use crate::{
-    CloseTarget, EDITOR_FONT_SIZE_MAX, EDITOR_FONT_SIZE_MIN, ObjectBody, ObjectTab, Profile,
-    QueryState, Settings, StructureState, Tab, Workspace,
+    EDITOR_FONT_SIZE_MAX, EDITOR_FONT_SIZE_MIN, Settings, Workspace,
     actions::{
         AddFilter, CancelQuery, NewQuery, NewRow, NextPage, PreviousPage, RemoveFilter,
         ResetEditorZoom, RunQuery, SaveQuery, SetFilterColumn, SetFilterOperator, SetFilterRaw,
@@ -40,6 +39,7 @@ use crate::{
     result_grid,
     result_grid::ResultGrid,
     result_pane_is_expanded,
+    session::{CloseTarget, ObjectBody, ObjectTab, Profile, QueryState, StructureState, Tab},
     theme::{FontSlot, Theme, fonts, layout, theme},
     ui::{
         Control, Tone, button, button_label, compact_count, dialog, group_thousands, icon_button,

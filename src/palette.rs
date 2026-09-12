@@ -20,13 +20,14 @@ use nucleo_matcher::{
 };
 
 use crate::{
-    CatalogState, ObjectBody, Profile, QueryState, Tab, Workspace,
+    Workspace,
     db::{RelationKind, RoutineKind},
     explorer::{ExplorerTarget, ObjectKind},
     export::Format,
     icons::icon,
-    object_icon, routine_name, row_icon,
+    session::{CatalogState, ObjectBody, Profile, QueryState, Tab, routine_name},
     theme::{FontSlot, fonts, layout, theme},
+    ui::{object_icon, row_icon},
 };
 
 #[derive(Clone, Copy, PartialEq, Eq)]
