@@ -50,6 +50,10 @@ const MAX_COLUMN_WIDTH: f32 = 480.0;
 /// of geometry to place a column is time the user waits through for nothing.
 const WIDTH_SAMPLE_ROWS: usize = 200;
 
+/// A row's schema and table, and its primary key as column/value pairs — what a
+/// one-row `DELETE` needs and nothing else.
+pub type RowKey = (String, String, Vec<(String, String)>);
+
 pub struct ResultGrid {
     columns: Vec<Column>,
     result: QueryResult,
@@ -436,6 +440,26 @@ impl ResultGrid {
                 .get(col)
                 .and_then(|column| column.data_type.as_deref())
                 .is_some_and(db::is_binary_type)
+    }
+
+    /// The row's table and its whole primary key, named and valued, or nothing.
+    ///
+    /// The same question [`ResultGrid::editable`] asks, answered for a whole row
+    /// instead of one cell, because deleting a row and editing a cell of it need
+    /// exactly the same thing: a predicate that reaches this row and no other.
+    /// `None` where the result traces to no table, where the index has outlived
+    /// the rows, and where any key column came back NULL — `=` does not find a
+    /// NULL, so a predicate built from one reaches nothing.
+    pub fn row_key(&self, row: usize) -> Option<RowKey> {
+        let edit = self.result.edit.as_ref()?;
+        if row >= self.result.rows.len() {
+            return None;
+        }
+        Some((
+            edit.schema.clone(),
+            edit.table.clone(),
+            self.key_values(edit, row)?,
+        ))
     }
 
     /// Open an input on a cell. `false` when the cell is not editable, and
@@ -1087,6 +1111,51 @@ mod tests {
             }),
             ..QueryResult::default()
         })
+    }
+
+    /// The same shape again, but the NULL is in the *key* column: the row the
+    /// server left unnameable.
+    fn grid_with_a_null_key() -> ResultGrid {
+        ResultGrid::new(QueryResult {
+            columns: vec![column("id"), column("note")],
+            rows: vec![vec![None, Some("first".into())]],
+            edit: Some(EditTarget {
+                schema: "public".into(),
+                table: "measurements".into(),
+                columns: vec![Some("id".into()), Some("body".into())],
+                keys: vec![0],
+            }),
+            ..QueryResult::default()
+        })
+    }
+
+    #[test]
+    fn a_row_offers_its_whole_key_or_nothing_at_all() {
+        // The same condition that makes a cell editable, because it is the same
+        // question: can Slate name this row.
+        let grid = editable_grid();
+        assert_eq!(
+            grid.row_key(1),
+            Some((
+                "public".to_string(),
+                "measurements".to_string(),
+                vec![("id".to_string(), "8".to_string())]
+            ))
+        );
+        // A row index can outlive the rows it was taken from.
+        assert_eq!(grid.row_key(9), None);
+        // And a result Slate cannot trace to one table has no key anywhere.
+        assert_eq!(grid_of(&[Some("x")]).row_key(0), None);
+    }
+
+    #[test]
+    fn a_row_whose_key_the_server_left_null_cannot_be_named() {
+        // `=` does not find a NULL, so a predicate built from one matches
+        // nothing -- and a delete that matches nothing is not the delete the
+        // confirmation described.
+        assert_eq!(grid_with_a_null_key().row_key(0), None);
+        // The same row is nameable when it is a non-key column that is NULL.
+        assert!(grid_with_a_null().row_key(0).is_some());
     }
 
     #[test]

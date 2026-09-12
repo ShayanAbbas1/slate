@@ -268,9 +268,6 @@ pub fn insert_row(
 /// `None` on an empty key list. A `DELETE` with no `WHERE` empties the table, so
 /// it must not be possible to produce one: a caller that has lost the row's key
 /// gets nothing to run rather than something that runs.
-// The grid's deletion flow is the pending caller; until it lands the tests are
-// the only ones.
-#[allow(dead_code)]
 pub fn delete_row(
     engine: Engine,
     schema: &str,
@@ -357,9 +354,6 @@ pub fn is_generated_write(sql: &str) -> bool {
 ///
 /// Set equality, order-independent. A composite key matched on half of itself
 /// reaches every row sharing that half.
-// The grid's deletion flow is the pending caller; until it lands the tests are
-// the only ones.
-#[allow(dead_code)]
 pub fn delete_matches_key(sql: &str, keys: &[&str]) -> bool {
     let Some(columns) = delete_key_columns(sql) else {
         return false;

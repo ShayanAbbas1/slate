@@ -100,6 +100,7 @@ actions!(
         EditCell,
         CopyCell,
         SetNull,
+        DeleteRow,
         ApplyEdits,
         DiscardEdits,
         FuzzyOpen,
@@ -3140,6 +3141,7 @@ impl Workspace {
             Command::NewRow => self.new_row(&NewRow, window, cx),
             Command::CloseObject(id) => self.ask_before_close(CloseTarget::Object(id), cx),
             Command::SetNull => self.set_null(&SetNull, window, cx),
+            Command::DeleteRow => self.delete_row(&DeleteRow, window, cx),
             Command::ApplyEdits => self.apply_edits(&ApplyEdits, window, cx),
             Command::DiscardEdits => self.discard_edits(&DiscardEdits, window, cx),
             Command::ExportResults(format) => self.export_results(format, cx),
@@ -3212,6 +3214,20 @@ impl Workspace {
                 grid.delegate()
                     .active()
                     .is_some_and(|(row, col)| grid.delegate().editable(row, col))
+            })
+        })
+    }
+
+    /// Whether the row the ring is on can be named by its primary key, which is
+    /// the whole of what makes it deletable. Read off the grid for the reason
+    /// [`Workspace::has_editable_cell`] is.
+    fn has_nameable_row(&self, cx: &App) -> bool {
+        self.profile().is_some_and(|profile| {
+            profile.session.active_results().is_some_and(|results| {
+                let grid = results.read(cx);
+                grid.delegate()
+                    .active()
+                    .is_some_and(|(row, _)| grid.delegate().row_key(row).is_some())
             })
         })
     }
@@ -3771,6 +3787,87 @@ impl Workspace {
             return;
         }
         self.note("This column cannot be edited.".into(), cx);
+    }
+
+    /// Generate the one-row `DELETE` and show it. **Nothing runs here** — Run in
+    /// the review panel is the ask (`AGENTS.md` rule 1, spec §5).
+    ///
+    /// Deliberately not on a keybinding, for the reason [`Workspace::apply_edits`]
+    /// is not: a destructive write one fat finger from a navigation key is a
+    /// write nobody asked for. The palette row is how it is reached.
+    fn delete_row(&mut self, _: &DeleteRow, _: &mut Window, cx: &mut Context<Self>) {
+        self.clear_notice();
+        let engine = self.engine();
+        let Some(profile) = self.profile() else {
+            return;
+        };
+        // A statement already generated is the one the user is reading; another
+        // behind it would leave that panel describing something else.
+        if profile.session.apply_review.is_some() || profile.session.insert_form.is_some() {
+            return;
+        }
+        // Browsing surfaces only. A query tab's grid is a view of the user's own
+        // statement, and a delete there would be Slate writing into a buffer to
+        // destroy rows.
+        let tab = profile.session.active;
+        if !matches!(tab, Tab::Object(_)) {
+            self.note(
+                "Deleting a row is offered on a table's rows, not on a query's results.".into(),
+                cx,
+            );
+            return;
+        }
+        let Some(results) = profile.session.active_results() else {
+            return;
+        };
+        let grid = results.read(cx);
+        let key = grid
+            .delegate()
+            .active()
+            .and_then(|(row, _)| grid.delegate().row_key(row));
+        let Some((schema, table, keys)) = key else {
+            self.note(
+                "Slate cannot name this row by its primary key, so it will not delete it.".into(),
+                cx,
+            );
+            return;
+        };
+
+        let borrowed: Vec<(&str, &str)> = keys
+            .iter()
+            .map(|(column, value)| (column.as_str(), value.as_str()))
+            .collect();
+        let Some(statement) = sql::delete_row(engine, &schema, &table, &borrowed) else {
+            self.note(
+                "Slate cannot name this row by its primary key, so it will not delete it.".into(),
+                cx,
+            );
+            return;
+        };
+        // Both halves of the admission, before anything is shown: the gate every
+        // generated statement passes (`AGENTS.md` rule 2), and the readout it
+        // cannot give alone — that the predicate is this row's key and not some
+        // other set of columns. Failing either is Slate disagreeing with itself,
+        // a bug in Slate rather than a user error, so it is said and not run.
+        let columns: Vec<&str> = borrowed.iter().map(|&(column, _)| column).collect();
+        if !sql::is_generated_write(&statement) || !sql::delete_matches_key(&statement, &columns) {
+            self.note(
+                "Slate refused to run a statement it wrote itself: it is not a DELETE of one row \
+                 by its primary key."
+                    .into(),
+                cx,
+            );
+            return;
+        }
+
+        if let Some(profile) = self.profile_mut() {
+            profile.session.apply_review = Some(ApplyReview {
+                tab,
+                title: "Delete row",
+                sql: statement,
+            });
+        }
+        cx.notify();
     }
 
     /// `cmd+c` on the active cell, whole value and all.

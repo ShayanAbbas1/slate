@@ -77,6 +77,9 @@ pub enum Command {
     /// Stage a `NULL` on the active cell. The row is how the gesture stops
     /// being folklore; the editor's own affordance dispatches the same action.
     SetNull,
+    /// Generate the one-row `DELETE` and show it for confirmation. Offered only
+    /// where the grid can name the row by its primary key (spec §5).
+    DeleteRow,
     ApplyEdits,
     DiscardEdits,
     /// The format here only picks the extension the save dialog suggests. What
@@ -478,6 +481,16 @@ fn command_items(workspace: &Workspace, profile: &Profile, cx: &App) -> Vec<Item
                     ));
                 }
                 items.push(Item::command("New row…", "", icon::PLUS, Command::NewRow));
+                // Only on a row Slate can name by its primary key -- the same
+                // condition that makes a cell of it editable.
+                if workspace.has_nameable_row(cx) {
+                    items.push(Item::command(
+                        "Delete row…",
+                        "",
+                        icon::DELETE,
+                        Command::DeleteRow,
+                    ));
+                }
             }
         }
         items.push(Item::command(

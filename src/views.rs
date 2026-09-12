@@ -566,6 +566,7 @@ fn render_results(
                             .on_action(cx.listener(Workspace::edit_cell))
                             .on_action(cx.listener(Workspace::copy_cell))
                             .on_action(cx.listener(Workspace::set_null))
+                            .on_action(cx.listener(Workspace::delete_row))
                             .child(Table::new(results).bordered(false).stripe(false)),
                     )
                     .children(render_row_inspector(results, cx)),
