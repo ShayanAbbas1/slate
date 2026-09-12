@@ -14,7 +14,7 @@
 //! result column was read from, which is exactly what in-grid editing needs, so
 //! there is no describe step and nothing here can disturb an open transaction.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::mpsc::{RecvTimeoutError, Sender, channel};
 use std::sync::{Arc, Mutex};
@@ -25,8 +25,8 @@ use rusqlite::types::ValueRef;
 use rusqlite::{Batch, InterruptHandle, OpenFlags};
 
 use super::{
-    Catalog, Cell, Column, DbError, EditTarget, Engine, NamedDefinition, QueryResult, Structure,
-    assemble_catalog, assemble_structure, non_utf8_error, percent_decoded, plain_error,
+    Catalog, Cell, Column, DbError, EditTarget, Engine, ForeignKey, NamedDefinition, QueryResult,
+    Structure, assemble_catalog, assemble_structure, non_utf8_error, percent_decoded, plain_error,
     required_cell,
 };
 
@@ -359,6 +359,7 @@ impl Connection {
             assemble_structure(columns, QueryResult::default(), QueryResult::default())?;
         structure.indexes = self.indexes(schema, relation)?;
         structure.constraints = self.constraints(schema, relation)?;
+        structure.foreign_keys = self.foreign_keys(schema, relation)?;
         Ok(structure)
     }
 
@@ -446,7 +447,7 @@ impl Connection {
         // One constraint spans one row per column, so the rows are grouped here
         // rather than with `group_concat`, whose ordering clause is newer than
         // the oldest SQLite this could be pointed at.
-        let mut current: Option<(String, ForeignKey)> = None;
+        let mut current: Option<(String, KeyGroup)> = None;
         for row in &listed.rows {
             let id = required_cell(&listed, row, "constraint_id")?.to_string();
             let target = required_cell(&listed, row, "target_relation")?.to_string();
@@ -466,7 +467,7 @@ impl Connection {
                     }
                     current = Some((
                         id,
-                        ForeignKey {
+                        KeyGroup {
                             target,
                             sources: vec![source_column],
                             targets: Vec::from_iter(
@@ -483,10 +484,81 @@ impl Connection {
 
         Ok(constraints)
     }
+
+    /// The same pragma as [`Connection::constraints`], kept as fields: one
+    /// entry per column of every foreign key, in key order.
+    fn foreign_keys(&self, schema: &str, relation: &str) -> Result<Vec<ForeignKey>, DbError> {
+        let listed = self.internal_query(&format!(
+            "SELECT id AS constraint_id,
+                    \"table\" AS target_relation,
+                    \"from\" AS source_column,
+                    COALESCE(\"to\", '') AS target_column
+             FROM pragma_foreign_key_list({relation}, {schema})
+             ORDER BY id, seq",
+            relation = Engine::Sqlite.quote_literal(relation),
+            schema = Engine::Sqlite.quote_literal(schema),
+        ))?;
+
+        let mut listed_keys = Vec::with_capacity(listed.rows.len());
+        for row in &listed.rows {
+            listed_keys.push((
+                required_cell(&listed, row, "constraint_id")?.to_string(),
+                required_cell(&listed, row, "target_relation")?.to_string(),
+                required_cell(&listed, row, "source_column")?.to_string(),
+                required_cell(&listed, row, "target_column")?.to_string(),
+            ));
+        }
+
+        let mut parent_keys: HashMap<String, Vec<String>> = HashMap::new();
+        let mut keys = Vec::new();
+        for group in listed_keys.chunk_by(|a, b| a.0 == b.0) {
+            let target = &group[0].1;
+            let mut columns = Vec::with_capacity(group.len());
+            for (position, (_, _, source, target_column)) in group.iter().enumerate() {
+                let referenced_column = if target_column.is_empty() {
+                    // A null `to` means the key references the parent's primary
+                    // key without naming its columns, so the gap is filled from
+                    // that key -- positionally, which is the correspondence the
+                    // pragma's own `seq` order gives both sides.
+                    if !parent_keys.contains_key(target) {
+                        parent_keys.insert(target.clone(), self.primary_key(schema, target)?);
+                    }
+                    match parent_keys[target].get(position) {
+                        Some(column) => column.clone(),
+                        // A parent whose key cannot be stated gets no arrow at
+                        // all: a `WHERE` aimed at a column that does not exist
+                        // is worse than no navigation.
+                        None => break,
+                    }
+                } else {
+                    target_column.clone()
+                };
+
+                columns.push(ForeignKey {
+                    column: source.clone(),
+                    // A SQLite foreign key may not reference an attached
+                    // database, so the parent of every key is in the database
+                    // the key itself is in -- which is why the pragma reports no
+                    // schema for one.
+                    referenced_schema: schema.to_string(),
+                    referenced_table: target.clone(),
+                    referenced_column,
+                });
+            }
+
+            if columns.len() == group.len() {
+                keys.extend(columns);
+            }
+        }
+
+        Ok(keys)
+    }
 }
 
-/// One foreign key, gathered across the rows the pragma spreads it over.
-struct ForeignKey {
+/// One foreign key's rendering, gathered across the rows the pragma spreads it
+/// over. Named for the grouping it does rather than for the key, because
+/// [`ForeignKey`] is now the key as fields and this is the DDL text beside it.
+struct KeyGroup {
     target: String,
     sources: Vec<String>,
     /// Empty when the key references the target's primary key without naming
@@ -494,8 +566,8 @@ struct ForeignKey {
     targets: Vec<String>,
 }
 
-impl From<ForeignKey> for NamedDefinition {
-    fn from(key: ForeignKey) -> Self {
+impl From<KeyGroup> for NamedDefinition {
+    fn from(key: KeyGroup) -> Self {
         let references = if key.targets.is_empty() {
             Engine::Sqlite.quote_identifier(&key.target)
         } else {
@@ -1284,6 +1356,55 @@ SELECT count(*) FROM forever
     }
 
     #[test]
+    fn a_key_that_does_not_name_its_target_borrows_the_parents_primary_key() {
+        let connection = memory(
+            "CREATE TABLE parent (a INTEGER, b TEXT, PRIMARY KEY (a, b));
+             CREATE TABLE child (
+                 x INTEGER,
+                 y TEXT,
+                 FOREIGN KEY (x, y) REFERENCES parent
+             );",
+        );
+
+        assert_eq!(
+            connection
+                .structure("main", "child")
+                .expect("structure should load")
+                .foreign_keys,
+            vec![
+                ForeignKey {
+                    column: "x".into(),
+                    referenced_schema: "main".into(),
+                    referenced_table: "parent".into(),
+                    referenced_column: "a".into(),
+                },
+                ForeignKey {
+                    column: "y".into(),
+                    referenced_schema: "main".into(),
+                    referenced_table: "parent".into(),
+                    referenced_column: "b".into(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_key_whose_parent_states_no_key_is_skipped_rather_than_guessed() {
+        let connection = memory(
+            "CREATE TABLE parent (id INTEGER);
+             CREATE TABLE child (parent_id INTEGER REFERENCES parent);",
+        );
+
+        assert!(
+            connection
+                .structure("main", "child")
+                .expect("structure should load")
+                .foreign_keys
+                .is_empty()
+        );
+    }
+
+    #[test]
     #[ignore = "requires the repository development database configured through SLATE_SQLITE_PATH"]
     fn live_the_development_database_is_fully_seeded() {
         // The seed is applied by a tool outside this test suite, and a seed that
@@ -1385,5 +1506,68 @@ SELECT count(*) FROM forever
             .expect("query should succeed");
 
         assert_eq!(result.rows[0][0].as_deref(), Some("3"));
+    }
+
+    #[test]
+    #[ignore = "requires the repository development database configured through SLATE_SQLITE_PATH"]
+    fn live_a_single_column_foreign_key_names_its_parent() {
+        let structure = live()
+            .structure("main", "orders")
+            .expect("structure should load");
+
+        assert_eq!(
+            structure.foreign_keys,
+            vec![ForeignKey {
+                column: "account_id".into(),
+                referenced_schema: "main".into(),
+                referenced_table: "accounts".into(),
+                referenced_column: "id".into(),
+            }]
+        );
+    }
+
+    #[test]
+    #[ignore = "requires the repository development database configured through SLATE_SQLITE_PATH"]
+    fn live_a_composite_foreign_key_is_one_entry_per_column_in_key_order() {
+        let structure = live()
+            .structure("main", "order_items")
+            .expect("structure should load");
+
+        assert_eq!(
+            structure.foreign_keys,
+            vec![
+                ForeignKey {
+                    column: "order_account_id".into(),
+                    referenced_schema: "main".into(),
+                    referenced_table: "orders".into(),
+                    referenced_column: "account_id".into(),
+                },
+                ForeignKey {
+                    column: "order_number".into(),
+                    referenced_schema: "main".into(),
+                    referenced_table: "orders".into(),
+                    referenced_column: "number".into(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    #[ignore = "requires the repository development database configured through SLATE_SQLITE_PATH"]
+    fn live_the_rendered_foreign_key_survives_beside_the_structured_one() {
+        let structure = live()
+            .structure("main", "order_items")
+            .expect("structure should load");
+
+        assert!(
+            structure
+                .constraints
+                .iter()
+                .any(|constraint| constraint.definition
+                    == "FOREIGN KEY (\"order_account_id\", \"order_number\") \
+                    REFERENCES \"orders\" (\"account_id\", \"number\")"),
+            "{:?}",
+            structure.constraints
+        );
     }
 }
