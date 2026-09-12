@@ -7,8 +7,9 @@
 //!
 //! Each engine module owns everything about its own driver: how a value becomes
 //! text, what a type is called, which catalog answers a question. What they
-//! share is the vocabulary in this file — and the two assemblers that turn a
-//! [`QueryResult`] into a [`Catalog`] or a [`Structure`], which is why an
+//! share is the vocabulary in this file — and the assemblers that turn a
+//! [`QueryResult`] into a [`Catalog`], a [`Structure`] or its
+//! [`ForeignKey`]s, which is why an
 //! engine's catalog SQL aliases its columns to names chosen here rather than to
 //! its own.
 
@@ -508,6 +509,7 @@ pub struct Structure {
     pub columns: Vec<ColumnDefinition>,
     pub indexes: Vec<NamedDefinition>,
     pub constraints: Vec<NamedDefinition>,
+    pub foreign_keys: Vec<ForeignKey>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -525,6 +527,32 @@ pub struct ColumnDefinition {
 pub struct NamedDefinition {
     pub name: String,
     pub definition: String,
+}
+
+/// One column of one relation, and the column it references. Enough to write a
+/// `WHERE` against the referenced relation and nothing else.
+///
+/// A composite key is several of these and nothing groups them: following a key
+/// is a per-column gesture, so the constraint they came from is not something a
+/// caller has to reassemble.
+///
+/// Additional to the rendered DDL in [`Structure::constraints`], not a
+/// replacement for it — the text is what the structure tab shows, and parsing a
+/// server's rendering back into fields would only lose information. Computing
+/// the fields from the catalog that text was rendered from loses nothing.
+///
+/// Engine-agnostic by rule, not by accident: hard rule 4. No oid, no attribute
+/// number, no `information_schema` row and no driver value reaches these four
+/// owned strings, and nothing here says which engine answered.
+// The three engine modules are the pending callers; each fills this in from its
+// own catalog query in the tasks that follow this one.
+#[allow(dead_code)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ForeignKey {
+    pub column: String,
+    pub referenced_schema: String,
+    pub referenced_table: String,
+    pub referenced_column: String,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -661,6 +689,31 @@ pub(super) fn assemble_structure(
     }
 
     Ok(structure)
+}
+
+/// Reads foreign keys out of a result whose columns are named the way Slate
+/// names them: `column_name`, `referenced_schema`, `referenced_table`,
+/// `referenced_column`.
+///
+/// This is shared *parsing of a Slate-named result shape*, not shared dispatch.
+/// Postgres and MySQL each write their own catalog query and each choose these
+/// four aliases, so the row-to-struct step is the same work twice; SQLite does
+/// not use this at all, because `PRAGMA foreign_key_list` reports a different
+/// shape. No engine branches here and no engine has to route through it.
+#[allow(dead_code)] // See `ForeignKey`: the engine modules are the pending callers.
+pub(super) fn assemble_foreign_keys(result: &QueryResult) -> Result<Vec<ForeignKey>, DbError> {
+    result
+        .rows
+        .iter()
+        .map(|row| {
+            Ok(ForeignKey {
+                column: required_cell(result, row, "column_name")?.to_string(),
+                referenced_schema: required_cell(result, row, "referenced_schema")?.to_string(),
+                referenced_table: required_cell(result, row, "referenced_table")?.to_string(),
+                referenced_column: required_cell(result, row, "referenced_column")?.to_string(),
+            })
+        })
+        .collect()
 }
 
 fn schema<'a>(
@@ -1021,6 +1074,91 @@ mod tests {
         );
         assert_eq!(structure.indexes[0].name, "accounts_pkey");
         assert_eq!(structure.constraints[0].definition, "PRIMARY KEY (id)");
+    }
+
+    #[test]
+    fn a_composite_foreign_key_arrives_as_one_row_per_column() {
+        let keys = result(
+            &[
+                "column_name",
+                "referenced_schema",
+                "referenced_table",
+                "referenced_column",
+            ],
+            &[
+                &[
+                    Some("tenant_id"),
+                    Some("public"),
+                    Some("accounts"),
+                    Some("tenant_id"),
+                ],
+                &[
+                    Some("account_id"),
+                    Some("public"),
+                    Some("accounts"),
+                    Some("id"),
+                ],
+            ],
+        );
+
+        assert_eq!(
+            assemble_foreign_keys(&keys).unwrap(),
+            vec![
+                ForeignKey {
+                    column: "tenant_id".into(),
+                    referenced_schema: "public".into(),
+                    referenced_table: "accounts".into(),
+                    referenced_column: "tenant_id".into(),
+                },
+                ForeignKey {
+                    column: "account_id".into(),
+                    referenced_schema: "public".into(),
+                    referenced_table: "accounts".into(),
+                    referenced_column: "id".into(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_foreign_key_query_missing_a_column_is_an_error_not_a_guess() {
+        let keys = result(
+            &["column_name", "referenced_schema", "referenced_table"],
+            &[&[Some("account_id"), Some("public"), Some("accounts")]],
+        );
+
+        let error = assemble_foreign_keys(&keys).unwrap_err();
+
+        assert_eq!(
+            error.message,
+            "Catalog query omitted column referenced_column."
+        );
+    }
+
+    #[test]
+    fn the_rendered_constraints_survive_the_structured_form_arriving() {
+        let columns = result(
+            &["column_name", "data_type", "nullable", "column_default"],
+            &[&[Some("id"), Some("bigint"), Some("no"), Some("")]],
+        );
+        let constraints = result(
+            &["object_name", "definition"],
+            &[&[
+                Some("orders_account_id_fkey"),
+                Some("FOREIGN KEY (account_id) REFERENCES public.accounts(id)"),
+            ]],
+        );
+
+        let structure = assemble_structure(columns, QueryResult::default(), constraints).unwrap();
+
+        assert_eq!(
+            structure.constraints,
+            vec![NamedDefinition {
+                name: "orders_account_id_fkey".into(),
+                definition: "FOREIGN KEY (account_id) REFERENCES public.accounts(id)".into(),
+            }]
+        );
+        assert!(structure.foreign_keys.is_empty());
     }
 
     #[test]
