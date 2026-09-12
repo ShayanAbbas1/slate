@@ -6786,36 +6786,15 @@ fn filter_predicate(
         Operator::IsNotNull => Some(format!("{name} IS NOT NULL")),
         Operator::IsEmpty => Some(format!("{name} = {}", literal(""))),
         Operator::IsNotEmpty => Some(format!("{name} <> {}", literal(""))),
-        Operator::Contains => Some(like(
-            engine,
-            &name,
-            true,
-            format!("%{}%", like_pattern(value)),
-        )),
-        Operator::NotContains => Some(like(
-            engine,
-            &name,
-            false,
-            format!("%{}%", like_pattern(value)),
-        )),
-        Operator::StartsWith => Some(like(
-            engine,
-            &name,
-            true,
-            format!("{}%", like_pattern(value)),
-        )),
-        Operator::EndsWith => Some(like(
-            engine,
-            &name,
-            true,
-            format!("%{}", like_pattern(value)),
-        )),
+        Operator::Contains | Operator::NotContains | Operator::StartsWith | Operator::EndsWith => {
+            Some(substring(engine, &name, operator, value))
+        }
         Operator::InList | Operator::NotInList => {
             let items: Vec<_> = value
                 .split(',')
                 .map(str::trim)
                 .filter(|item| !item.is_empty())
-                .map(|item| literal(item))
+                .map(&literal)
                 .collect();
             // An empty list is `IN ()`, which does not parse anywhere.
             if items.is_empty() {
@@ -6841,36 +6820,69 @@ fn filter_predicate(
                 literal(high)
             ))
         }
-        // Postgres spells it as an operator and MySQL as a keyword; SQLite has
-        // no regex at all, which `Operator::on` is what refuses (spec §7).
+        // Postgres spells it as an operator; MySQL's own `REGEXP` infix is not
+        // in the grammar the gate parses with, so the function form it has had
+        // since 8.0.4 goes out instead. SQLite has no regex at all, which
+        // `Operator::on` is what refuses (spec §7).
         Operator::Regex => match engine {
             Engine::Postgres => comparison("~"),
-            Engine::MySql => comparison("REGEXP"),
+            Engine::MySql => Some(format!("REGEXP_LIKE({name}, {})", literal(value))),
             Engine::Sqlite => None,
         },
     }
 }
 
-/// A `LIKE` against a pattern, with the escape clause that makes the escaping
-/// [`like_pattern`] did mean anything.
+/// Whether one column holds a value, at the start, at the end or anywhere.
 ///
-/// The clause is written out rather than left to the server's default: MySQL's
-/// default happens to be the same backslash, but saying so is what keeps the
-/// pattern and the escape from being decided in two places.
-fn like(engine: Engine, name: &str, positive: bool, pattern: String) -> String {
+/// `LIKE` where the engine has an escape character for the wildcards the user's
+/// own value may hold, and exact substring arithmetic where it does not. Two
+/// engine divergences meet here (`AGENTS.md`, and spec §7):
+///
+/// The escape is the engine's **default** rather than an `ESCAPE` clause naming
+/// it, because `tree_sitter_sequel` does not parse one and `is_generated_select`
+/// would refuse every `LIKE` this writes. Postgres and MySQL both default to
+/// the backslash, which is what [`like_pattern`] escapes with.
+///
+/// **SQLite has no default escape character at all**, so a pattern is the wrong
+/// tool there: a value holding `%` or `_` would silently widen the match, which
+/// is the one failure this exists to prevent. `instr` and `substr` ask the same
+/// question with no pattern to escape. They are case-sensitive where SQLite's
+/// `LIKE` is not, which is the cost of the trade and is smaller than answering
+/// a question nobody asked.
+fn substring(engine: Engine, name: &str, operator: Operator, value: &str) -> String {
+    let literal = engine.quote_literal(value);
+    if engine == Engine::Sqlite {
+        return match operator {
+            Operator::NotContains => format!("instr({name}, {literal}) = 0"),
+            Operator::StartsWith => format!("instr({name}, {literal}) = 1"),
+            // A suffix longer than the value leaves the whole of it, which
+            // cannot equal a longer literal -- so no length guard is needed.
+            Operator::EndsWith => format!(
+                "substr({name}, -{}) = {literal}",
+                value.chars().count().max(1)
+            ),
+            _ => format!("instr({name}, {literal}) > 0"),
+        };
+    }
+    let escaped = like_pattern(value);
+    let pattern = match operator {
+        Operator::StartsWith => format!("{escaped}%"),
+        Operator::EndsWith => format!("%{escaped}"),
+        _ => format!("%{escaped}%"),
+    };
     format!(
-        "{name} {}LIKE {} ESCAPE {}",
-        match positive {
-            true => "",
-            false => "NOT ",
+        "{name} {}LIKE {}",
+        match operator {
+            Operator::NotContains => "NOT ",
+            _ => "",
         },
-        engine.quote_literal(&pattern),
-        engine.quote_literal("\\")
+        engine.quote_literal(&pattern)
     )
 }
 
-/// The user's text as a `LIKE` pattern's literal part: the wildcards it holds
-/// are escaped, so a value containing `%` matches a percent sign rather than
+/// The user's text as the literal part of a `LIKE` pattern: the wildcards it
+/// holds are escaped with the backslash both pattern engines take as their
+/// default escape, so a value containing `%` matches a percent sign rather than
 /// silently widening the match to anything.
 fn like_pattern(value: &str) -> String {
     let mut escaped = String::with_capacity(value.len());
@@ -7918,36 +7930,289 @@ mod tests {
             .collect()
     }
 
+    /// A bar as the UI holds it. Most tests care about one operator and one
+    /// value, and nothing else about the bar.
+    fn bar(column: Option<&str>, operator: Operator, value: &str) -> FilterBar {
+        FilterBar {
+            column: column.map(str::to_string),
+            operator,
+            value: value.to_string(),
+            ..FilterBar::default()
+        }
+    }
+
+    /// The predicate one operator writes over one column.
+    fn predicate(engine: Engine, operator: Operator, value: &str) -> Option<String> {
+        bar_predicate(engine, &bar(Some("state"), operator, value))
+    }
+
     #[test]
-    fn a_header_input_writes_a_quoted_equality_into_the_filter() {
+    fn a_bar_writes_a_quoted_predicate_into_the_filter() {
         // The identifier and the literal are both the user's text, and both are
         // quoted the way the engine will read them -- a double-quoted name is a
         // string literal on MySQL, which is the silent failure this exists to
         // avoid.
         assert_eq!(
-            filter_predicate(Engine::Postgres, "state", "ok"),
-            r#""state" = 'ok'"#
+            predicate(Engine::Postgres, Operator::Equals, "ok").as_deref(),
+            Some(r#""state" = 'ok'"#)
         );
         assert_eq!(
-            filter_predicate(Engine::MySql, "state", "ok"),
-            "`state` = 'ok'"
+            predicate(Engine::MySql, Operator::Equals, "ok").as_deref(),
+            Some("`state` = 'ok'")
         );
         assert_eq!(
-            filter_predicate(Engine::Sqlite, "state", "ok"),
-            r#""state" = 'ok'"#
+            predicate(Engine::Sqlite, Operator::Equals, "ok").as_deref(),
+            Some(r#""state" = 'ok'"#)
         );
         // An apostrophe in the value and a quote in the column name are the two
         // ways a typed value becomes SQL of its own.
         assert_eq!(
-            filter_predicate(Engine::Postgres, r#"od"d"#, "it's"),
-            r#""od""d" = 'it''s'"#
+            filter_predicate(Engine::Postgres, r#"od"d"#, Operator::Equals, "it's").as_deref(),
+            Some(r#""od""d" = 'it''s'"#)
         );
         // And a backslash is the third, on the one engine that reads it as an
         // escape.
         assert_eq!(
-            filter_predicate(Engine::MySql, "path", r"a\b"),
-            r"`path` = 'a\\b'"
+            filter_predicate(Engine::MySql, "path", Operator::Equals, r"a\b").as_deref(),
+            Some(r"`path` = 'a\\b'")
         );
+    }
+
+    #[test]
+    fn every_operator_writes_the_shape_its_symbol_promises() {
+        let sql = |operator, value| predicate(Engine::Postgres, operator, value).expect("applied");
+        assert_eq!(sql(Operator::Equals, "1"), r#""state" = '1'"#);
+        // `<>` on both negations rather than `!=`: it is the spelling all three
+        // engines agree on, and the dropdown says `!=` because that is the one
+        // people read.
+        assert_eq!(sql(Operator::NotEquals, "1"), r#""state" <> '1'"#);
+        assert_eq!(sql(Operator::Greater, "1"), r#""state" > '1'"#);
+        assert_eq!(sql(Operator::GreaterOrEqual, "1"), r#""state" >= '1'"#);
+        assert_eq!(sql(Operator::Less, "1"), r#""state" < '1'"#);
+        assert_eq!(sql(Operator::LessOrEqual, "1"), r#""state" <= '1'"#);
+        assert_eq!(sql(Operator::IsNull, ""), r#""state" IS NULL"#);
+        assert_eq!(sql(Operator::IsNotNull, ""), r#""state" IS NOT NULL"#);
+        assert_eq!(sql(Operator::IsEmpty, ""), r#""state" = ''"#);
+        assert_eq!(sql(Operator::IsNotEmpty, ""), r#""state" <> ''"#);
+        assert_eq!(sql(Operator::Contains, "ok"), r#""state" LIKE '%ok%'"#);
+        assert_eq!(
+            sql(Operator::NotContains, "ok"),
+            r#""state" NOT LIKE '%ok%'"#
+        );
+        assert_eq!(sql(Operator::StartsWith, "ok"), r#""state" LIKE 'ok%'"#);
+        assert_eq!(sql(Operator::EndsWith, "ok"), r#""state" LIKE '%ok'"#);
+        assert_eq!(sql(Operator::InList, "a, b"), r#""state" IN ('a', 'b')"#);
+        assert_eq!(
+            sql(Operator::NotInList, "a, b"),
+            r#""state" NOT IN ('a', 'b')"#
+        );
+        assert_eq!(
+            sql(Operator::Between, "1..9"),
+            r#""state" BETWEEN '1' AND '9'"#
+        );
+        assert_eq!(sql(Operator::Regex, "^a"), r#""state" ~ '^a'"#);
+    }
+
+    #[test]
+    fn a_like_value_cannot_smuggle_a_wildcard_of_its_own() {
+        // `50%` is a value, not "anything starting with 50" -- and without the
+        // escaping the widening is silent, which is the whole hazard. The
+        // backslash is what Postgres and MySQL take as the escape with no
+        // `ESCAPE` clause naming it, which is the clause the gate's grammar
+        // cannot read.
+        assert_eq!(
+            predicate(Engine::Postgres, Operator::Contains, "50%").as_deref(),
+            Some(r#""state" LIKE '%50\%%'"#)
+        );
+        assert_eq!(
+            predicate(Engine::Postgres, Operator::StartsWith, "a_b").as_deref(),
+            Some(r#""state" LIKE 'a\_b%'"#)
+        );
+        // The escape character itself, or the escaping would be escapable.
+        assert_eq!(
+            predicate(Engine::Postgres, Operator::Contains, r"a\b").as_deref(),
+            Some(r#""state" LIKE '%a\\b%'"#)
+        );
+        // MySQL reads a backslash inside a literal as an escape of its own, so
+        // every one of them is doubled on the way into the string and the
+        // pattern still sees the single one the escaping put there.
+        assert_eq!(
+            predicate(Engine::MySql, Operator::Contains, "50%").as_deref(),
+            Some(r"`state` LIKE '%50\\%%'")
+        );
+    }
+
+    #[test]
+    fn sqlite_asks_for_a_substring_rather_than_a_pattern_it_cannot_escape() {
+        // SQLite has no default escape character, so `%` in a value would be a
+        // wildcard whatever the pattern did. `instr` has no pattern to escape.
+        assert_eq!(
+            predicate(Engine::Sqlite, Operator::Contains, "50%").as_deref(),
+            Some(r#"instr("state", '50%') > 0"#)
+        );
+        assert_eq!(
+            predicate(Engine::Sqlite, Operator::NotContains, "ok").as_deref(),
+            Some(r#"instr("state", 'ok') = 0"#)
+        );
+        assert_eq!(
+            predicate(Engine::Sqlite, Operator::StartsWith, "ok").as_deref(),
+            Some(r#"instr("state", 'ok') = 1"#)
+        );
+        // Counted in characters rather than bytes, or a multi-byte suffix asks
+        // for more of the string than it is.
+        assert_eq!(
+            predicate(Engine::Sqlite, Operator::EndsWith, "ök").as_deref(),
+            Some(r#"substr("state", -2) = 'ök'"#)
+        );
+    }
+
+    #[test]
+    fn a_list_is_split_on_commas_and_quoted_item_by_item() {
+        assert_eq!(
+            predicate(Engine::Postgres, Operator::InList, " a , b ,, c ").as_deref(),
+            Some(r#""state" IN ('a', 'b', 'c')"#)
+        );
+        // Each item is a literal of its own, so a comma cannot be typed into
+        // one to end it early.
+        assert_eq!(
+            predicate(Engine::Postgres, Operator::InList, "it's").as_deref(),
+            Some(r#""state" IN ('it''s')"#)
+        );
+        // `IN ()` does not parse anywhere, so an empty list is no predicate.
+        assert_eq!(predicate(Engine::Postgres, Operator::InList, " , "), None);
+    }
+
+    #[test]
+    fn a_range_needs_both_of_its_halves() {
+        assert_eq!(
+            predicate(Engine::Postgres, Operator::Between, " 1 .. 9 ").as_deref(),
+            Some(r#""state" BETWEEN '1' AND '9'"#)
+        );
+        assert_eq!(predicate(Engine::Postgres, Operator::Between, "1"), None);
+        assert_eq!(predicate(Engine::Postgres, Operator::Between, "1.."), None);
+        assert_eq!(predicate(Engine::Postgres, Operator::Between, "..9"), None);
+    }
+
+    #[test]
+    fn an_absence_is_applied_with_no_value_at_all() {
+        // The four that take no value are the four that would otherwise be
+        // unreachable: their bar shows no input to type into.
+        for operator in [
+            Operator::IsNull,
+            Operator::IsNotNull,
+            Operator::IsEmpty,
+            Operator::IsNotEmpty,
+        ] {
+            assert!(!operator.takes_value(), "{} takes a value", operator.slug());
+            assert!(
+                predicate(Engine::Postgres, operator, "").is_some(),
+                "{} was not applied",
+                operator.slug()
+            );
+        }
+        // And every other operator needs one.
+        for operator in Operator::ALL.into_iter().filter(|o| o.takes_value()) {
+            assert!(
+                predicate(Engine::Postgres, operator, "").is_none(),
+                "{} was applied with no value",
+                operator.slug()
+            );
+        }
+    }
+
+    #[test]
+    fn sqlite_is_neither_offered_nor_sent_a_regex_it_cannot_run() {
+        // SQLite ships no `REGEXP`, so the operator is a syntax error there
+        // rather than a query that returns nothing.
+        assert!(Operator::Regex.on(Engine::Postgres));
+        assert!(Operator::Regex.on(Engine::MySql));
+        assert!(!Operator::Regex.on(Engine::Sqlite));
+        // The infix `REGEXP` MySQL documents is not in the grammar the gate
+        // parses with, so the function form goes out instead.
+        assert_eq!(
+            predicate(Engine::MySql, Operator::Regex, "^a").as_deref(),
+            Some("REGEXP_LIKE(`state`, '^a')")
+        );
+        // A bar restored onto a SQLite profile from a session that was on
+        // another engine narrows nothing rather than breaking the statement.
+        assert_eq!(predicate(Engine::Sqlite, Operator::Regex, "^a"), None);
+    }
+
+    #[test]
+    fn a_raw_bar_is_the_users_own_sql_verbatim() {
+        let raw = |value: &str| {
+            bar_predicate(
+                Engine::Postgres,
+                &FilterBar {
+                    raw: true,
+                    value: value.to_string(),
+                    ..FilterBar::default()
+                },
+            )
+        };
+        // Nothing here inspects it: `is_generated_select` is what stands behind
+        // a raw bar, and it reads the whole statement rather than the fragment.
+        assert_eq!(
+            raw("id > 5 OR name IS NULL").as_deref(),
+            Some("id > 5 OR name IS NULL")
+        );
+        assert_eq!(raw("   "), None);
+    }
+
+    #[test]
+    fn probe_escape() {
+        for filter in [
+            r#""state" LIKE '%ok%'"#,
+            r#""state" LIKE '%ok%' ESCAPE '\'"#,
+            r#""state" LIKE '%ok%' escape '!'"#,
+            r#"instr("state", 'a') > 0"#,
+            r#"instr("state", 'a') = 0"#,
+            r#"instr("state", 'a') = 1"#,
+            r#"substr("state", -2) = 'ok'"#,
+            r#"instr("state", 'it''s') > 0"#,
+            r#"REGEXP_LIKE(`state`, '^a')"#,
+            r#"NOT instr("state", 'a') > 0"#,
+            r#"strpos("state", 'a') > 0"#,
+            r#"REGEXP_LIKE("state", '^a')"#,
+            r#""state" regexp '^a'"#,
+            r#"("state" = '1') OR ("state" = '2')"#,
+            r#""state" LIKE CONCAT('%', 'a', '%')"#,
+            r#"lower("state") LIKE '%a%'"#,
+            r#""state" NOT LIKE '%ok%'"#,
+            r#""state" ~ '^a'"#,
+            r#""state" REGEXP '^a'"#,
+            r#""state" BETWEEN '1' AND '9'"#,
+            r#""state" IN ('a', 'b')"#,
+            r#""state" NOT IN ('a', 'b')"#,
+            r#""state" IS NOT NULL"#,
+            r#""state" <> ''"#,
+        ] {
+            let sql = explorer::preview_sql(Engine::Postgres, "public", "accounts", filter, 100, 0);
+            println!("{} {filter}", sql::is_generated_select(&sql));
+        }
+    }
+
+    #[test]
+    fn every_operator_writes_a_statement_the_gate_admits() {
+        // The other half of the operator list: a predicate that does not parse
+        // is refused before it runs, which would make an operator unusable
+        // rather than unsafe. Checked per engine, because the quoting differs.
+        for engine in [Engine::Postgres, Engine::MySql, Engine::Sqlite] {
+            for operator in Operator::ALL.into_iter().filter(|o| o.on(engine)) {
+                let value = match operator {
+                    Operator::Between => "1..9",
+                    Operator::InList | Operator::NotInList => "a, b",
+                    _ => "ok",
+                };
+                let filter = predicate(engine, operator, value).expect("applied");
+                let sql = explorer::preview_sql(engine, "public", "accounts", &filter, 100, 0);
+                assert!(
+                    sql::is_generated_select(&sql),
+                    "{} was refused: {sql}",
+                    operator.slug()
+                );
+            }
+        }
     }
 
     fn account_key() -> db::ForeignKey {
@@ -8144,12 +8409,16 @@ mod tests {
     }
 
     /// The bars as the UI holds them, straight through to the `WHERE`.
-    fn filter_of(engine: Engine, bars: &[(Option<&str>, &str)]) -> String {
-        let rows: Vec<_> = bars
-            .iter()
-            .map(|(column, value)| (column.map(str::to_string), (*value).to_string()))
-            .collect();
-        derived_filter(engine, &applied_filters(&rows))
+    fn filter_of(engine: Engine, bars: &[FilterBar]) -> String {
+        derived_filter(engine, bars)
+    }
+
+    /// An equality bar joined to the one above it.
+    fn joined(column: &str, value: &str, conjunction: Conjunction) -> FilterBar {
+        FilterBar {
+            conjunction,
+            ..bar(Some(column), Operator::Equals, value)
+        }
     }
 
     #[test]
@@ -8164,9 +8433,27 @@ mod tests {
         // Added and not yet used, either half at a time. A half-filled bar that
         // reached the statement would re-query on every keystroke of a column
         // name nobody has picked.
-        assert_eq!(filter_of(Engine::Postgres, &[(None, "")]), "");
-        assert_eq!(filter_of(Engine::Postgres, &[(None, "ok")]), "");
-        assert_eq!(filter_of(Engine::Postgres, &[(Some("state"), "")]), "");
+        assert_eq!(
+            filter_of(Engine::Postgres, &[bar(None, Operator::Equals, "")]),
+            ""
+        );
+        assert_eq!(
+            filter_of(Engine::Postgres, &[bar(None, Operator::Equals, "ok")]),
+            ""
+        );
+        assert_eq!(
+            filter_of(
+                Engine::Postgres,
+                &[bar(Some("state"), Operator::Equals, "")]
+            ),
+            ""
+        );
+        // Not even with an operator that needs no value: there is still no
+        // column for it to be about.
+        assert_eq!(
+            filter_of(Engine::Postgres, &[bar(None, Operator::IsNull, "")]),
+            ""
+        );
     }
 
     #[test]
@@ -8174,19 +8461,97 @@ mod tests {
         assert_eq!(
             filter_of(
                 Engine::Postgres,
-                &[(Some("state"), "ok"), (Some("tier"), "2")]
+                &[
+                    joined("state", "ok", Conjunction::And),
+                    joined("tier", "2", Conjunction::And)
+                ]
             ),
-            r#""state" = 'ok' AND "tier" = '2'"#
+            r#"("state" = 'ok') AND ("tier" = '2')"#
         );
         // An unfinished bar between two finished ones drops out rather than
         // breaking the conjunction.
         assert_eq!(
             filter_of(
                 Engine::Postgres,
-                &[(Some("state"), "ok"), (None, ""), (Some("tier"), "2")]
+                &[
+                    joined("state", "ok", Conjunction::And),
+                    bar(None, Operator::Equals, ""),
+                    joined("tier", "2", Conjunction::And)
+                ]
             ),
-            r#""state" = 'ok' AND "tier" = '2'"#
+            r#"("state" = 'ok') AND ("tier" = '2')"#
         );
+        // A lone bar is unwrapped, which is what keeps a tab filtered before
+        // joiners existed on the grid key it already had.
+        assert_eq!(
+            filter_of(Engine::Postgres, &[joined("state", "ok", Conjunction::And)]),
+            r#""state" = 'ok'"#
+        );
+    }
+
+    #[test]
+    fn a_mixed_stack_folds_left_to_right_rather_than_by_sql_precedence() {
+        // `a OR b AND c` is `a OR (b AND c)` to every engine, and the stack
+        // reads top to bottom -- so each fold is parenthesised and the result
+        // is `(a OR b) AND c`. The one semantic choice in the stack.
+        assert_eq!(
+            filter_of(
+                Engine::Postgres,
+                &[
+                    joined("a", "1", Conjunction::And),
+                    joined("b", "2", Conjunction::Or),
+                    joined("c", "3", Conjunction::And),
+                ]
+            ),
+            r#"(("a" = '1') OR ("b" = '2')) AND ("c" = '3')"#
+        );
+        // The first bar's own joiner is never read: it has nothing above it.
+        assert_eq!(
+            filter_of(
+                Engine::Postgres,
+                &[
+                    joined("a", "1", Conjunction::Or),
+                    joined("b", "2", Conjunction::Or),
+                ]
+            ),
+            r#"("a" = '1') OR ("b" = '2')"#
+        );
+    }
+
+    #[test]
+    fn a_mixed_stack_is_still_a_statement_the_gate_admits() {
+        let filter = filter_of(
+            Engine::Postgres,
+            &[
+                joined("a", "1", Conjunction::And),
+                FilterBar {
+                    raw: true,
+                    conjunction: Conjunction::Or,
+                    value: "id > 5".to_string(),
+                    ..FilterBar::default()
+                },
+                joined("c", "3", Conjunction::And),
+            ],
+        );
+        assert_eq!(filter, r#"(("a" = '1') OR (id > 5)) AND ("c" = '3')"#);
+        let sql = explorer::preview_sql(Engine::Postgres, "public", "accounts", &filter, 100, 0);
+        assert!(sql::is_generated_select(&sql), "{sql} was refused");
+    }
+
+    #[test]
+    fn a_raw_bar_that_breaks_the_statement_is_refused_rather_than_run() {
+        // The gate is the whole safety story for a raw bar (spec §2.3): the
+        // tab keeps its rows and says so instead of sending this.
+        let filter = filter_of(
+            Engine::Postgres,
+            &[FilterBar {
+                raw: true,
+                value: "1 = 1; DROP TABLE accounts".to_string(),
+                ..FilterBar::default()
+            }],
+        );
+        let sql = explorer::preview_sql(Engine::Postgres, "public", "accounts", &filter, 100, 0);
+        assert!(!sql::is_generated_select(&sql), "{sql} was admitted");
     }
 
     #[test]
@@ -8194,21 +8559,96 @@ mod tests {
         // The same hazard `filter_predicate` carries, now that a stack of them
         // is what a preview runs: a double-quoted name is a string literal on
         // MySQL, so this fails silently rather than loudly when it is wrong.
-        let bars = [(Some("state"), "it's"), (Some(r#"od"d"#), r"a\b")];
+        let bars = [
+            joined("state", "it's", Conjunction::And),
+            joined(r#"od"d"#, r"a\b", Conjunction::And),
+        ];
         assert_eq!(
             filter_of(Engine::Postgres, &bars),
-            r#""state" = 'it''s' AND "od""d" = 'a\b'"#
+            r#"("state" = 'it''s') AND ("od""d" = 'a\b')"#
         );
         // The backslash doubles on the one engine that reads it as an escape,
         // and the double quote is an ordinary character inside backticks.
         assert_eq!(
             filter_of(Engine::MySql, &bars),
-            r#"`state` = 'it''s' AND `od"d` = 'a\\b'"#
+            r#"(`state` = 'it''s') AND (`od"d` = 'a\\b')"#
         );
         assert_eq!(
             filter_of(Engine::Sqlite, &bars),
-            r#""state" = 'it''s' AND "od""d" = 'a\b'"#
+            r#"("state" = 'it''s') AND ("od""d" = 'a\b')"#
         );
+    }
+
+    #[test]
+    fn the_bars_a_stored_tab_comes_back_with_are_the_bars_it_had() {
+        let stored = store::StoredObject {
+            schema: "public".into(),
+            name: "accounts".into(),
+            routine: false,
+            kind: RelationKind::default(),
+            filter: String::new(),
+            filters: Vec::new(),
+            active: true,
+            bars: vec![
+                store::StoredFilter {
+                    column: "state".into(),
+                    value: "ok".into(),
+                    operator: "contains".into(),
+                    conjunction: "OR".into(),
+                    raw: false,
+                },
+                store::StoredFilter {
+                    value: "id > 5".into(),
+                    raw: true,
+                    ..store::StoredFilter::default()
+                },
+            ],
+        };
+        assert_eq!(
+            stored_bars(&stored),
+            vec![
+                FilterBar {
+                    column: Some("state".into()),
+                    operator: Operator::Contains,
+                    conjunction: Conjunction::Or,
+                    raw: false,
+                    value: "ok".into(),
+                },
+                FilterBar {
+                    column: None,
+                    operator: Operator::Equals,
+                    conjunction: Conjunction::And,
+                    raw: true,
+                    value: "id > 5".into(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_bar_written_before_operators_comes_back_as_the_equality_it_was() {
+        // The one field an older profile has, read once on the way in. An
+        // operator or joiner this build cannot read falls the same way.
+        let stored = store::StoredObject {
+            schema: "public".into(),
+            name: "accounts".into(),
+            routine: false,
+            kind: RelationKind::default(),
+            filter: r#""state" = 'ok'"#.into(),
+            filters: vec![("state".into(), "ok".into())],
+            active: true,
+            bars: Vec::new(),
+        };
+        assert_eq!(
+            stored_bars(&stored),
+            vec![bar(Some("state"), Operator::Equals, "ok")]
+        );
+        assert_eq!(Operator::from_slug("no-such-operator"), Operator::Equals);
+        assert_eq!(Conjunction::from_str("XOR"), Conjunction::And);
+        // And the slug survives the round trip for every operator there is.
+        for operator in Operator::ALL {
+            assert_eq!(Operator::from_slug(operator.slug()), operator);
+        }
     }
 
     #[test]
